@@ -9,6 +9,7 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 import unittest
+from unittest import mock
 
 
 SCRIPT = os.path.join(os.path.dirname(os.path.dirname(__file__)), "scripts", "tokenpipe.py")
@@ -81,6 +82,24 @@ class TokenpipeTests(unittest.TestCase):
         self.assertIn("FAILED auth_test.py", result["output"])
         self.assertIn("Traceback", result["output"])
 
+    def test_classify_search_line_numbers_and_rg_io_errors(self):
+        numbered = "\n".join(
+            "%d:module%04d needle unique payload" % (line, line)
+            for line in range(1, 1000)
+        )
+        self.assertEqual(tokenpipe.classify(numbered), "plain")
+        io_errors = "\n".join(
+            "rg: /missing-%03d: IO error for operation: No such file or directory" % line
+            for line in range(300)
+        )
+        self.assertEqual(tokenpipe.classify(io_errors), "error")
+        failed_json = json.dumps({"status": "failed", "items": list(range(200))})
+        self.assertEqual(tokenpipe.classify(failed_json), "json")
+
+    def test_plugin_version_fails_open_for_non_object_manifest(self):
+        with mock.patch("builtins.open", mock.mock_open(read_data="[]")):
+            self.assertEqual(tokenpipe.plugin_version(), tokenpipe.VERSION)
+
     def test_diff_and_code_passthrough(self):
         diff = "diff --git a/a b/a\n--- a/a\n+++ b/a\n" + ("+important\n" * 300)
         result = tokenpipe.process(self.payload(diff), "safe")
@@ -119,6 +138,11 @@ class TokenpipeTests(unittest.TestCase):
         self.assertEqual(report["calls"], 2)
         self.assertIn("session-test", report["groups"]["session"])
         self.assertIn("test", report["groups"]["command_category"])
+        self.assertEqual(report["groups"]["mode"]["audit"]["calls"], 1)
+        self.assertEqual(report["groups"]["mode"]["safe"]["calls"], 1)
+        self.assertEqual(report["audit_calls"], 1)
+        self.assertEqual(report["native_calls"], 0)
+        self.assertIn(tokenpipe.plugin_version(), report["groups"]["plugin_version"])
         self.assertTrue(report["token_counts_are_estimates"])
 
     def test_accepts_only_coarse_supplied_command_category(self):
@@ -215,6 +239,19 @@ class TokenpipeTests(unittest.TestCase):
         self.assertNotIn("raw_ref=", safe.splitlines()[0])
         self.assertIn("category-not-allowed-in-mode", tokenpipe.load_metrics()[-2]["skip_reason"])
         self.assertIn("raw_ref=", full.splitlines()[0])
+
+    def test_refused_audit_exec_does_not_inflate_native_coverage(self):
+        ls_path = shutil.which("ls")
+        output, status = tokenpipe.execute_native(
+            [ls_path, self.temp.name], "filesystem-read", "audit"
+        )
+        self.assertEqual(status, 126)
+        self.assertIn("strategy=refused", output.splitlines()[0])
+        report = tokenpipe.aggregate([tokenpipe.load_metrics()[-1]])
+        self.assertEqual(report["audit_calls"], 0)
+        self.assertEqual(report["native_calls"], 0)
+        self.assertEqual(report["native_refused_calls"], 1)
+        self.assertEqual(report["native_call_coverage_percent_estimate"], 0.0)
 
     def test_native_unknown_yaml_toml_source_and_plain_passthrough(self):
         samples = [
@@ -419,6 +456,9 @@ class TokenpipeTests(unittest.TestCase):
             self.assertTrue(metric["rtk_used"])
             report = tokenpipe.aggregate([metric])
             self.assertEqual(report["groups"]["strategy"]["rtk-direct"]["rtk_calls"], 1)
+            self.assertEqual(report["native_calls"], 1)
+            self.assertEqual(report["rtk_owned_calls"], 1)
+            self.assertEqual(report["native_call_coverage_percent_estimate"], 100.0)
             os.chmod(rtk, 0o722)
             output, status_code = tokenpipe.execute_native(
                 [ls_path, self.temp.name], "filesystem-read", "safe"

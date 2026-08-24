@@ -31,7 +31,14 @@ ANSI_RE = re.compile(r"\x1b(?:[@-_][0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))"
 SECRET_KEY_RE = re.compile(r"(?i)(token|secret|password|authorization|api[_-]?key|cookie)")
 ERROR_RE = re.compile(
     r"(?i)(error|failed|failure|fatal|panic|exception|traceback|assert|timeout|"
-    r"segmentation|denied|not found|\b[45]\d\d\b)"
+    r"segmentation|denied|not found|(?:http(?:/[0-9.]+)?\s+|"
+    r"status(?:\s+code)?\s*[:=]?\s*|returned?\s+)[45]\d\d\b)"
+)
+STRONG_ERROR_RE = re.compile(
+    r"(?i)(failed|failure|fatal|panic|exception|traceback|assert|timeout|"
+    r"segmentation|denied|not found|(?:io|os)\s+error|"
+    r"(?:http(?:/[0-9.]+)?\s+|status(?:\s+code)?\s*[:=]?\s*|"
+    r"returned?\s+)[45]\d\d\b)"
 )
 SUMMARY_RE = re.compile(
     r"(?i)(summary|tests? (?:passed|failed)|passed|failed|warnings?|errors?|"
@@ -46,6 +53,17 @@ CONFIG_RE = re.compile(
     r"(?m)(^\s*\[[A-Za-z0-9_.-]+\]\s*$|^\s*[A-Za-z_][A-Za-z0-9_.-]*\s*=\s*\S+|"
     r"^\s*[A-Za-z_][A-Za-z0-9_.-]*:\s+\S+)"
 )
+
+
+def plugin_version():
+    path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".codex-plugin", "plugin.json")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        value = payload.get("version") if isinstance(payload, dict) else None
+        return value if isinstance(value, str) and 0 < len(value) <= 128 else VERSION
+    except (OSError, TypeError, ValueError):
+        return VERSION
 
 
 def _home():
@@ -366,14 +384,18 @@ def classify(text):
         return "diff"
     if CODE_RE.search(text) and len(text.splitlines()) > 8:
         return "code"
-    if len(CONFIG_RE.findall(text)) >= 3 and len(text.splitlines()) > 4:
-        return "config"
     if stripped[:1] in "[{":
         try:
             json.loads(text)
             return "json"
         except (ValueError, TypeError):
             pass
+    # Strong runtime failures outrank config-like `tool: message` lines such as
+    # ripgrep's repeated `rg: path: IO error ...` stderr.
+    if STRONG_ERROR_RE.search(text):
+        return "error"
+    if len(CONFIG_RE.findall(text)) >= 3 and len(text.splitlines()) > 4:
+        return "config"
     if ERROR_RE.search(text):
         return "error"
     lines = text.splitlines()
@@ -542,6 +564,7 @@ def process(payload, mode=None):
         "command_category": command_category(payload),
         "strategy": strategy,
         "content_category": category,
+        "plugin_version": plugin_version(),
         "mode": mode,
         "original_bytes": len(original.encode("utf-8", "replace")),
         "shown_bytes": len(shown.encode("utf-8", "replace")),
@@ -854,7 +877,7 @@ def _metric_base(payload, mode, category, strategy, content_category, original, 
         "session": _safe_component(payload.get("session_id"), "unknown-session"),
         "tool": _safe_component(payload.get("tool_name"), "exec_command"),
         "command_category": category, "strategy": strategy,
-        "content_category": content_category, "mode": mode,
+        "content_category": content_category, "plugin_version": plugin_version(), "mode": mode,
         "original_bytes": len(original.encode("utf-8", "replace")),
         "shown_bytes": len(shown.encode("utf-8", "replace")),
         "counterfactual_bytes": len(counterfactual.encode("utf-8", "replace")),
@@ -1073,6 +1096,7 @@ def aggregate(rows):
     groups = {
         "day": {}, "session": {}, "command_category": {},
         "strategy": {}, "content_category": {}, "skip_reason": {},
+        "mode": {}, "plugin_version": {},
     }
     for dimension in groups:
         for row in rows:
@@ -1092,9 +1116,29 @@ def aggregate(rows):
     original = sum(int(row.get("original_tokens_estimate") or 0) for row in rows)
     shown = sum(int(row.get("shown_tokens_estimate") or 0) for row in rows)
     counterfactual = sum(int(row.get("counterfactual_tokens_estimate") or 0) for row in rows)
+    native_refused_rows = [
+        row for row in rows
+        if int(row.get("native_header_bytes") or 0) > 0 and row.get("strategy") == "refused"
+    ]
+    native_rows = [
+        row for row in rows
+        if int(row.get("native_header_bytes") or 0) > 0 and row.get("strategy") != "refused"
+    ]
+    native_original = sum(int(row.get("original_tokens_estimate") or 0) for row in native_rows)
+    native_shown = sum(int(row.get("shown_tokens_estimate") or 0) for row in native_rows)
     return {
         "token_counts_are_estimates": True,
         "calls": len(rows),
+        "audit_calls": sum(
+            1 for row in rows
+            if row.get("mode") == "audit" and int(row.get("native_header_bytes") or 0) == 0
+        ),
+        "native_calls": len(native_rows),
+        "native_refused_calls": len(native_refused_rows),
+        "rtk_owned_calls": sum(1 for row in native_rows if row.get("rtk_used")),
+        "native_call_coverage_percent_estimate": round(100.0 * len(native_rows) / len(rows), 2) if rows else 0.0,
+        "native_token_coverage_percent_estimate": round(100.0 * native_original / original, 2) if original else 0.0,
+        "native_saved_percent_estimate": round(100.0 * (native_original - native_shown) / native_original, 2) if native_original else 0.0,
         "original_tokens_estimate": original,
         "shown_tokens_estimate": shown,
         "counterfactual_tokens_estimate": counterfactual,
@@ -1199,13 +1243,23 @@ def main(argv=None):
         else:
             print("Token counts are estimates (UTF-8 bytes / 3.5), not provider usage.")
             print("Calls: %d" % report["calls"])
+            print("Audit-only calls: %d" % report["audit_calls"])
+            print("Native calls: %d (%.2f%% of calls, %.2f%% of estimated tokens)" % (
+                report["native_calls"], report["native_call_coverage_percent_estimate"],
+                report["native_token_coverage_percent_estimate"],
+            ))
+            print("Native refused calls: %d" % report["native_refused_calls"])
+            print("RTK-owned native calls: %d" % report["rtk_owned_calls"])
+            print("Native tokenpipe saved: %.2f%%" % report["native_saved_percent_estimate"])
             print("Original: %d est. tokens" % report["original_tokens_estimate"])
             print("Shown: %d est. tokens" % report["shown_tokens_estimate"])
-            print("Actual saved: %.2f%%" % report["actual_saved_percent_estimate"])
+            print("Tokenpipe-owned saved: %.2f%%" % report["actual_saved_percent_estimate"])
             print("Counterfactual saved: %.2f%%" % report["counterfactual_saved_percent_estimate"])
+            if report["rtk_owned_calls"]:
+                print("RTK savings are external to these estimates; verify them with `rtk gain`.")
             for dimension in (
                 "day", "session", "command_category", "strategy",
-                "content_category", "skip_reason",
+                "content_category", "skip_reason", "mode", "plugin_version",
             ):
                 print("\n%s:" % dimension)
                 for key, value in sorted(report["groups"][dimension].items()):

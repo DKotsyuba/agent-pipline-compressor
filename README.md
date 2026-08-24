@@ -34,6 +34,10 @@ python3 ~/plugins/codex-token-pipeline/scripts/tokenpipe.py rtk off
 ```
 
 RTK owns output filtering when selected; Lite/CCA are not stacked after it.
+Tokenpipe therefore cannot measure RTK's raw-to-filtered savings or provide a
+tokenpipe `raw_ref` for them. Keep RTK disabled when you want measurable local
+compression and recovery; enable it only when `rtk gain` independently shows a
+benefit on your workload.
 
 ## Statistics
 
@@ -42,6 +46,11 @@ python3 ~/plugins/codex-token-pipeline/scripts/tokenpipe.py stats
 python3 ~/plugins/codex-token-pipeline/scripts/tokenpipe.py stats --since 24h
 python3 ~/plugins/codex-token-pipeline/scripts/tokenpipe.py stats --json
 ```
+
+Stats separate audit-only observations from native wrapped calls, report native
+call/token coverage, and label RTK-owned calls. "Tokenpipe-owned" savings do not
+include savings that an external RTK process may have applied before tokenpipe
+sees the output.
 
 Metrics normally live in `~/.codex/tokenpipe/metrics.jsonl`; when the Bash
 sandbox cannot write there, native-wrapper metrics fall back to the private
@@ -82,6 +91,12 @@ python3 ~/plugins/codex-token-pipeline/scripts/tokenpipe.py show <raw_ref>
 - Cancellation is forwarded to the child process group with bounded SIGKILL fallback and reap.
 - `decision:block`, PostToolUse replacement, model calls, and provider proxies are not used.
 - RTK requires explicit persisted configuration and is validated again before execution.
+
+Codex currently cannot replace model-visible output from `PostToolUse`, so
+non-wrapped commands remain audit-only. `safe` deliberately rejects compound
+shell syntax; use one eligible read-only command per tool call when active
+compression matters. Arbitrary pipeline execution is outside this plugin's
+`shell=False` security boundary.
 
 The CCA-style algorithm is an independent implementation inspired by the
 recovery and conservative-selection ideas in

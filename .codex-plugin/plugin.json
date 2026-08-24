@@ -1,6 +1,6 @@
 {
   "name": "codex-token-pipeline",
-  "version": "0.1.0+codex.20260821193617",
+  "version": "0.1.0+codex.20260824131632",
   "description": "Local audit and compression pipeline for Codex Bash tool output.",
   "author": {
     "name": "Local developer"
