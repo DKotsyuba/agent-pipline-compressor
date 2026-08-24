@@ -39,6 +39,20 @@ tokenpipe `raw_ref` for them. Keep RTK disabled when you want measurable local
 compression and recovery; enable it only when `rtk gain` independently shows a
 benefit on your workload.
 
+## Compression lab
+
+The deterministic lab compares local stage orders and records real RTK routes:
+
+```bash
+python3 benchmarks/compression_lab.py --no-rtk
+python3 benchmarks/compression_lab.py
+python3 -m unittest discover -s tests -v
+```
+
+RTK captures remain measurable, but an RTK result that changes output is not
+eligible for the lab's deployable policy until the original output is
+recoverable without executing the command twice.
+
 When tokenpipe invokes RTK inside the Codex sandbox, it defaults `RTK_DB_PATH`
 to the private tokenpipe runtime directory under `$TMPDIR`; an explicit user
 `RTK_DB_PATH` still wins. This keeps `rtk gain` tracking writable without
