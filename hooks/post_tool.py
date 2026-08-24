@@ -6,7 +6,8 @@ import sys
 
 sys.dont_write_bytecode = True
 
-from common import NATIVE_MARKER, read_event, run_audit, run_skip, tool_output
+from common import (NATIVE_MARKER, emit, exit_status, mode, read_event,
+                    run_audit, run_post_process, run_skip, tool_output)
 
 
 def audit_limit() -> int:
@@ -30,6 +31,9 @@ def is_native_output(output: str) -> bool:
 
 
 def main() -> int:
+    if os.environ.get("CLAUDE_PLUGIN_ROOT") and not os.environ.get("PLUGIN_ROOT"):
+        from claude_post_tool import main as claude_main
+        return claude_main()
     event = read_event()
     if event is None:
         return 0
@@ -49,8 +53,20 @@ def main() -> int:
     if len(output.encode("utf-8", "replace")) > limit:
         run_skip(event, "audit-output-overflow")
         return 0
+    active_mode = mode()
+    if os.environ.get("TOKENPIPE_POST_REPLACE") == "1" and active_mode in {"safe", "full"}:
+        result = run_post_process(event, output, active_mode)
+        if result and result.get("action") == "replace" and result.get("raw_ref"):
+            status = exit_status(event)
+            header = "tokenpipe-post-v1 mode=%s strategy=%s" % (
+                active_mode, result.get("strategy") or "unknown")
+            if status is not None:
+                header += " exit=%d" % status
+            header += " raw_ref=" + result["raw_ref"]
+            emit({"decision": "block", "reason": header + "\n" + result["output"]})
+            return 0
     # Always force audit: PostToolUse is observation-only in every configured
-    # mode and deliberately emits no stdout whatsoever.
+    # ordinary Codex mode and deliberately emits no stdout whatsoever.
     run_audit(event, output)
     return 0
 

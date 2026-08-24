@@ -24,7 +24,7 @@ tokenpipe = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(tokenpipe)
 
 LAB_VERSION = "2.0.0"
-SCORE_TOLERANCE = 0.01
+MAX_SELECTION_LATENCY_MS = 250.0
 STAGES = ("ansi", "json-lite", "log-lite", "cca", "bound")
 PARTIAL_ORDER = (("ansi", "json-lite"), ("ansi", "log-lite"), ("ansi", "cca"),
                  ("ansi", "bound"), ("json-lite", "bound"), ("log-lite", "cca"),
@@ -356,9 +356,9 @@ def _best(candidates):
     valid = [item for item in candidates if item["valid"]]
     if not valid:
         return None
-    best_score = max(item["selection_score"] for item in valid)
-    near = [item for item in valid if best_score - item["selection_score"] <= SCORE_TOLERANCE]
-    return max(near, key=lambda item: (item["token_savings"], item["savings"], -_stage_count(item),
+    within_guard = [item for item in valid if item["latency_ms"] <= MAX_SELECTION_LATENCY_MS]
+    pool = within_guard or valid
+    return max(pool, key=lambda item: (item["token_savings"], item["savings"], -_stage_count(item),
                                       -item["bytes"], item["source"] == "local", item["id"]))
 
 
@@ -408,11 +408,11 @@ def _winner_row(rows, coverage_field="coverage"):
     eligible = [row for row in rows if row[coverage_field] >= 1.0]
     if not eligible:
         return None
-    best_score = max(row["latency_aware_score"] for row in eligible)
-    near = [row for row in eligible if best_score - row["latency_aware_score"] <= SCORE_TOLERANCE]
-    return max(near, key=lambda row: (row["normalized_savings"], -row["weighted_normalized_tokens"],
+    within_guard = [row for row in eligible if row["p95_latency_ms"] <= MAX_SELECTION_LATENCY_MS]
+    pool = within_guard or eligible
+    return max(pool, key=lambda row: (row["normalized_savings"], -row["weighted_normalized_tokens"],
                                      -_stage_count(row), row["signature"]["source"] == "local",
-                                     -row["p95_latency_ms"], -row["median_latency_ms"], row["id"]))
+                                     row["id"]))
 
 
 def _routing_policy(records, scope):

@@ -1,0 +1,109 @@
+import contextlib
+import importlib
+import io
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+
+
+ROOT = Path(__file__).resolve().parent.parent
+HOOKS = ROOT / "hooks"
+sys.path.insert(0, str(HOOKS))
+claude_post = importlib.import_module("claude_post_tool")
+post_tool = importlib.import_module("post_tool")
+
+
+class ClaudeHookTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.old_env = os.environ.copy()
+        os.environ["TOKENPIPE_HOME"] = self.temp.name
+        os.environ["TOKENPIPE_MIN_TOKENS_ESTIMATE"] = "10"
+        os.environ["TOKENPIPE_MODE"] = "safe"
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self.old_env)
+        self.temp.cleanup()
+
+    def event(self, stdout="", stderr="", **response_fields):
+        response = {
+            "stdout": stdout,
+            "stderr": stderr,
+            "interrupted": False,
+            "isImage": False,
+        }
+        response.update(response_fields)
+        return {
+            "session_id": "claude-session",
+            "tool_use_id": "toolu_123",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "pytest -q"},
+            "tool_response": response,
+        }
+
+    def test_replaces_stdout_preserves_shape_and_recovers_raw(self):
+        raw = "same line\n" * 400
+        event = self.event(raw, "warning\n", duration_ms=17)
+        result = claude_post.adapt(event)
+        specific = result["hookSpecificOutput"]
+        updated = specific["updatedToolOutput"]
+        self.assertLess(len(updated["stdout"]), len(raw))
+        self.assertEqual(updated["stderr"], "warning\n")
+        self.assertEqual(updated["interrupted"], False)
+        self.assertEqual(updated["isImage"], False)
+        self.assertEqual(updated["duration_ms"], 17)
+        self.assertNotIn("permissionDecision", json.dumps(result))
+        context = specific["additionalContext"]
+        self.assertIn("tokenpipe-claude-v1", context)
+        raw_ref = context.split("stdout raw_ref=", 1)[1].split(";", 1)[0]
+        self.assertEqual(claude_post.tokenpipe.show_raw(raw_ref), raw)
+
+    def test_each_changed_stream_has_its_own_recovery_ref(self):
+        stdout = "out repeat\n" * 400
+        stderr = "ERROR repeated\n" * 400
+        result = claude_post.adapt(self.event(stdout, stderr))["hookSpecificOutput"]
+        context = result["additionalContext"]
+        stdout_ref = context.split("stdout raw_ref=", 1)[1].split(",", 1)[0]
+        stderr_ref = context.split("stderr raw_ref=", 1)[1].split(";", 1)[0]
+        self.assertNotEqual(stdout_ref, stderr_ref)
+        self.assertEqual(claude_post.tokenpipe.show_raw(stdout_ref), stdout)
+        self.assertEqual(claude_post.tokenpipe.show_raw(stderr_ref), stderr)
+
+    def test_small_binary_unknown_and_audit_are_exact_passthrough(self):
+        self.assertIsNone(claude_post.adapt(self.event("ok\n")))
+        self.assertIsNone(claude_post.adapt(self.event("same\n" * 400, isImage=True)))
+        malformed = self.event("same\n" * 400)
+        malformed["tool_response"] = "not-an-object"
+        self.assertIsNone(claude_post.adapt(malformed))
+        self.assertIsNone(claude_post.adapt(self.event("same\n" * 400), "audit"))
+
+    def test_raw_spool_failure_is_fail_open(self):
+        original = claude_post.tokenpipe.spool_raw
+        claude_post.tokenpipe.spool_raw = lambda *args, **kwargs: (_ for _ in ()).throw(OSError("full"))
+        try:
+            self.assertIsNone(claude_post.adapt(self.event("same\n" * 400)))
+        finally:
+            claude_post.tokenpipe.spool_raw = original
+
+    def test_shared_post_hook_dispatches_only_in_claude_environment(self):
+        os.environ["CLAUDE_PLUGIN_ROOT"] = str(ROOT)
+        event = self.event("same line\n" * 400)
+        old_stdin = sys.stdin
+        sys.stdin = io.StringIO(json.dumps(event))
+        visible = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(visible):
+                post_tool.main()
+        finally:
+            sys.stdin = old_stdin
+        result = json.loads(visible.getvalue())
+        self.assertIn("updatedToolOutput", result["hookSpecificOutput"])
+
+
+if __name__ == "__main__":
+    unittest.main()

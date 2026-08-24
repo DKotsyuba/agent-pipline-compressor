@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 
 
@@ -110,6 +111,44 @@ class HookSecurityTests(unittest.TestCase):
         self.assertIs(calls[0][1]["stderr"], common.subprocess.DEVNULL)
         self.assertEqual(calls[0][1]["check"], False)
 
+    def test_agent_run_post_fallback_replaces_only_after_raw_recovery(self):
+        os.environ["TOKENPIPE_MODE"] = "safe"
+        os.environ["TOKENPIPE_POST_REPLACE"] = "1"
+        token_home = tempfile.TemporaryDirectory()
+        self.addCleanup(token_home.cleanup)
+        os.environ["TOKENPIPE_HOME"] = token_home.name
+        os.environ["TOKENPIPE_MIN_TOKENS_ESTIMATE"] = "10"
+        event = {
+            "session_id": "post-session",
+            "tool_use_id": "post-call",
+            "tool_input": {"cmd": "find . -type f -print", "shell": "bash"},
+            "tool_response": {"aggregatedOutput": "same line\n" * 400, "exitCode": 0},
+        }
+        old_stdin = sys.stdin
+        sys.stdin = io.StringIO(json.dumps(event))
+        visible = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(visible):
+                post_tool.main()
+        finally:
+            sys.stdin = old_stdin
+        response = json.loads(visible.getvalue())
+        self.assertEqual(response["decision"], "block")
+        self.assertIn("tokenpipe-post-v1 mode=safe", response["reason"])
+        raw_ref = response["reason"].split("raw_ref=", 1)[1].splitlines()[0]
+        with open(raw_ref, "r", encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "same line\n" * 400)
+
+    def test_agent_run_post_fallback_is_silent_without_recoverable_replacement(self):
+        os.environ["TOKENPIPE_MODE"] = "safe"
+        os.environ["TOKENPIPE_POST_REPLACE"] = "1"
+        original = post_tool.run_post_process
+        post_tool.run_post_process = lambda *_: {"action": "passthrough", "raw_ref": None}
+        try:
+            self.assertEqual(self.run_post("same line\n" * 400, "safe"), "")
+        finally:
+            post_tool.run_post_process = original
+
     def test_safe_and_full_allowlists(self):
         safe_yes = ["git status", "git diff --stat", "rg TODO src", "find . -type f", "ls -la", "docker ps"]
         full_only = ["pytest -q", "cargo test", "go build ./...", "npm run lint", "ruff check ."]
@@ -133,14 +172,44 @@ class HookSecurityTests(unittest.TestCase):
         wrapped = pre_tool.rewrite("git diff --stat", "safe")
         self.assertEqual(
             wrapped,
-            "/usr/bin/python3 {} exec --category git-read -- git diff --stat".format(
-                str(common.TOKENPIPE)
+            "{} {} exec --category git-read -- git diff --stat".format(
+                pre_tool.shlex.quote(sys.executable), str(common.TOKENPIPE)
             ),
         )
         self.assertNotIn("base64", wrapped.lower())
         self.assertNotIn("&&", wrapped)
         self.assertNotIn("|", wrapped)
         self.assertNotIn(";", wrapped)
+
+    def test_unified_exec_shell_envelope_is_unwrapped_but_inner_syntax_stays_strict(self):
+        wrapped = pre_tool.rewrite("/bin/bash -c 'git status'", "safe")
+        self.assertTrue(wrapped.endswith("-- git status"), wrapped)
+        self.assertIsNone(pre_tool.rewrite("/bin/bash -c 'git status && git push'", "safe"))
+        self.assertIsNone(pre_tool.rewrite("/bin/bash -c 'rg $PATTERN src'", "safe"))
+        self.assertIsNone(pre_tool.rewrite("bash -c 'git status'", "safe"))
+
+    def test_real_unified_exec_response_shape_is_observed(self):
+        event = {
+            "tool_input": {"cmd": "find . -type f -print", "shell": "bash", "login": False},
+            "tool_response": {"aggregatedOutput": "one\ntwo\n", "exitCode": 0},
+        }
+        self.assertEqual(common.tool_output(event), "one\ntwo\n")
+        self.assertEqual(common.command_category(common.command_from(event)), "filesystem")
+
+        os.environ["TOKENPIPE_MODE"] = "safe"
+        old_stdin = sys.stdin
+        sys.stdin = io.StringIO(json.dumps(event))
+        visible = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(visible):
+                pre_tool.main()
+        finally:
+            sys.stdin = old_stdin
+        updated = json.loads(visible.getvalue())["hookSpecificOutput"]["updatedInput"]
+        self.assertIn("tokenpipe.py exec --category search", updated["cmd"])
+        self.assertEqual(updated["shell"], "bash")
+        self.assertEqual(updated["login"], False)
+        self.assertNotIn("command", updated)
 
     def test_audit_mode_does_not_rewrite(self):
         self.assertIsNone(pre_tool.rewrite("git status", "audit"))
@@ -188,9 +257,39 @@ class HookSecurityTests(unittest.TestCase):
             for hook in group["hooks"]
         ]
         self.assertEqual(commands, [
-            '/usr/bin/python3 "$PLUGIN_ROOT/hooks/pre_tool.py"',
-            '/usr/bin/python3 "$PLUGIN_ROOT/hooks/post_tool.py"',
+            '/Library/Frameworks/Python.framework/Versions/3.8/bin/python3 "${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/hooks/pre_tool.py"',
+            '/Library/Frameworks/Python.framework/Versions/3.8/bin/python3 "${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/hooks/post_tool.py"',
         ])
+
+    def test_claude_host_does_not_rewrite_bash_command(self):
+        os.environ["TOKENPIPE_MODE"] = "safe"
+        os.environ.pop("PLUGIN_ROOT", None)
+        os.environ["CLAUDE_PLUGIN_ROOT"] = str(ROOT)
+        event = {"tool_input": {"command": "git status"}}
+        old_stdin = sys.stdin
+        sys.stdin = io.StringIO(json.dumps(event))
+        visible = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(visible):
+                pre_tool.main()
+        finally:
+            sys.stdin = old_stdin
+        self.assertEqual(visible.getvalue(), "")
+
+    def test_codex_plugin_root_wins_when_both_host_variables_exist(self):
+        os.environ["TOKENPIPE_MODE"] = "safe"
+        os.environ["PLUGIN_ROOT"] = str(ROOT)
+        os.environ["CLAUDE_PLUGIN_ROOT"] = str(ROOT)
+        event = {"tool_input": {"cmd": "git status", "shell": "bash"}}
+        old_stdin = sys.stdin
+        sys.stdin = io.StringIO(json.dumps(event))
+        visible = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(visible):
+                pre_tool.main()
+        finally:
+            sys.stdin = old_stdin
+        self.assertIn("tokenpipe.py exec --category git-read", visible.getvalue())
 
 
 if __name__ == "__main__":

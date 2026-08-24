@@ -1,7 +1,7 @@
 # Codex Token Pipeline
 
 Local, deterministic Bash-output auditing and compression for Codex Desktop and
-CLI. The plugin does not change the model provider, proxy provider credentials,
+CLI and Claude Code. The plugin does not change the model provider, proxy provider credentials,
 call a model, register an MCP server, or set Codex `tool_output_token_limit`.
 
 ## Modes
@@ -10,10 +10,11 @@ call a model, register an MCP server, or set Codex `tool_output_token_limit`.
 - `safe`: PreToolUse wraps only strict read-only commands (`git` reads, `rg`, safe `find`/`ls`, `docker ps/logs`) in the native tokenpipe executor.
 - `full`: safe mode plus selected test/build/lint commands. Enable only after checking approval UX in your Codex environment.
 
-PostToolUse is observation-only in every mode. It never copies tool output into
-hook `additionalContext` or developer context. Active compression happens
-inside the pre-execution wrapper, so compressed text remains ordinary Bash
-tool-role output.
+PostToolUse is observation-only in ordinary Codex sessions. It never copies
+tool output into hook `additionalContext` or developer context. Active ordinary
+Codex compression happens inside the pre-execution wrapper, so compressed text
+remains ordinary Bash tool-role output. The isolated `agent-run` read-only
+fallback is documented separately below.
 
 Change mode from the versioned source checkout:
 
@@ -52,6 +53,44 @@ python3 -m unittest discover -s tests -v
 RTK captures remain measurable, but an RTK result that changes output is not
 eligible for the lab's deployable policy until the original output is
 recoverable without executing the command twice.
+
+## Claude Code
+
+The same source tree is a Claude Code plugin. Claude keeps native command and
+permission handling; its `PostToolUse` hook compresses text `stdout`/`stderr`
+and returns `updatedToolOutput`. Every changed stream gets a private `raw_ref`.
+Unknown, binary, image, oversized, or unspoolable results pass through exactly.
+
+Install globally from the bundled local marketplace:
+
+```bash
+claude plugin marketplace add ~/plugins/codex-token-pipeline --scope user
+claude plugin install codex-token-pipeline@tokenpipe-local --scope user
+```
+
+For isolated print-mode runners, load the source explicitly:
+
+```bash
+claude --bare --plugin-dir ~/plugins/codex-token-pipeline -p "..."
+```
+
+Claude and Codex share the persisted tokenpipe mode unless `TOKENPIPE_HOME` or
+`TOKENPIPE_MODE` overrides it. `audit` observes only; `safe` and `full` may
+replace eligible text output after successful raw spooling.
+
+## agent-run
+
+`agent-run` Claude loads the source explicitly with `--safe-mode --plugin-dir`.
+Its isolated Codex home (`~/.codex-crew`) has this plugin installed and its two
+hooks explicitly trusted.
+
+Write-capable Codex agents use the native pre-execution wrapper. Read-only
+Codex agents cannot create a raw spool inside their tool sandbox, so the wrapper
+fails open to the validated original command; `agent-run` sets
+`TOKENPIPE_POST_REPLACE=1`, allowing the outside-sandbox PostToolUse hook to
+spool and replace only when recovery succeeds. That `raw_ref` restores the
+exact PostToolUse input, which may already reflect Codex's own tool-output cap.
+No other Codex environment enables this fallback.
 
 When tokenpipe invokes RTK inside the Codex sandbox, it defaults `RTK_DB_PATH`
 to the private tokenpipe runtime directory under `$TMPDIR`; an explicit user
@@ -109,14 +148,14 @@ python3 ~/plugins/codex-token-pipeline/scripts/tokenpipe.py show <raw_ref>
   read-only sandbox), the wrapper replaces itself with the original validated
   command and performs no compression.
 - Cancellation is forwarded to the child process group with bounded SIGKILL fallback and reap.
-- `decision:block`, PostToolUse replacement, model calls, and provider proxies are not used.
+- Model calls and provider proxies are not used. `decision:block` PostToolUse
+  replacement is restricted to the explicit `agent-run` read-only fallback.
 - RTK requires explicit persisted configuration and is validated again before execution.
 
-Codex currently cannot replace model-visible output from `PostToolUse`, so
-non-wrapped commands remain audit-only. `safe` deliberately rejects compound
-shell syntax; use one eligible read-only command per tool call when active
-compression matters. Arbitrary pipeline execution is outside this plugin's
-`shell=False` security boundary.
+Ordinary Codex non-wrapped commands remain audit-only. `safe` deliberately
+rejects compound shell syntax; use one eligible read-only command per tool call
+when active compression matters. Arbitrary pipeline execution is outside this
+plugin's `shell=False` security boundary.
 
 The CCA-style algorithm is an independent implementation inspired by the
 recovery and conservative-selection ideas in

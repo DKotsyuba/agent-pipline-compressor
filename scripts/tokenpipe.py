@@ -938,9 +938,9 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
     if rtk_used:
         command_argv = [rtk_path] + command_argv
     child_env = os.environ.copy()
-    if rtk_used:
-        child_env.setdefault("RTK_DB_PATH", os.path.join(_runtime_home(), "rtk-history.db"))
     try:
+        if rtk_used:
+            child_env.setdefault("RTK_DB_PATH", os.path.join(_runtime_home(), "rtk-history.db"))
         returncode, stdout_bytes, stderr_bytes, capture_overflow = _run_captured(
             command_argv, child_env
         )
@@ -953,13 +953,9 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
                 "\ntokenpipe: child terminated after captured output exceeded "
                 "%d bytes\n" % _capture_limit()
             )
-    except PermissionError as exc:
+    except (PermissionError, OSError) as exc:
         if exec_fallback:
             os.execvpe(original_command_argv[0], original_command_argv, os.environ.copy())
-        exit_status = 127
-        stdout = ""
-        stderr = "%s: %s" % (type(exc).__name__, exc)
-    except OSError as exc:
         exit_status = 127
         stdout = ""
         stderr = "%s: %s" % (type(exc).__name__, exc)
@@ -1229,9 +1225,7 @@ def main(argv=None):
             payload = json.load(sys.stdin)
             if not isinstance(payload, dict):
                 raise ValueError("payload must be a JSON object")
-            # PostToolUse is observability-only. Safe/full replacement happens
-            # exclusively inside `exec`, before the native tool result exists.
-            result = process(payload, "audit")
+            result = process(payload, args.mode or "audit")
         except Exception as exc:
             result = {
                 "ok": False, "action": "passthrough", "output": "", "mode": args.mode or "audit",

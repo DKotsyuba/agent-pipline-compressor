@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 from typing import Any, Dict, Iterable, Optional
@@ -68,7 +69,7 @@ def _strings(value: Any) -> Iterable[str]:
                 if key in value:
                     yield from _strings(value[key])
             return
-        for key in ("output", "text", "content", "result"):
+        for key in ("aggregatedOutput", "output", "text", "content", "result"):
             if key in value:
                 yield from _strings(value[key])
                 return
@@ -92,16 +93,32 @@ def tool_input(event: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def command_from(event: Dict[str, Any]) -> Optional[str]:
-    value = tool_input(event).get("command")
-    return value if isinstance(value, str) else None
+    value = tool_input(event)
+    for key in ("command", "cmd"):
+        command = value.get(key)
+        if isinstance(command, str):
+            return command
+    return None
+
+
+def unwrap_shell_command(command: str) -> str:
+    """Unwrap Codex unified exec's exact `/bin/bash -c <command>` envelope."""
+    try:
+        words = shlex.split(command, posix=True)
+    except ValueError:
+        return command
+    if (len(words) == 3 and Path(words[0]).name in {"bash", "sh", "zsh"}
+            and os.path.isabs(words[0]) and words[1] == "-c"):
+        return words[2]
+    return command
 
 
 def command_category(command: Optional[str]) -> str:
     """Return a coarse non-secret category, never the command or its arguments."""
     if not command:
         return "unknown"
+    command = unwrap_shell_command(command)
     try:
-        import shlex
         words = shlex.split(command, posix=True)
     except ValueError:
         return "unknown"
@@ -199,6 +216,29 @@ def run_audit(event: Dict[str, Any], output: str) -> None:
         )
     except (OSError, subprocess.SubprocessError):
         return
+
+
+def run_post_process(event: Dict[str, Any], output: str, active_mode: str) -> Optional[Dict[str, Any]]:
+    """Run the shared compressor and return only its bounded structured result."""
+    if active_mode not in {"safe", "full"} or not TOKENPIPE.is_file():
+        return None
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(TOKENPIPE), "post", "--mode", active_mode],
+            input=json.dumps(post_request(event, output), ensure_ascii=False),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=_hook_timeout(),
+            check=False,
+            env=os.environ.copy(),
+        )
+        if completed.returncode != 0 or len(completed.stdout) > 1024 * 1024:
+            return None
+        value = json.loads(completed.stdout)
+        return value if isinstance(value, dict) else None
+    except (OSError, TypeError, ValueError, subprocess.SubprocessError):
+        return None
 
 
 def run_skip(event: Dict[str, Any], reason: str) -> None:

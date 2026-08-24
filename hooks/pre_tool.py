@@ -2,6 +2,7 @@
 """Route strict Bash commands through tokenpipe before execution."""
 
 from pathlib import Path
+import os
 import re
 import shlex
 import sys
@@ -9,7 +10,7 @@ from typing import List, Optional
 
 sys.dont_write_bytecode = True
 
-from common import TOKENPIPE, _safe_id, emit, mode, read_event, tool_input
+from common import TOKENPIPE, _safe_id, emit, mode, read_event, tool_input, unwrap_shell_command
 
 
 ENV_PREFIX = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
@@ -123,6 +124,7 @@ def rewrite(command: str, active_mode: Optional[str] = None,
     active_mode = active_mode or mode()
     if active_mode not in {"safe", "full"}:
         return None
+    command = unwrap_shell_command(command)
     if not command.strip() or _has_forbidden_syntax(command):
         return None
     try:
@@ -139,7 +141,7 @@ def rewrite(command: str, active_mode: Optional[str] = None,
     # Only the already parsed argv is shell-quoted; no opaque/base64 transport is
     # used, keeping approvals and diagnostics human-readable.
     fields = [
-        "/usr/bin/python3", shlex.quote(str(TOKENPIPE)), "exec",
+        shlex.quote(sys.executable), shlex.quote(str(TOKENPIPE)), "exec",
         "--category", category,
     ]
     if session_id:
@@ -150,6 +152,11 @@ def rewrite(command: str, active_mode: Optional[str] = None,
 
 
 def main() -> int:
+    # Claude Code replaces tool output directly in PostToolUse. Rewriting the
+    # command there would duplicate execution policy and lose Claude's native
+    # permission semantics.
+    if os.environ.get("CLAUDE_PLUGIN_ROOT") and not os.environ.get("PLUGIN_ROOT"):
+        return 0
     active_mode = mode()
     if active_mode not in {"safe", "full"}:
         return 0
@@ -157,9 +164,11 @@ def main() -> int:
     if event is None:
         return 0
     original_input = tool_input(event)
-    command = original_input.get("command")
-    if not isinstance(command, str):
+    command_key = next((key for key in ("command", "cmd")
+                        if isinstance(original_input.get(key), str)), None)
+    if command_key is None:
         return 0
+    command = original_input[command_key]
     session_id = _safe_id(event.get("session_id"))
     tool_call_id = _safe_id(event.get("tool_use_id") or event.get("tool_call_id"))
     updated_command = rewrite(command, active_mode, session_id, tool_call_id)
@@ -168,7 +177,7 @@ def main() -> int:
     # Preserve every Bash input field (cwd, timeout, tty, etc.) and change only
     # the command. This also keeps permission/sandbox metadata intact.
     updated_input = dict(original_input)
-    updated_input["command"] = updated_command
+    updated_input[command_key] = updated_command
     emit({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",

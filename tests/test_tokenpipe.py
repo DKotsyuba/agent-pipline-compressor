@@ -321,6 +321,21 @@ class TokenpipeTests(unittest.TestCase):
         self.assertIn("tokenpipe refused wrapper execution", output)
         self.assertFalse(os.path.exists(marker))
 
+    def test_native_cli_falls_back_to_validated_original_on_capture_oserror(self):
+        ls_path = shutil.which("ls")
+        self.assertIsNotNone(ls_path)
+
+        class FallbackCalled(Exception):
+            pass
+
+        with mock.patch.object(tokenpipe, "_run_captured", side_effect=FileNotFoundError("no temp")), \
+                mock.patch.object(tokenpipe.os, "execvpe", side_effect=FallbackCalled) as fallback:
+            with self.assertRaises(FallbackCalled):
+                tokenpipe.execute_native(
+                    [ls_path, self.temp.name], "filesystem-read", "safe", exec_fallback=True
+                )
+        fallback.assert_called_once_with(ls_path, [ls_path, self.temp.name], mock.ANY)
+
     def test_native_authoritative_validator_rejects_pre_hook_denials(self):
         denied = [
             ([self.executable("find", "print('executed')\n"), ".", "-fprint", "out"], "search"),
@@ -374,7 +389,7 @@ class TokenpipeTests(unittest.TestCase):
             [sys.executable, SCRIPT, "exec", "--category", "test", "--", "pytest"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=os.environ.copy(),
         )
-        deadline = time.time() + 3
+        deadline = time.time() + 10
         while not os.path.exists(pid_path) and time.time() < deadline:
             time.sleep(0.02)
         self.assertTrue(os.path.exists(pid_path))

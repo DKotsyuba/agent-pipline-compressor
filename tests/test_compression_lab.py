@@ -270,9 +270,9 @@ raise SystemExit(subprocess.run(command, check=False).returncode)
         self.assertGreater(rows[0]["latency_penalty"], 0)
         self.assertTrue(all("p95_latency_ms" in row for row in lab._pareto(rows)))
 
-    def test_sub_tolerance_latency_noise_prefers_shorter_equivalent_pipeline(self):
+    def test_latency_guard_prefers_shorter_equivalent_pipeline(self):
         case = lab.Case("same", "x", "plain", 1, 0, "x" * 100)
-        shorter = lab.evaluate_candidate(case, case.raw, "x" * 10, 0, True, "local", ("cca",), 10)
+        shorter = lab.evaluate_candidate(case, case.raw, "x" * 10, 0, True, "local", ("cca",), 40)
         noisily_faster = lab.evaluate_candidate(case, case.raw, "x" * 10, 0, True, "local", ("ansi", "cca"), 1)
         self.assertEqual(lab._best([shorter, noisily_faster])["id"], "local:cca")
         records = [{"scope": "command-matrix", "category": "x", "weight": 1,
