@@ -732,7 +732,7 @@ def _terminate_group(process, signum):
             pass
 
 
-def _run_captured(argv):
+def _run_captured(argv, child_env=None):
     """Run one child with disk-backed bounded capture and signal forwarding."""
     capture_home = _runtime_home()
     _mkdir_private(capture_home)
@@ -742,7 +742,8 @@ def _run_captured(argv):
     captured = {"bytes": 0}
     with tempfile.TemporaryFile(dir=capture_home) as stdout_file, tempfile.TemporaryFile(dir=capture_home) as stderr_file:
         process = subprocess.Popen(
-            argv, shell=False, cwd=None, env=os.environ.copy(),
+            argv, shell=False, cwd=None,
+            env=(os.environ if child_env is None else child_env).copy(),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
         )
         previous = {}
@@ -936,8 +937,13 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
     rtk_used = bool(want_rtk and category_ok and trusted_rtk_path(rtk_path))
     if rtk_used:
         command_argv = [rtk_path] + command_argv
+    child_env = os.environ.copy()
+    if rtk_used:
+        child_env.setdefault("RTK_DB_PATH", os.path.join(_runtime_home(), "rtk-history.db"))
     try:
-        returncode, stdout_bytes, stderr_bytes, capture_overflow = _run_captured(command_argv)
+        returncode, stdout_bytes, stderr_bytes, capture_overflow = _run_captured(
+            command_argv, child_env
+        )
         exit_status = int(returncode)
         stdout = stdout_bytes.decode("utf-8", "replace")
         stderr = stderr_bytes.decode("utf-8", "replace")

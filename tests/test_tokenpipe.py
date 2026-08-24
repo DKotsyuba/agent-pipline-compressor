@@ -440,9 +440,11 @@ class TokenpipeTests(unittest.TestCase):
         self.assertEqual(metric["original_bytes"], 0)
 
     def test_rtk_direct_prefix_requires_trusted_absolute_binary(self):
+        db_path_seen = os.path.join(self.temp.name, "rtk-db-path-seen")
         rtk = self.executable(
             "rtk",
-            "import os, sys\nos.execv(sys.argv[1], sys.argv[1:])\n",
+            "import os, sys\nopen(%r, 'w').write(os.environ.get('RTK_DB_PATH', ''))\n"
+            "os.execv(sys.argv[1], sys.argv[1:])\n" % db_path_seen,
         )
         ls_path = "/bin/ls"
         try:
@@ -459,6 +461,15 @@ class TokenpipeTests(unittest.TestCase):
             self.assertEqual(report["native_calls"], 1)
             self.assertEqual(report["rtk_owned_calls"], 1)
             self.assertEqual(report["native_call_coverage_percent_estimate"], 100.0)
+            with open(db_path_seen, "r", encoding="utf-8") as handle:
+                self.assertEqual(
+                    handle.read(), os.path.join(tokenpipe._runtime_home(), "rtk-history.db")
+                )
+            custom_db = os.path.join(self.temp.name, "custom-rtk.db")
+            os.environ["RTK_DB_PATH"] = custom_db
+            tokenpipe.execute_native([ls_path, self.temp.name], "filesystem-read", "safe")
+            with open(db_path_seen, "r", encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), custom_db)
             os.chmod(rtk, 0o722)
             output, status_code = tokenpipe.execute_native(
                 [ls_path, self.temp.name], "filesystem-read", "safe"

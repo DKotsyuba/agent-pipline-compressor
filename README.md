@@ -39,6 +39,12 @@ tokenpipe `raw_ref` for them. Keep RTK disabled when you want measurable local
 compression and recovery; enable it only when `rtk gain` independently shows a
 benefit on your workload.
 
+When tokenpipe invokes RTK inside the Codex sandbox, it defaults `RTK_DB_PATH`
+to the private tokenpipe runtime directory under `$TMPDIR`; an explicit user
+`RTK_DB_PATH` still wins. This keeps `rtk gain` tracking writable without
+broadening filesystem permissions. The operating system may sweep that runtime
+directory, so set an explicit writable path when durable RTK history matters.
+
 ## Statistics
 
 ```bash
