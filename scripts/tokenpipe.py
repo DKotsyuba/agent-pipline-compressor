@@ -936,7 +936,7 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
     want_rtk = use_rtk if use_rtk is not None else persisted_rtk_enabled
     rtk_used = bool(want_rtk and category_ok and trusted_rtk_path(rtk_path))
     if rtk_used:
-        command_argv = [rtk_path] + command_argv
+        command_argv = [rtk_path, os.path.basename(str(argv[0]))] + command_argv[1:]
     child_env = os.environ.copy()
     try:
         if rtk_used:
@@ -973,11 +973,6 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
             strategy = "capture-overflow"
             skip_reason = "capture-overflow"
             candidate = bound_candidate(body)
-        elif rtk_used:
-            # RTK already owns filtering for this command. Do not stack Lite or
-            # CCA on its output; RTK savings are reported by `rtk gain` while
-            # tokenpipe records adoption and observed output size.
-            skip_reason = "rtk-owned-output"
         elif content_category in ("code", "diff", "config"):
             skip_reason = content_category + "-passthrough"
         elif estimate_tokens(body) < max(1, int(os.environ.get("TOKENPIPE_MIN_TOKENS_ESTIMATE", "1500"))):

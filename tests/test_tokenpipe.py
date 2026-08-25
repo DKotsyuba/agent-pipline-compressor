@@ -456,10 +456,12 @@ class TokenpipeTests(unittest.TestCase):
 
     def test_rtk_direct_prefix_requires_trusted_absolute_binary(self):
         db_path_seen = os.path.join(self.temp.name, "rtk-db-path-seen")
+        command_seen = os.path.join(self.temp.name, "rtk-command-seen")
         rtk = self.executable(
             "rtk",
             "import os, sys\nopen(%r, 'w').write(os.environ.get('RTK_DB_PATH', ''))\n"
-            "os.execv(sys.argv[1], sys.argv[1:])\n" % db_path_seen,
+            "open(%r, 'w').write(sys.argv[1])\nos.execvp(sys.argv[1], sys.argv[1:])\n"
+            % (db_path_seen, command_seen),
         )
         ls_path = "/bin/ls"
         try:
@@ -476,6 +478,8 @@ class TokenpipeTests(unittest.TestCase):
             self.assertEqual(report["native_calls"], 1)
             self.assertEqual(report["rtk_owned_calls"], 1)
             self.assertEqual(report["native_call_coverage_percent_estimate"], 100.0)
+            with open(command_seen, "r", encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "ls")
             with open(db_path_seen, "r", encoding="utf-8") as handle:
                 self.assertEqual(
                     handle.read(), os.path.join(tokenpipe._runtime_home(), "rtk-history.db")
@@ -491,6 +495,34 @@ class TokenpipeTests(unittest.TestCase):
             )
             self.assertEqual(status_code, 0)
             self.assertNotIn("strategy=rtk-direct", output.splitlines()[0])
+        finally:
+            tokenpipe.set_configured_rtk(None)
+
+    def test_rtk_no_savings_output_falls_through_to_deterministic_compression(self):
+        command_seen = os.path.join(self.temp.name, "rtk-fallback-command-seen")
+        rtk = self.executable(
+            "rtk",
+            "import os, sys\nopen(%r, 'w').write(sys.argv[1])\n"
+            "os.execvp(sys.argv[1], sys.argv[1:])\n" % command_seen,
+        )
+        rg_target = self.executable("rg-real", "print('same log line\\n' * 500, end='')\n")
+        rg = os.path.join(self.temp.name, "rg")
+        os.symlink(rg_target, rg)
+        try:
+            tokenpipe.set_configured_rtk(rtk)
+            output, status_code = tokenpipe.execute_native(
+                [rg, "needle"], "search", "safe", "rtk-session", "rtk-fallback"
+            )
+            self.assertEqual(status_code, 0)
+            self.assertIn("strategy=rtk-direct_lite-log", output.splitlines()[0])
+            self.assertIn("raw_ref=", output.splitlines()[0])
+            self.assertIn("previous line repeated", output)
+            with open(command_seen, "r", encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "rg")
+            metric = tokenpipe.load_metrics()[-1]
+            self.assertTrue(metric["rtk_used"])
+            self.assertEqual(metric["strategy"], "rtk-direct+lite-log")
+            self.assertGreater(metric["original_bytes"], metric["shown_bytes"])
         finally:
             tokenpipe.set_configured_rtk(None)
 
