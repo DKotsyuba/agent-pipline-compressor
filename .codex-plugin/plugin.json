@@ -1,5 +1,5 @@
 {
-  "name": "codex-token-pipeline",
+  "name": "agent-pipline-compressor",
   "version": "0.1.0+codex.20260825100009",
   "description": "Local audit and compression pipeline for Codex Bash tool output.",
   "author": {
@@ -14,7 +14,7 @@
     "rtk"
   ],
   "interface": {
-    "displayName": "Codex Token Pipeline",
+    "displayName": "Agent Pipline Compressor",
     "shortDescription": "Measure and compress noisy Bash tool output locally.",
     "longDescription": "Audits Codex Bash output, records private savings metrics, and can selectively apply deterministic Lite, CCA-style, and RTK compression with recoverable raw output.",
     "developerName": "Local developer",
@@ -24,6 +24,6 @@
       "Local",
       "Analytics"
     ],
-    "defaultPrompt": "Show me how to inspect Codex Token Pipeline savings."
+    "defaultPrompt": "Show me how to inspect Agent Pipline Compressor savings."
   }
 }

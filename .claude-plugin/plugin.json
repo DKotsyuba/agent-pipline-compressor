@@ -1,5 +1,5 @@
 {
-  "name": "codex-token-pipeline",
+  "name": "agent-pipline-compressor",
   "version": "0.1.7",
   "description": "Local deterministic compression and recovery for Claude Code Bash tool output.",
   "author": {

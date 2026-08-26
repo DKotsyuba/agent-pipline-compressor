@@ -6,7 +6,7 @@
   "description": "Local dual-host token pipeline plugins.",
   "plugins": [
     {
-      "name": "codex-token-pipeline",
+      "name": "agent-pipline-compressor",
       "source": "./",
       "version": "0.1.7",
       "description": "Deterministic tool-output compression with recoverable raw output."

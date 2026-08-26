@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared, fail-open helpers for Codex Token Pipeline hooks.
+"""Shared, fail-open helpers for Agent Pipline Compressor hooks.
 
 The hook layer deliberately does not persist prompts, commands, or raw output.
 Persistence and aggregate accounting belong to ``scripts/tokenpipe.py``.

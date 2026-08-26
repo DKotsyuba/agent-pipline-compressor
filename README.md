@@ -1,4 +1,4 @@
-# Codex Token Pipeline
+# Agent Pipline Compressor
 
 Local, deterministic Bash-output auditing and compression for Codex Desktop and
 CLI and Claude Code. The plugin does not change the model provider, proxy provider credentials,
@@ -19,9 +19,9 @@ fallback is documented separately below.
 Change mode from the versioned source checkout:
 
 ```bash
-python3 ~/plugins/codex-token-pipeline/scripts/tokenpipe.py mode audit
-python3 ~/plugins/codex-token-pipeline/scripts/tokenpipe.py mode safe
-python3 ~/plugins/codex-token-pipeline/scripts/tokenpipe.py mode full
+python3 ~/plugins/agent-pipline-compressor/scripts/tokenpipe.py mode audit
+python3 ~/plugins/agent-pipline-compressor/scripts/tokenpipe.py mode safe
+python3 ~/plugins/agent-pipline-compressor/scripts/tokenpipe.py mode full
 ```
 
 Start a new Codex task after changing plugin installation or hook definitions.
@@ -30,8 +30,8 @@ Mode changes are read per hook call and do not require reinstalling the plugin.
 Optional RTK integration is configured separately with a trusted absolute binary:
 
 ```bash
-python3 ~/plugins/codex-token-pipeline/scripts/tokenpipe.py rtk /absolute/path/to/rtk
-python3 ~/plugins/codex-token-pipeline/scripts/tokenpipe.py rtk off
+python3 ~/plugins/agent-pipline-compressor/scripts/tokenpipe.py rtk /absolute/path/to/rtk
+python3 ~/plugins/agent-pipline-compressor/scripts/tokenpipe.py rtk off
 ```
 
 RTK owns output filtering when selected; Lite/CCA are not stacked after it.
@@ -64,14 +64,14 @@ Unknown, binary, image, oversized, or unspoolable results pass through exactly.
 Install globally from the bundled local marketplace:
 
 ```bash
-claude plugin marketplace add ~/plugins/codex-token-pipeline --scope user
-claude plugin install codex-token-pipeline@tokenpipe-local --scope user
+claude plugin marketplace add ~/plugins/agent-pipline-compressor --scope user
+claude plugin install agent-pipline-compressor@tokenpipe-local --scope user
 ```
 
 For isolated print-mode runners, load the source explicitly:
 
 ```bash
-claude --bare --plugin-dir ~/plugins/codex-token-pipeline -p "..."
+claude --bare --plugin-dir ~/plugins/agent-pipline-compressor -p "..."
 ```
 
 Claude and Codex share the persisted tokenpipe mode unless `TOKENPIPE_HOME` or
@@ -101,9 +101,9 @@ directory, so set an explicit writable path when durable RTK history matters.
 ## Statistics
 
 ```bash
-python3 ~/plugins/codex-token-pipeline/scripts/tokenpipe.py stats
-python3 ~/plugins/codex-token-pipeline/scripts/tokenpipe.py stats --since 24h
-python3 ~/plugins/codex-token-pipeline/scripts/tokenpipe.py stats --json
+python3 ~/plugins/agent-pipline-compressor/scripts/tokenpipe.py stats
+python3 ~/plugins/agent-pipline-compressor/scripts/tokenpipe.py stats --since 24h
+python3 ~/plugins/agent-pipline-compressor/scripts/tokenpipe.py stats --json
 ```
 
 Stats separate audit-only observations from native wrapped calls, report native
@@ -130,7 +130,7 @@ Codex home. The default retention is seven days with a 256 MiB total cap, though
 the operating system may sweep temporary files sooner. Read a returned reference with:
 
 ```bash
-python3 ~/plugins/codex-token-pipeline/scripts/tokenpipe.py show <raw_ref>
+python3 ~/plugins/agent-pipline-compressor/scripts/tokenpipe.py show <raw_ref>
 ```
 
 ## Design
