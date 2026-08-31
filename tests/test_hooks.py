@@ -20,6 +20,11 @@ post_tool = importlib.import_module("post_tool")
 class HookSecurityTests(unittest.TestCase):
     def setUp(self):
         self.old_env = os.environ.copy()
+        # Isolate from the developer machine's live tokenpipe config: a real
+        # persisted mode/post_replace value must never leak into hook tests.
+        token_home = tempfile.TemporaryDirectory()
+        self.addCleanup(token_home.cleanup)
+        os.environ["TOKENPIPE_HOME"] = token_home.name
 
     def tearDown(self):
         os.environ.clear()
@@ -423,6 +428,8 @@ class HookSecurityTests(unittest.TestCase):
         ]
         self.assertEqual(commands, [
             '/usr/bin/python3 "${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/hooks/pre_tool.py"',
+            '/usr/bin/python3 "${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/hooks/post_tool.py"',
+            '/usr/bin/python3 "${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/hooks/post_tool.py"',
             '/usr/bin/python3 "${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/hooks/post_tool.py"',
         ])
         self.assertTrue(all(command.startswith("/usr/bin/python3 ") for command in commands))
