@@ -41,6 +41,26 @@ def mode() -> str:
         return "audit"
 
 
+def post_replace_value() -> Optional[str]:
+    """Resolve the post-replacement gate: environment first, then config.json."""
+    configured = os.environ.get("TOKENPIPE_POST_REPLACE")
+    if configured is not None:
+        return configured
+    config_home = Path(
+        os.path.expanduser(os.environ.get("TOKENPIPE_HOME", "~/.codex/tokenpipe"))
+    )
+    try:
+        config_path = config_home / "config.json"
+        if config_path.stat().st_size > 4096:
+            return None
+        with config_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        value = payload.get("post_replace") if isinstance(payload, dict) else None
+        return value if isinstance(value, str) and value else None
+    except (OSError, TypeError, ValueError):
+        return None
+
+
 def read_event() -> Optional[Dict[str, Any]]:
     try:
         value = json.load(sys.stdin)

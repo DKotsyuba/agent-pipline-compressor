@@ -203,6 +203,7 @@ class HookSecurityTests(unittest.TestCase):
 
     def test_post_replace_unset_audits_only(self):
         os.environ.pop("TOKENPIPE_POST_REPLACE", None)
+        os.environ["TOKENPIPE_HOME"] = tempfile.mkdtemp()
         calls, audited = [], []
         original_process, original_audit = post_tool.run_post_process, post_tool.run_audit
         try:
@@ -232,6 +233,18 @@ class HookSecurityTests(unittest.TestCase):
                 self.assertEqual(len(audited), 1 if expect_audit else 0)
         finally:
             post_tool.run_post_process, post_tool.run_audit = original_process, original_audit
+
+    def test_post_replace_config_fallback_and_env_override(self):
+        token_home = tempfile.mkdtemp()
+        os.environ["TOKENPIPE_HOME"] = token_home
+        os.environ.pop("TOKENPIPE_POST_REPLACE", None)
+        with open(os.path.join(token_home, "config.json"), "w", encoding="utf-8") as handle:
+            json.dump({"post_replace": "error"}, handle)
+        self.assertEqual(post_tool.post_replace_gate(), (True, frozenset(("error",))))
+        os.environ["TOKENPIPE_POST_REPLACE"] = "0"
+        self.assertEqual(post_tool.post_replace_gate(), (False, None))
+        os.environ["TOKENPIPE_POST_REPLACE"] = "log"
+        self.assertEqual(post_tool.post_replace_gate(), (True, frozenset(("log",))))
 
     def _metrics(self):
         path = Path(os.environ["TOKENPIPE_HOME"]) / "metrics.jsonl"

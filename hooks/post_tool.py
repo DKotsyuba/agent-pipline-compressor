@@ -7,8 +7,9 @@ from typing import FrozenSet, Optional, Tuple
 
 sys.dont_write_bytecode = True
 
-from common import (NATIVE_MARKER, emit, exit_status, mode, read_event,
-                    run_audit, run_post_process, run_skip, tool_output)
+from common import (NATIVE_MARKER, emit, exit_status, mode, post_replace_value,
+                    read_event, run_audit, run_post_process, run_skip,
+                    tool_output)
 
 
 def audit_limit() -> int:
@@ -40,7 +41,7 @@ def post_replace_gate() -> Tuple[bool, Optional[FrozenSet[str]]]:
     ignored, unrecognized tokens never match, and ambiguous mixes of switch
     values with categories fail closed to audit-only.
     """
-    raw = os.environ.get("TOKENPIPE_POST_REPLACE")
+    raw = post_replace_value()
     if raw is None:
         return False, None
     tokens = frozenset(

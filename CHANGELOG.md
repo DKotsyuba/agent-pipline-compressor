@@ -16,6 +16,11 @@ All notable changes to this project are documented here. The format follows
   and everything else keeps the original output with an honest
   `category-gated` metric. Malformed or mixed values fail closed to
   audit-only.
+- `python3 scripts/tokenpipe.py post-replace 1|<category list>|off` persists
+  the replacement gate in the shared `TOKENPIPE_HOME` config, so every
+  runtime using the same home picks it up without per-process environment
+  wiring; the `TOKENPIPE_POST_REPLACE` environment variable still overrides
+  the persisted value.
 
 ### Fixed
 

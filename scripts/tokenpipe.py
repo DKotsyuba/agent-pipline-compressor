@@ -221,6 +221,20 @@ def set_configured_mode(mode):
     return mode
 
 
+def configured_post_replace():
+    value = configured_settings().get("post_replace")
+    return value if isinstance(value, str) and value else None
+
+
+def set_post_replace(value):
+    settings = configured_settings()
+    if value in ("off", "0", ""):
+        settings.pop("post_replace", None)
+    else:
+        settings["post_replace"] = value
+    _write_settings(settings)
+
+
 def _safe_component(value, fallback):
     value = str(value or fallback)
     value = re.sub(r"[^A-Za-z0-9_.-]", "_", value)[:96]
@@ -1559,6 +1573,9 @@ def main(argv=None):
     show.add_argument("raw_ref")
     mode_cmd = commands.add_parser("mode", help="print or persist audit/safe/full mode")
     mode_cmd.add_argument("value", nargs="?", choices=("audit", "safe", "full"))
+    replace_cmd = commands.add_parser(
+        "post-replace", help="print or persist the post-replacement gate (1, category list, or off)")
+    replace_cmd.add_argument("value", nargs="?")
     rtk_cmd = commands.add_parser("rtk", help="show, enable, or disable trusted RTK integration")
     rtk_cmd.add_argument("value", nargs="?", help="absolute RTK executable path, or 'off'")
     native = commands.add_parser("exec", help="execute direct argv and emit native compressed output")
@@ -1631,6 +1648,11 @@ def main(argv=None):
         if args.value:
             set_configured_mode(args.value)
         print(configured_mode())
+        return 0
+    if args.command == "post-replace":
+        if args.value is not None:
+            set_post_replace(args.value.strip())
+        print(configured_post_replace() or "off")
         return 0
     if args.command == "rtk":
         try:
