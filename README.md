@@ -13,7 +13,8 @@ This is an early `0.1.0` release. Start in `audit`, then opt into `safe` only af
 ### Prerequisites
 
 - Codex or Claude Code with its plugin support enabled.
-- `python3` on your `PATH` (the tested CI versions are listed below).
+- Python 3.8+ at `/usr/bin/python3` for hooks, plus `python3` on `PATH` for the
+  source administration commands below (tested CI versions are listed below).
 - A newly started task/session after installing, updating, or changing hooks.
 
 Install for one host only, or both if you use both hosts.
@@ -105,7 +106,7 @@ claude --bare --plugin-dir . -p "..."
 | Codex | Marketplace plugin | Native compression is applied by the pre-execution wrapper for eligible commands. Other Bash output is audited. |
 | Claude Code | GitHub marketplace plugin | The hook can replace eligible text `stdout`/`stderr`; changed streams include recovery references. |
 | Python | 3.8 minimum | Current source and tests are compatible with Python 3.8; see the CI workflow for the release-tested matrix. |
-| Platform | Host-dependent | No operating-system compatibility promise is made beyond the host's supported plugin runtime and `python3`. |
+| Platform | macOS/Linux convention | Hook execution requires `/usr/bin/python3`; nonstandard layouts need explicit packaging support. |
 
 ## Modes and configuration
 
@@ -115,7 +116,7 @@ claude --bare --plugin-dir . -p "..."
 | `safe` | no | Wraps only strict read-only command categories. |
 | `full` | no | Adds selected test/build/lint commands; use only after approval behavior is validated locally. |
 
-Persist a mode with `python3 scripts/tokenpipe.py mode audit|safe|full`. `TOKENPIPE_MODE` can override the mode for hook processing. The following environment variables are optional and intentionally local:
+Persist a mode with `python3 scripts/tokenpipe.py mode audit|safe|full`. `TOKENPIPE_MODE` can override the mode for hook processing. The Codex post-replacement gate can likewise be persisted with `python3 scripts/tokenpipe.py post-replace 1|<category list>|off`, so every runtime sharing the same `TOKENPIPE_HOME` picks it up without per-process environment wiring; `TOKENPIPE_POST_REPLACE` overrides it. The following environment variables are optional and intentionally local:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -128,6 +129,7 @@ Persist a mode with `python3 scripts/tokenpipe.py mode audit|safe|full`. `TOKENP
 | `TOKENPIPE_RAW_MAX_BYTES` | `256 MiB` | Raw-output storage cap. |
 | `TOKENPIPE_METRICS_MAX_BYTES` | `8 MiB` | Metrics-file rotation cap. |
 | `TOKENPIPE_HOOK_TIMEOUT_SEC` | `30` | Hook post-processing timeout. |
+| `TOKENPIPE_POST_REPLACE` | `0` | Codex post-output replacement gate: `0`/absent audits only; `1` replaces any eligible content category; a comma-separated category list (e.g. `error,log`) replaces only output the compressor classifies into a listed category, and any other value audits only. The environment variable overrides the persisted `post-replace` setting. |
 | `TOKENPIPE_AUDIT_MAX_BYTES` | `1 MiB` | Largest single Codex audit output copied to the compressor; larger output is recorded as metadata only. |
 | `TOKENPIPE_CLAUDE_MAX_BYTES` | `16 MiB` | Largest Claude text stream considered by its post-tool hook. |
 | `RTK_DB_PATH` | private runtime DB | Optional RTK history location; an explicit value takes precedence. |
@@ -193,7 +195,7 @@ Key files:
 | A command was not wrapped | `safe` accepts only narrow read-only argv; avoid pipes, redirects, shell operators, and compound commands. |
 | No `raw_ref` | Small/protected/unknown output can pass through; any raw-spool failure also deliberately leaves output untouched. |
 | Cannot read a reference | Use the same local user/runtime state; temporary storage may have been cleaned. |
-| Python/hook failure | Confirm `python3` is on `PATH`, reinstall/update the plugin, then start a new session. |
+| Python/hook failure | Confirm `/usr/bin/python3` exists and `python3` is on `PATH`, reinstall/update the plugin, then start a new session. |
 | Need details | Run `python3 scripts/tokenpipe.py stats --json` and open a [bug report](https://github.com/DKotsyuba/agent-pipline-compressor/issues/new?template=bug_report.md). Do not attach raw sensitive output. |
 
 ## Development
@@ -207,19 +209,6 @@ python3 scripts/tokenpipe.py --version
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution flow and [AGENTS.md](AGENTS.md) for repository engineering guidance.
-
-## Releases
-
-The public baseline is SemVer `0.1.0`; release tags are `vMAJOR.MINOR.PATCH`. Pull requests and pushes to `main` are validated by CI; release tags rerun the full test matrix before publication. A valid tag produces a GitHub Release archive named `agent-pipline-compressor-vX.Y.Z.tar.gz`, its checksum, generated release notes, and a provenance attestation. See [CHANGELOG.md](CHANGELOG.md) for Keep a Changelog release notes. GitHub Packages, Docker, and GHCR are intentionally not used.
-
-Download and verify a GitHub Release asset:
-
-```bash
-gh release download v0.1.0 --repo DKotsyuba/agent-pipline-compressor --dir release
-(cd release && shasum -a 256 -c agent-pipline-compressor-v0.1.0.tar.gz.sha256)
-gh attestation verify release/agent-pipline-compressor-v0.1.0.tar.gz \
-  --repo DKotsyuba/agent-pipline-compressor
-```
 
 ## Contributing, security, and license
 

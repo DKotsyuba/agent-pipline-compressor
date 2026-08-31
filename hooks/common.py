@@ -41,6 +41,26 @@ def mode() -> str:
         return "audit"
 
 
+def post_replace_value() -> Optional[str]:
+    """Resolve the post-replacement gate: environment first, then config.json."""
+    configured = os.environ.get("TOKENPIPE_POST_REPLACE")
+    if configured is not None:
+        return configured
+    config_home = Path(
+        os.path.expanduser(os.environ.get("TOKENPIPE_HOME", "~/.codex/tokenpipe"))
+    )
+    try:
+        config_path = config_home / "config.json"
+        if config_path.stat().st_size > 4096:
+            return None
+        with config_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        value = payload.get("post_replace") if isinstance(payload, dict) else None
+        return value if isinstance(value, str) and value else None
+    except (OSError, TypeError, ValueError):
+        return None
+
+
 def read_event() -> Optional[Dict[str, Any]]:
     try:
         value = json.load(sys.stdin)
@@ -218,14 +238,18 @@ def run_audit(event: Dict[str, Any], output: str) -> None:
         return
 
 
-def run_post_process(event: Dict[str, Any], output: str, active_mode: str) -> Optional[Dict[str, Any]]:
+def run_post_process(event: Dict[str, Any], output: str, active_mode: str,
+                     categories: Optional[frozenset] = None) -> Optional[Dict[str, Any]]:
     """Run the shared compressor and return only its bounded structured result."""
     if active_mode not in {"safe", "full"} or not TOKENPIPE.is_file():
         return None
+    request = post_request(event, output)
+    if categories is not None:
+        request["replace_categories"] = sorted(categories)
     try:
         completed = subprocess.run(
             [sys.executable, str(TOKENPIPE), "post", "--mode", active_mode],
-            input=json.dumps(post_request(event, output), ensure_ascii=False),
+            input=json.dumps(request, ensure_ascii=False),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
