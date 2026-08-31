@@ -1,0 +1,72 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.8", "3.14"]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Test tagged source
+        run: |
+          set -euo pipefail
+          python3 -m compileall -q scripts hooks benchmarks tests
+          python3 -m unittest discover -s tests -v
+          while IFS= read -r file; do jq empty "$file"; done < <(git ls-files '*.json')
+      - name: Validate tag and package contract
+        uses: ./.github/actions/package
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - id: package
+        name: Build release package
+        uses: ./.github/actions/package
+      - name: Attest release archive
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ steps.package.outputs.archive }}
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+          CHECKSUM: ${{ steps.package.outputs.checksum }}
+          VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            verify_dir="$(mktemp -d "${RUNNER_TEMP}/release-verify.XXXXXX")"
+            gh release download "$tag" \
+              --pattern "$(basename "$ARCHIVE")" \
+              --pattern "$(basename "$CHECKSUM")" \
+              --dir "$verify_dir"
+            cmp "$ARCHIVE" "$verify_dir/$(basename "$ARCHIVE")"
+            cmp "$CHECKSUM" "$verify_dir/$(basename "$CHECKSUM")"
+          else
+            gh release create "$tag" "$ARCHIVE" "$CHECKSUM" \
+              --verify-tag --generate-notes --title "$tag"
+          fi

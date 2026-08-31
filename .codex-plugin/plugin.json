@@ -1,10 +1,13 @@
 {
   "name": "agent-pipline-compressor",
-  "version": "0.1.0+codex.20260825100009",
-  "description": "Local audit and compression pipeline for Codex Bash tool output.",
+  "version": "0.1.0",
+  "description": "Local deterministic compression and recovery for noisy Codex Bash output.",
   "author": {
-    "name": "Local developer"
+    "name": "wild-feather",
+    "url": "https://github.com/wild-feather"
   },
+  "homepage": "https://github.com/DKotsyuba/agent-pipline-compressor#readme",
+  "repository": "https://github.com/DKotsyuba/agent-pipline-compressor",
   "license": "MIT",
   "keywords": [
     "codex",
@@ -17,13 +20,16 @@
     "displayName": "Agent Pipline Compressor",
     "shortDescription": "Measure and compress noisy Bash tool output locally.",
     "longDescription": "Audits Codex Bash output, records private savings metrics, and can selectively apply deterministic Lite, CCA-style, and RTK compression with recoverable raw output.",
-    "developerName": "Local developer",
+    "developerName": "wild-feather",
     "category": "Productivity",
     "capabilities": [
       "Hooks",
       "Local",
       "Analytics"
     ],
-    "defaultPrompt": "Show me how to inspect Agent Pipline Compressor savings."
+    "defaultPrompt": [
+      "Show Agent Pipline Compressor savings.",
+      "Explain the current compression mode."
+    ]
   }
 }

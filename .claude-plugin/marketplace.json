@@ -1,14 +1,14 @@
 {
   "name": "tokenpipe-local",
   "owner": {
-    "name": "Local developer"
+    "name": "wild-feather"
   },
-  "description": "Local dual-host token pipeline plugins.",
+  "description": "Deterministic local tool-output compression plugins.",
   "plugins": [
     {
       "name": "agent-pipline-compressor",
       "source": "./",
-      "version": "0.1.7",
+      "version": "0.1.0",
       "description": "Deterministic tool-output compression with recoverable raw output."
     }
   ]

@@ -1,10 +1,13 @@
 {
   "name": "agent-pipline-compressor",
-  "version": "0.1.7",
+  "version": "0.1.0",
   "description": "Local deterministic compression and recovery for Claude Code Bash tool output.",
   "author": {
-    "name": "Local developer"
+    "name": "wild-feather",
+    "url": "https://github.com/wild-feather"
   },
+  "homepage": "https://github.com/DKotsyuba/agent-pipline-compressor#readme",
+  "repository": "https://github.com/DKotsyuba/agent-pipline-compressor",
   "license": "MIT",
   "keywords": [
     "claude-code",
