@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/Library/Frameworks/Python.framework/Versions/3.8/bin/python3 \"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/hooks/pre_tool.py\"",
+            "command": "/usr/bin/python3 \"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/hooks/pre_tool.py\"",
             "timeout": 10
           }
         ]
@@ -18,7 +18,27 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/Library/Frameworks/Python.framework/Versions/3.8/bin/python3 \"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/hooks/post_tool.py\"",
+            "command": "/usr/bin/python3 \"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/hooks/post_tool.py\"",
+            "timeout": 65
+          }
+        ]
+      },
+      {
+        "matcher": "^(Grep|WebFetch)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 \"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/hooks/post_tool.py\"",
+            "timeout": 65
+          }
+        ]
+      },
+      {
+        "matcher": "^mcp__",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 \"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/hooks/post_tool.py\"",
             "timeout": 65
           }
         ]
