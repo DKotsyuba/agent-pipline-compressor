@@ -3,8 +3,8 @@
   "version": "0.2.0",
   "description": "Local deterministic compression and recovery for Claude Code Bash tool output.",
   "author": {
-    "name": "wild-feather",
-    "url": "https://github.com/wild-feather"
+    "name": "Denis Kotsyuba",
+    "url": "https://github.com/DKotsyuba"
   },
   "homepage": "https://github.com/DKotsyuba/agent-pipline-compressor#readme",
   "repository": "https://github.com/DKotsyuba/agent-pipline-compressor",

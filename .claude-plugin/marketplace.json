@@ -1,7 +1,7 @@
 {
   "name": "tokenpipe-local",
   "owner": {
-    "name": "wild-feather"
+    "name": "Denis Kotsyuba"
   },
   "description": "Deterministic local tool-output compression plugins.",
   "plugins": [

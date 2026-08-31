@@ -3,8 +3,8 @@
   "version": "0.2.0",
   "description": "Local deterministic compression and recovery for noisy Codex Bash output.",
   "author": {
-    "name": "wild-feather",
-    "url": "https://github.com/wild-feather"
+    "name": "Denis Kotsyuba",
+    "url": "https://github.com/DKotsyuba"
   },
   "homepage": "https://github.com/DKotsyuba/agent-pipline-compressor#readme",
   "repository": "https://github.com/DKotsyuba/agent-pipline-compressor",
@@ -20,7 +20,7 @@
     "displayName": "Agent Pipline Compressor",
     "shortDescription": "Measure and compress noisy Bash tool output locally.",
     "longDescription": "Audits Codex Bash output, records private savings metrics, and can selectively apply deterministic Lite, CCA-style, and RTK compression with recoverable raw output.",
-    "developerName": "wild-feather",
+    "developerName": "Denis Kotsyuba",
     "category": "Productivity",
     "capabilities": [
       "Hooks",
