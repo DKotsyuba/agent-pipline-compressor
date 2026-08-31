@@ -4,13 +4,14 @@
 import importlib.util
 import json
 import os
+import re
 import shlex
 import sys
 from typing import Any, Dict, Optional
 
 sys.dont_write_bytecode = True
 
-from common import TOKENPIPE, _safe_id, command_category, mode, read_event
+from common import TOKENPIPE, _safe_id, command_category, mode, read_event, tool_output
 
 
 CLAUDE_MARKER = "tokenpipe-claude-v1"
@@ -32,6 +33,54 @@ def _limit() -> int:
     except ValueError:
         value = 16 * 1024 * 1024
     return max(1024, min(value, 64 * 1024 * 1024))
+
+
+AUDIT_IGNORED_TOOLS = frozenset(("Read", "Edit", "Write", "NotebookEdit"))
+
+
+def _audit_tool_name(value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        return "unknown"
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", value)[:64] or "unknown"
+
+
+def _audit_request(event: Dict[str, Any], output: str) -> Dict[str, Any]:
+    request = {
+        "output": output,
+        "tool_name": _audit_tool_name(event.get("tool_name")),
+        "command_category": command_category(
+            (event.get("tool_input") or {}).get("command")
+            if isinstance(event.get("tool_input"), dict) else None
+        ),
+    }
+    session_id = _safe_id(event.get("session_id"))
+    if session_id:
+        request["session_id"] = session_id
+    call_id = _safe_id(event.get("tool_use_id") or event.get("tool_call_id"))
+    if call_id:
+        request["tool_call_id"] = call_id
+    return request
+
+
+def audit(event: Dict[str, Any]) -> None:
+    """Record one bounded audit-only metric for a non-Bash Claude tool event.
+
+    Measurement only: the shared core runs with the mode forced to ``audit``,
+    so nothing is ever replaced, spooled, or printed for these tools.
+    """
+    response = event.get("tool_response")
+    if isinstance(response, dict) and response.get("isImage") is True:
+        return
+    output = tool_output(event)
+    if not output:
+        return
+    limit = _limit()
+    if len(output) > limit or len(output.encode("utf-8", "replace")) > limit:
+        return
+    try:
+        tokenpipe.process(_audit_request(event, output), "audit")
+    except Exception:
+        pass
 
 
 def _request(event: Dict[str, Any], stream: str, output: str) -> Dict[str, Any]:
@@ -81,8 +130,15 @@ def adapt(event: Dict[str, Any], active_mode: Optional[str] = None) -> Optional[
     cap, cleanup, or recovery failure removes new refs and fails open for the
     whole response. Images, unsupported shapes, and oversized streams pass
     through without side effects beyond bounded metrics.
+
+    Non-Bash tools take an audit-only path with no replacement branch: their
+    textual output feeds exactly one forced-audit metric and this function
+    always returns ``None`` for them, so nothing reaches stdout.
     """
-    if event.get("tool_name") not in (None, "Bash"):
+    tool_name = event.get("tool_name")
+    if tool_name not in (None, "Bash"):
+        if tool_name not in AUDIT_IGNORED_TOOLS:
+            audit(event)
         return None
     response = event.get("tool_response")
     if not isinstance(response, dict) or response.get("isImage") is True:
