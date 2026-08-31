@@ -26,7 +26,7 @@ import time
 import uuid
 
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 ANSI_RE = re.compile(r"\x1b(?:[@-_][0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 SECRET_KEY_RE = re.compile(r"(?i)(token|secret|password|authorization|api[_-]?key|cookie)")
 ERROR_RE = re.compile(

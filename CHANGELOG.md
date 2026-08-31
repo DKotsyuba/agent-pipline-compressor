@@ -6,9 +6,22 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-### Changed
+## [0.2.0] - 2026-08-31
 
-- Public-release hardening, onboarding, and automation are being prepared.
+### Added
+
+- `TOKENPIPE_POST_REPLACE` accepts a comma-separated content-category
+  allowlist (for example `error` or `error,log`) in addition to `0`/`1`:
+  only output the compressor classifies into a listed category is replaced,
+  and everything else keeps the original output with an honest
+  `category-gated` metric. Malformed or mixed values fail closed to
+  audit-only.
+
+### Fixed
+
+- The Codex post hook no longer runs a second audit pass after a
+  non-replacing compressor run; each event records exactly one metric, so
+  statistics no longer double-count originals or overstate savings.
 
 ## [0.1.0] - 2026-08-31
 
@@ -42,5 +55,6 @@ All notable changes to this project are documented here. The format follows
 - Claude hook commands use absolute `/usr/bin/python3` instead of a
   machine-specific Python Framework path or a project-controlled PATH lookup.
 
-[Unreleased]: https://github.com/DKotsyuba/agent-pipline-compressor/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/DKotsyuba/agent-pipline-compressor/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/DKotsyuba/agent-pipline-compressor/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/DKotsyuba/agent-pipline-compressor/releases/tag/v0.1.0
