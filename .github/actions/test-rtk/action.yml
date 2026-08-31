@@ -1,0 +1,46 @@
+name: Configure deterministic RTK fixture
+description: Provide the optional RTK integration tests with a route-compatible local shim.
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        shim="${RUNNER_TEMP}/tokenpipe-rtk-shim.py"
+        cat > "$shim" <<'PY'
+        #!/usr/bin/env python3
+        """Deterministic CI stand-in for the optional RTK executable."""
+
+        import pathlib
+        import subprocess
+        import sys
+
+
+        route, *args = sys.argv[1:]
+        if route == "pytest":
+            failed = bool(args and "test_fail.py" in args[-1])
+            if failed:
+                print("FAILED test_fail.py::test_failure - AssertionError: expected true")
+                print("1 failed")
+                raise SystemExit(1)
+            print("40 passed")
+            raise SystemExit(0)
+        if route == "test":
+            if args[:1] == ["--"]:
+                args = args[1:]
+            command = args
+        elif route in {"git", "rg", "ls", "find"}:
+            command = [route] + args
+        elif route in {"log", "json"}:
+            output = pathlib.Path(args[-1]).read_text(encoding="utf-8")
+            if route == "log":
+                output += "\nrtk-shim deterministic mutation\n"
+            sys.stdout.write(output)
+            raise SystemExit(0)
+        else:
+            raise SystemExit(127)
+        raise SystemExit(subprocess.run(command, check=False).returncode)
+        PY
+        chmod 0755 "$shim"
+        echo "TOKENPIPE_LAB_RTK=$shim" >> "$GITHUB_ENV"

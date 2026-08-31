@@ -24,6 +24,8 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Configure deterministic RTK fixture
+        uses: ./.github/actions/test-rtk
       - name: Test tagged source
         run: |
           set -euo pipefail
