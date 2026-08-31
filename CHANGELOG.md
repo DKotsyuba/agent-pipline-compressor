@@ -6,6 +6,17 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Claude Code PostToolUse coverage beyond Bash: Grep, WebFetch, and MCP tool
+  results are recorded as audit-only metrics (no replacement path exists for
+  them); Read/Edit/Write/NotebookEdit are ignored.
+- The Codex pre-hook now verifies that a command's executable resolves into
+  the wrapper's trusted directories before rewriting; untrusted heads (for
+  example toolchains installed under the home directory) pass through
+  unwrapped instead of failing with exit 126, making `full` mode safe to
+  enable on machines with home-directory toolchains.
+
 ## [0.2.0] - 2026-08-31
 
 ### Added

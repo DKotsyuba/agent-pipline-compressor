@@ -5,6 +5,7 @@ from pathlib import Path
 import os
 import re
 import shlex
+import shutil
 import sys
 from typing import List, Optional
 
@@ -20,6 +21,13 @@ INTERACTIVE_FLAGS = frozenset((
     "--paginate",
 ))
 MUTATING_FLAGS = frozenset(("--fix", "--fix-only", "--write"))
+
+# Mirror of the wrapper's trusted executable roots. scripts/tokenpipe.py
+# _TRUSTED_EXECUTABLE_DIRS is the authority; its full ownership and symlink
+# validation remains the enforcement point at execution time.
+_TRUSTED_EXECUTABLE_DIRS = (
+    "/bin", "/usr/bin", "/usr/sbin", "/sbin", "/usr/local/bin", "/opt/homebrew/bin",
+)
 
 
 def _has_forbidden_syntax(command: str) -> bool:
@@ -118,6 +126,25 @@ def _allowed(words: List[str], active_mode: str) -> bool:
     return False
 
 
+def _trusted_head(head: str) -> bool:
+    # Cheap prefix gate: resolve the head (absolute paths directly, otherwise
+    # shutil.which through the hook process PATH) and reject anything outside
+    # the trusted roots. The wrapper refuses those with exit 126, so rewriting
+    # them would break the command instead of compressing it.
+    candidate = head if os.path.isabs(head) else shutil.which(head)
+    if not candidate:
+        return False
+    # Test the PATH-resolved location itself, not its realpath: Homebrew
+    # installs are symlinks into Cellar, and the wrapper accepts them by
+    # their trusted-directory location. Symlink/ownership scrutiny stays
+    # with the wrapper at execution time.
+    candidate = os.path.normpath(candidate)
+    return any(
+        candidate == prefix or candidate.startswith(prefix + os.sep)
+        for prefix in _TRUSTED_EXECUTABLE_DIRS
+    )
+
+
 def rewrite(command: str, active_mode: Optional[str] = None,
             session_id: Optional[str] = None,
             tool_call_id: Optional[str] = None) -> Optional[str]:
@@ -135,6 +162,11 @@ def rewrite(command: str, active_mode: Optional[str] = None,
         return None
     category = _wrapper_category(words)
     if not category:
+        return None
+    if not _trusted_head(words[0]):
+        # Full-mode heads (cargo, npm, pnpm, yarn, tsc, pyright, venv pytest)
+        # usually live under $HOME; passing the command through untouched beats
+        # rewriting it into a wrapper that would exit 126.
         return None
     # Resolve the installed plugin's absolute script path inside the hook. The
     # later Bash process does not inherit the hook-only PLUGIN_ROOT variable.

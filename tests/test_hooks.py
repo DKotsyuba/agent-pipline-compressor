@@ -25,8 +25,13 @@ class HookSecurityTests(unittest.TestCase):
         token_home = tempfile.TemporaryDirectory()
         self.addCleanup(token_home.cleanup)
         os.environ["TOKENPIPE_HOME"] = token_home.name
+        # Resolve command heads from a fake trusted root by default; tests that
+        # exercise real PATH resolution restore the real resolver explicitly.
+        self.real_which = pre_tool.shutil.which
+        pre_tool.shutil.which = lambda head, path=None: "/usr/bin/" + head
 
     def tearDown(self):
+        pre_tool.shutil.which = self.real_which
         os.environ.clear()
         os.environ.update(self.old_env)
 
@@ -336,6 +341,28 @@ class HookSecurityTests(unittest.TestCase):
         for command in denied:
             self.assertIsNone(pre_tool.rewrite(command, "safe"), command)
             self.assertIsNone(pre_tool.rewrite(command, "full"), command)
+
+    def test_full_mode_head_outside_trusted_roots_is_not_rewritten(self):
+        pre_tool.shutil.which = self.real_which
+        fake_bin = tempfile.TemporaryDirectory()
+        self.addCleanup(fake_bin.cleanup)
+        cargo = os.path.join(fake_bin.name, "cargo")
+        with open(cargo, "w", encoding="utf-8") as handle:
+            handle.write("#!/bin/sh\nexit 0\n")
+        os.chmod(cargo, 0o755)
+        os.environ["PATH"] = fake_bin.name
+        self.assertIsNone(pre_tool.rewrite("cargo test", "full"))
+
+    def test_full_mode_head_under_trusted_root_is_rewritten(self):
+        # setUp resolves heads into /usr/bin, a trusted prefix.
+        self.assertIsNotNone(pre_tool.rewrite("cargo test", "full"))
+
+    def test_safe_mode_git_is_still_rewritten(self):
+        self.assertIsNotNone(pre_tool.rewrite("git status", "safe"))
+
+    def test_absolute_head_outside_trusted_roots_is_not_rewritten(self):
+        self.assertIsNone(pre_tool.rewrite("/tmp/foo/git status", "safe"))
+        self.assertIsNone(pre_tool.rewrite("/tmp/foo/git status", "full"))
 
     def test_wrapper_is_readable_and_has_no_opaque_transport(self):
         wrapped = pre_tool.rewrite("git diff --stat", "safe")
