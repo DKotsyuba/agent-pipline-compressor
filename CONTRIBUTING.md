@@ -27,15 +27,3 @@ Conventional Commit-style messages (for example, `fix: preserve raw output on sp
 ## Versions and security
 
 Maintainers own release versions, tags, and changelog entries. Do not change them speculatively in a feature or bug-fix PR; call out a needed release in the PR instead. Report potential vulnerabilities privately as described in [SECURITY.md](SECURITY.md), not in a public issue.
-
-## Maintainer release flow
-
-1. Prepare one release PR that updates `VERSION`, both plugin manifests, both
-   marketplace entries, and the matching dated section in `CHANGELOG.md`.
-2. Merge only after the `CI` workflow passes on the release PR and `main`.
-3. Create and push the annotated tag `vMAJOR.MINOR.PATCH` on that exact commit.
-4. The tag-triggered `Release` workflow reruns the full matrix, builds the
-   allowlisted archive, publishes it with its checksum to GitHub Releases, and
-   creates a provenance attestation. Do not upload replacement assets manually.
-5. Verify the release checksum, attestation, generated notes, and downloadable
-   archive before announcing the release.
