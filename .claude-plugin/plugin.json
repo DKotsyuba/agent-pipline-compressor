@@ -1,6 +1,6 @@
 {
   "name": "agent-pipline-compressor",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Local deterministic compression and recovery for Claude Code Bash tool output.",
   "author": {
     "name": "Denis Kotsyuba",

@@ -9,7 +9,7 @@
       "source": {
         "source": "url",
         "url": "https://github.com/DKotsyuba/agent-pipline-compressor.git",
-        "ref": "v0.2.0"
+        "ref": "v0.2.1"
       },
       "policy": {
         "installation": "AVAILABLE",
