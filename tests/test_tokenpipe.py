@@ -20,16 +20,23 @@ SPEC.loader.exec_module(tokenpipe)
 
 class TokenpipeTests(unittest.TestCase):
     def setUp(self):
+        """Create private state and an explicitly trusted fixture bin directory."""
         self.temp = tempfile.TemporaryDirectory()
         self.old_env = os.environ.copy()
+        self.old_trusted_dirs = tokenpipe._TRUSTED_EXECUTABLE_DIRS
+        tokenpipe._TRUSTED_EXECUTABLE_DIRS = frozenset(
+            tuple(self.old_trusted_dirs) + (self.temp.name,)
+        )
         os.environ["TOKENPIPE_HOME"] = self.temp.name
         os.environ["TOKENPIPE_RUNTIME_HOME"] = os.path.join(self.temp.name, "runtime")
         os.environ["TOKENPIPE_MIN_TOKENS_ESTIMATE"] = "10"
         os.environ["PATH"] = self.temp.name + os.pathsep + self.old_env.get("PATH", "")
 
     def tearDown(self):
+        """Restore process environment and executable trust before cleanup."""
         os.environ.clear()
         os.environ.update(self.old_env)
+        tokenpipe._TRUSTED_EXECUTABLE_DIRS = self.old_trusted_dirs
         self.temp.cleanup()
 
     def payload(self, output, **extra):
@@ -74,6 +81,29 @@ class TokenpipeTests(unittest.TestCase):
         self.assertEqual(result["strategy"], "lite-json")
         self.assertEqual(tokenpipe.show_raw(result["raw_ref"]), raw)
         self.assertIn("__tokenpipe_omitted_items__", result["output"])
+
+    def test_binary_and_control_heavy_output_is_exact_passthrough(self):
+        """NUL/control-heavy output must never be transformed or spooled."""
+        for raw in (
+            ("\x00BIN\xff\n" * 400),
+            ("\x01\x02\x03payload" * 200),
+            ("\ufffdbad\n" * 1000),
+        ):
+            result = tokenpipe.process(self.payload(raw), "safe")
+            self.assertEqual(result["action"], "passthrough")
+            self.assertEqual(result["output"], raw)
+            self.assertIsNone(result["raw_ref"])
+
+    def test_native_invalid_utf8_is_not_compressed_or_spooled(self):
+        """Lossy decode replacement markers force exact-policy passthrough."""
+        pytest = self.executable(
+            "pytest", "import os\nos.write(1, b'\\xffbad\\n' * 1000)\n"
+        )
+        output, status_code = tokenpipe.execute_native([pytest], "test", "full")
+        self.assertEqual(status_code, 0)
+        self.assertIn("strategy=passthrough", output.splitlines()[0])
+        self.assertNotIn("raw_ref=", output.splitlines()[0])
+        self.assertIn("\ufffdbad", output)
 
     def test_error_ranking_preserves_failure(self):
         raw = ("noise\n" * 300) + "\n\nFAILED auth_test.py expected 401 got 200\nTraceback: boom\n" + ("tail\n" * 200)
@@ -363,6 +393,65 @@ class TokenpipeTests(unittest.TestCase):
         finally:
             other.cleanup()
 
+    def test_native_rejects_project_path_shim(self):
+        """A project-controlled PATH executable must not run even when 0755."""
+        project_bin = tempfile.TemporaryDirectory(dir=os.getcwd())
+        marker = os.path.join(project_bin.name, "marker")
+        try:
+            shim = os.path.join(project_bin.name, "rg")
+            with open(shim, "w", encoding="utf-8") as handle:
+                handle.write("#!%s\nopen(%r, 'w').write('ran')\n" % (sys.executable, marker))
+            os.chmod(shim, 0o755)
+            old_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = project_bin.name + os.pathsep + old_path
+            output, status_code = tokenpipe.execute_native(["rg", "needle"], "search", "safe")
+            self.assertEqual(status_code, 126)
+            self.assertFalse(os.path.exists(marker))
+            self.assertIn("untrusted-executable", output)
+        finally:
+            project_bin.cleanup()
+
+    def test_safe_git_disables_external_diff_and_fsmonitor_helpers(self):
+        """Safe Git reads must not invoke repository-configured executables."""
+        git = shutil.which("git")
+        if not git:
+            self.skipTest("git unavailable")
+        repo = tempfile.TemporaryDirectory()
+        marker = os.path.join(repo.name, "helper-ran")
+        helper = os.path.join(repo.name, "helper")
+        with open(helper, "w", encoding="utf-8") as handle:
+            handle.write("#!/bin/sh\nprintf ran > %s\nexit 0\n" % marker)
+        os.chmod(helper, 0o700)
+        subprocess.run([git, "init", "-q", repo.name], check=True)
+        subprocess.run([git, "-C", repo.name, "config", "user.email", "test@example.invalid"], check=True)
+        subprocess.run([git, "-C", repo.name, "config", "user.name", "test"], check=True)
+        path = os.path.join(repo.name, "file.txt")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("one\n")
+        subprocess.run([git, "-C", repo.name, "add", "file.txt"], check=True)
+        subprocess.run([git, "-C", repo.name, "commit", "-qm", "base"], check=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("two\n")
+        subprocess.run([git, "-C", repo.name, "config", "diff.external", helper], check=True)
+        subprocess.run([git, "-C", repo.name, "config", "core.fsmonitor", helper], check=True)
+        previous = os.getcwd()
+        try:
+            os.chdir(repo.name)
+            output, status_code = tokenpipe.execute_native(["git", "diff"], "git-read", "safe")
+            self.assertEqual(status_code, 0, output)
+            self.assertFalse(os.path.exists(marker))
+            output, status_code = tokenpipe.execute_native(["git", "status", "--short"], "git-read", "safe")
+            self.assertEqual(status_code, 0, output)
+            self.assertFalse(os.path.exists(marker))
+            refused, refused_status = tokenpipe.execute_native(
+                ["git", "diff", "--ext-diff"], "git-read", "safe"
+            )
+            self.assertEqual(refused_status, 126)
+            self.assertIn("category-command-mismatch", refused)
+        finally:
+            os.chdir(previous)
+            repo.cleanup()
+
     def test_native_capture_limit_terminates_and_reports_child(self):
         pytest = self.executable(
             "pytest",
@@ -376,6 +465,7 @@ class TokenpipeTests(unittest.TestCase):
         self.assertLess(len(output.encode("utf-8")), 1024 * 1024 + 16384)
 
     def test_cli_forwards_signal_kills_stubborn_child_and_reaps(self):
+        """CLI main forwards termination and reaps a trusted fixture process."""
         pid_path = os.path.join(self.temp.name, "stubborn.pid")
         self.executable(
             "pytest",
@@ -384,9 +474,20 @@ class TokenpipeTests(unittest.TestCase):
             + "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
             "while True: time.sleep(0.1)\n",
         )
+        driver = os.path.join(self.temp.name, "tokenpipe-driver.py")
+        with open(driver, "w", encoding="utf-8") as handle:
+            handle.write(
+                "import importlib.util, sys\n"
+                "spec = importlib.util.spec_from_file_location('tokenpipe_driver_core', %r)\n"
+                "module = importlib.util.module_from_spec(spec)\n"
+                "spec.loader.exec_module(module)\n"
+                "module._TRUSTED_EXECUTABLE_DIRS = frozenset((%r,))\n"
+                "sys.argv = [%r] + sys.argv[1:]\n"
+                "raise SystemExit(module.main())\n" % (SCRIPT, self.temp.name, SCRIPT)
+            )
         tokenpipe.set_configured_mode("full")
         process = subprocess.Popen(
-            [sys.executable, SCRIPT, "exec", "--category", "test", "--", "pytest"],
+            [sys.executable, driver, "exec", "--category", "test", "--", "pytest"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=os.environ.copy(),
         )
         deadline = time.time() + 10
@@ -411,15 +512,33 @@ class TokenpipeTests(unittest.TestCase):
         with self.assertRaises((OSError, ValueError)):
             tokenpipe.show_raw(link)
 
+    def test_spool_rejects_intermediate_session_symlink(self):
+        """Raw spooling must fail open without writing through a session link."""
+        raw_root = tokenpipe._raw_root()
+        tokenpipe._mkdir_private(raw_root)
+        outside = tempfile.TemporaryDirectory()
+        try:
+            os.symlink(outside.name, os.path.join(raw_root, "linked-session"))
+            raw = json.dumps({"items": list(range(300))}, indent=2)
+            payload = self.payload(raw)
+            payload["session_id"] = "linked-session"
+            result = tokenpipe.process(payload, "safe")
+            self.assertEqual(result["action"], "passthrough")
+            self.assertEqual(result["output"], raw)
+            self.assertEqual(os.listdir(outside.name), [])
+        finally:
+            outside.cleanup()
+
     def test_spool_collision_retries_exclusive_create(self):
         original_open = tokenpipe.os.open
         calls = {"count": 0}
 
-        def collide_once(path, flags, mode=0o777):
-            if "raw" in path and calls["count"] == 0:
+        def collide_once(path, flags, mode=0o777, *, dir_fd=None):
+            """Inject one file-allocation collision while preserving dirfd opens."""
+            if flags & os.O_CREAT and calls["count"] == 0:
                 calls["count"] += 1
                 raise OSError(tokenpipe.errno.EEXIST, "collision")
-            return original_open(path, flags, mode)
+            return original_open(path, flags, mode, dir_fd=dir_fd)
 
         tokenpipe.os.open = collide_once
         try:
@@ -536,6 +655,25 @@ class TokenpipeTests(unittest.TestCase):
         rows = tokenpipe.load_metrics()
         self.assertGreater(len(rows), 0)
         self.assertLess(len(rows), 150)
+
+    def test_metrics_symlink_victim_is_unchanged_and_processing_fails_open(self):
+        """Metrics symlinks must not alter victim content, mode, or tool output."""
+        victim_dir = tempfile.TemporaryDirectory()
+        try:
+            victim = os.path.join(victim_dir.name, "victim")
+            with open(victim, "w", encoding="utf-8") as handle:
+                handle.write("original")
+            os.chmod(victim, 0o644)
+            os.symlink(victim, tokenpipe._metrics_path())
+            with self.assertRaises(OSError):
+                tokenpipe._append_metric({"safe": True})
+            result = tokenpipe.process(self.payload("small exact output"), "safe")
+            self.assertEqual(result["output"], "small exact output")
+            with open(victim, "r", encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "original")
+            self.assertEqual(stat.S_IMODE(os.stat(victim).st_mode), 0o644)
+        finally:
+            victim_dir.cleanup()
 
 
 if __name__ == "__main__":

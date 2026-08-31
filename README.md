@@ -13,7 +13,8 @@ This is an early `0.1.0` release. Start in `audit`, then opt into `safe` only af
 ### Prerequisites
 
 - Codex or Claude Code with its plugin support enabled.
-- `python3` on your `PATH` (the tested CI versions are listed below).
+- Python 3.8+ at `/usr/bin/python3` for hooks, plus `python3` on `PATH` for the
+  source administration commands below (tested CI versions are listed below).
 - A newly started task/session after installing, updating, or changing hooks.
 
 Install for one host only, or both if you use both hosts.
@@ -105,7 +106,7 @@ claude --bare --plugin-dir . -p "..."
 | Codex | Marketplace plugin | Native compression is applied by the pre-execution wrapper for eligible commands. Other Bash output is audited. |
 | Claude Code | GitHub marketplace plugin | The hook can replace eligible text `stdout`/`stderr`; changed streams include recovery references. |
 | Python | 3.8 minimum | Current source and tests are compatible with Python 3.8; see the CI workflow for the release-tested matrix. |
-| Platform | Host-dependent | No operating-system compatibility promise is made beyond the host's supported plugin runtime and `python3`. |
+| Platform | macOS/Linux convention | Hook execution requires `/usr/bin/python3`; nonstandard layouts need explicit packaging support. |
 
 ## Modes and configuration
 
@@ -193,7 +194,7 @@ Key files:
 | A command was not wrapped | `safe` accepts only narrow read-only argv; avoid pipes, redirects, shell operators, and compound commands. |
 | No `raw_ref` | Small/protected/unknown output can pass through; any raw-spool failure also deliberately leaves output untouched. |
 | Cannot read a reference | Use the same local user/runtime state; temporary storage may have been cleaned. |
-| Python/hook failure | Confirm `python3` is on `PATH`, reinstall/update the plugin, then start a new session. |
+| Python/hook failure | Confirm `/usr/bin/python3` exists and `python3` is on `PATH`, reinstall/update the plugin, then start a new session. |
 | Need details | Run `python3 scripts/tokenpipe.py stats --json` and open a [bug report](https://github.com/DKotsyuba/agent-pipline-compressor/issues/new?template=bug_report.md). Do not attach raw sensitive output. |
 
 ## Development

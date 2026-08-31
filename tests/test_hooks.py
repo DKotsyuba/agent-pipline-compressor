@@ -248,6 +248,7 @@ class HookSecurityTests(unittest.TestCase):
         self.assertTrue(updated["command"].endswith("-- git status"))
 
     def test_plugin_hook_paths_use_plugin_root(self):
+        """Claude hook commands use portable python3 and plugin-root paths."""
         with (HOOKS / "hooks.json").open("r", encoding="utf-8") as handle:
             config = json.load(handle)
         commands = [
@@ -257,9 +258,10 @@ class HookSecurityTests(unittest.TestCase):
             for hook in group["hooks"]
         ]
         self.assertEqual(commands, [
-            '/Library/Frameworks/Python.framework/Versions/3.8/bin/python3 "${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/hooks/pre_tool.py"',
-            '/Library/Frameworks/Python.framework/Versions/3.8/bin/python3 "${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/hooks/post_tool.py"',
+            '/usr/bin/python3 "${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/hooks/pre_tool.py"',
+            '/usr/bin/python3 "${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/hooks/post_tool.py"',
         ])
+        self.assertTrue(all(command.startswith("/usr/bin/python3 ") for command in commands))
 
     def test_claude_host_does_not_rewrite_bash_command(self):
         os.environ["TOKENPIPE_MODE"] = "safe"

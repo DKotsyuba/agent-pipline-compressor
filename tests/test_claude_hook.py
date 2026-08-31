@@ -18,9 +18,11 @@ post_tool = importlib.import_module("post_tool")
 
 class ClaudeHookTests(unittest.TestCase):
     def setUp(self):
+        """Isolate user and runtime state for each Claude hook transaction."""
         self.temp = tempfile.TemporaryDirectory()
         self.old_env = os.environ.copy()
         os.environ["TOKENPIPE_HOME"] = self.temp.name
+        os.environ["TOKENPIPE_RUNTIME_HOME"] = os.path.join(self.temp.name, "runtime")
         os.environ["TOKENPIPE_MIN_TOKENS_ESTIMATE"] = "10"
         os.environ["TOKENPIPE_MODE"] = "safe"
 
@@ -74,8 +76,23 @@ class ClaudeHookTests(unittest.TestCase):
         self.assertEqual(claude_post.tokenpipe.show_raw(stdout_ref), stdout)
         self.assertEqual(claude_post.tokenpipe.show_raw(stderr_ref), stderr)
 
+    def test_two_stream_cap_failure_is_transactional_passthrough(self):
+        """Both Claude streams fail open when protected raws exceed one cap."""
+        os.environ["TOKENPIPE_RAW_MAX_BYTES"] = "12000"
+        stdout = "out repeat\n" * 800
+        stderr = "ERROR repeated\n" * 800
+        self.assertIsNone(claude_post.adapt(self.event(stdout, stderr)))
+        raw_root = claude_post.tokenpipe._raw_root()
+        remaining = [
+            name for base, _, names in os.walk(raw_root) for name in names
+        ] if os.path.isdir(raw_root) else []
+        self.assertEqual(remaining, [])
+        self.assertEqual(claude_post.tokenpipe.load_metrics(), [])
+
     def test_small_binary_unknown_and_audit_are_exact_passthrough(self):
+        """Unsupported, binary, small, and audit streams pass through exactly."""
         self.assertIsNone(claude_post.adapt(self.event("ok\n")))
+        self.assertIsNone(claude_post.adapt(self.event("\x00BIN\x01\n" * 400)))
         self.assertIsNone(claude_post.adapt(self.event("same\n" * 400, isImage=True)))
         malformed = self.event("same\n" * 400)
         malformed["tool_response"] = "not-an-object"

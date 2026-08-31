@@ -97,12 +97,83 @@ def _config_path():
     return os.path.join(_home(), "config.json")
 
 
-def _mkdir_private(path):
-    os.makedirs(path, mode=0o700, exist_ok=True)
+def _open_private_dir(path, create=True):
+    """Open a contained private directory without following symlinks.
+
+    Args:
+        path (str | os.PathLike): Absolute or user-expandable directory path.
+        create (bool): Create missing components with mode ``0700`` when true.
+
+    Returns:
+        int: An open directory descriptor owned by the caller.
+
+    Raises:
+        OSError: A component is missing, inaccessible, or the platform lacks
+            directory-relative no-follow primitives.
+        ValueError: A component is not a trusted directory, is writable by
+            another user, or the final directory is not private and user-owned.
+
+    The function never follows or chmods an existing symlink. Ancestors may be
+    readable by other users, but only root-owned sticky temporary directories
+    may be writable by them. The final directory must be owned by this process
+    and have no group/other permission bits.
+    """
+    if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
+        raise OSError(errno.ENOTSUP, "secure directory traversal is unavailable")
+    absolute = os.path.abspath(os.path.expanduser(path))
+    if sys.platform == "darwin":
+        # macOS exposes these root-owned compatibility aliases as symlinks.
+        # Normalize only the fixed platform prefixes; never resolve caller-
+        # controlled descendants or the final private directory.
+        for alias in ("/var", "/tmp"):
+            if absolute == alias or absolute.startswith(alias + os.sep):
+                absolute = "/private" + absolute
+                break
+    parts = [part for part in absolute.split(os.sep) if part]
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    current_fd = os.open(os.sep, flags)
     try:
-        os.chmod(path, 0o700)
-    except OSError:
-        pass
+        for index, component in enumerate(parts):
+            try:
+                next_fd = os.open(component, flags, dir_fd=current_fd)
+            except OSError as exc:
+                if not create or exc.errno != errno.ENOENT:
+                    raise
+                os.mkdir(component, 0o700, dir_fd=current_fd)
+                next_fd = os.open(component, flags, dir_fd=current_fd)
+            info = os.fstat(next_fd)
+            mode = stat.S_IMODE(info.st_mode)
+            final = index == len(parts) - 1
+            root_sticky = info.st_uid == 0 and bool(mode & stat.S_ISVTX)
+            trusted_owner = info.st_uid in (0, os.getuid())
+            safe_writes = not (mode & 0o022) or root_sticky
+            private_final = not final or (info.st_uid == os.getuid() and not (mode & 0o077))
+            if not stat.S_ISDIR(info.st_mode) or not trusted_owner or not safe_writes or not private_final:
+                os.close(next_fd)
+                raise ValueError("unsafe private directory component")
+            os.close(current_fd)
+            current_fd = next_fd
+        return current_fd
+    except BaseException:
+        os.close(current_fd)
+        raise
+
+
+def _mkdir_private(path):
+    """Create and validate a user-owned ``0700`` directory.
+
+    Args:
+        path (str | os.PathLike): Directory to create or validate.
+
+    Returns:
+        None: The validation descriptor is closed before returning.
+
+    Raises:
+        OSError: Secure traversal or creation fails.
+        ValueError: Existing ownership, mode, type, or containment is unsafe.
+    """
+    directory_fd = _open_private_dir(path, create=True)
+    os.close(directory_fd)
 
 
 def estimate_tokens(text):
@@ -191,69 +262,123 @@ def _write_all(fd, data):
 
 
 def spool_raw(text, session_id, tool_call_id, root=None):
+    """Persist exact tool output in a contained private spool file.
+
+    Args:
+        text (str): Raw model-sensitive tool output to store as UTF-8.
+        session_id (str | None): Untrusted lifecycle identifier, sanitized for
+            the session directory name.
+        tool_call_id (str | None): Untrusted lifecycle identifier, sanitized
+            for the file prefix.
+        root (str | None): Optional private spool root; defaults to user state.
+
+    Returns:
+        str: Absolute recovery path for the newly created ``0600`` regular file.
+
+    Raises:
+        OSError: Secure allocation, writing, syncing, or uniqueness fails.
+        ValueError: Directory/file containment, ownership, type, or links are
+            unsafe. No attacker-controlled symlink is followed or chmodded.
+    """
     session = _safe_component(session_id, "unknown-session")
     call = _safe_component(tool_call_id, "call-" + uuid.uuid4().hex[:12])
     directory = os.path.join(root or _raw_root(), session)
-    _mkdir_private(directory)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    directory_fd = _open_private_dir(directory, create=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     data = text.encode("utf-8", "replace")
-    for _ in range(32):
-        path = os.path.join(directory, call + "-" + uuid.uuid4().hex[:12] + ".log")
-        try:
-            fd = os.open(path, flags, 0o600)
-        except OSError as exc:
-            if exc.errno == errno.EEXIST:
-                continue
-            raise
-        try:
-            os.fchmod(fd, 0o600)
-            info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode):
-                raise ValueError("raw spool target is not regular")
-            _write_all(fd, data)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        return path
-    raise OSError(errno.EEXIST, "could not allocate unique raw spool file")
+    try:
+        for _ in range(32):
+            name = call + "-" + uuid.uuid4().hex[:12] + ".log"
+            try:
+                fd = os.open(name, flags, 0o600, dir_fd=directory_fd)
+            except OSError as exc:
+                if exc.errno == errno.EEXIST:
+                    continue
+                raise
+            try:
+                info = os.fstat(fd)
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                        or info.st_nlink != 1):
+                    raise ValueError("raw spool target is not a private regular file")
+                os.fchmod(fd, 0o600)
+                _write_all(fd, data)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            return os.path.join(directory, name)
+        raise OSError(errno.EEXIST, "could not allocate unique raw spool file")
+    finally:
+        os.close(directory_fd)
 
 
-def cleanup_spool(now=None, root=None):
+def cleanup_spool(now=None, root=None, protected=None):
+    """Enforce raw-output TTL and size caps without escaping the spool root.
+
+    Args:
+        now (float | None): Unix timestamp used for deterministic TTL checks.
+        root (str | None): Private spool root; defaults to user state.
+        protected (Iterable[str] | None): Recovery paths that must survive this
+            cleanup transaction while unprotected files are reclaimed first.
+
+    Returns:
+        bool: True when surviving files fit the configured byte cap. False means
+        protected files alone prevent compliance; callers must fail open and
+        remove their newly created protected outputs.
+
+    Unsafe roots are treated as absent by raising to the caller; symlinked
+    directories and non-regular or foreign-owned entries are never traversed or
+    removed. Cleanup has no effect outside the validated root.
+    """
     now = time.time() if now is None else now
     ttl = max(0, int(os.environ.get("TOKENPIPE_RAW_TTL_SECONDS", str(7 * 86400))))
     max_bytes = max(0, int(os.environ.get("TOKENPIPE_RAW_MAX_BYTES", str(256 * 1024 * 1024))))
     root = root or _raw_root()
-    if not os.path.isdir(root):
-        return
+    try:
+        root_fd = _open_private_dir(root, create=False)
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            return True
+        raise
+    else:
+        os.close(root_fd)
+    real_root = os.path.realpath(root)
+    protected_paths = {os.path.realpath(path) for path in (protected or ())}
     files = []
     for base, dirs, names in os.walk(root, topdown=True, followlinks=False):
-        dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(base, d))]
+        dirs[:] = [
+            name for name in dirs
+            if not os.path.islink(os.path.join(base, name))
+            and os.path.commonpath((real_root, os.path.realpath(os.path.join(base, name)))) == real_root
+        ]
         for name in names:
             path = os.path.join(base, name)
             try:
                 info = os.lstat(path)
             except OSError:
                 continue
-            if not stat.S_ISREG(info.st_mode):
+            real_path = os.path.realpath(path)
+            if (os.path.commonpath((real_root, real_path)) != real_root
+                    or not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()):
                 continue
-            if ttl and now - info.st_mtime > ttl:
+            if real_path not in protected_paths and ttl and now - info.st_mtime > ttl:
                 try:
                     os.unlink(path)
                 except OSError:
                     pass
             else:
-                files.append((info.st_mtime, info.st_size, path))
+                files.append((info.st_mtime, info.st_size, path, real_path))
     total = sum(item[1] for item in files)
-    for _, size, path in sorted(files):
+    for _, size, path, real_path in sorted(files):
         if total <= max_bytes:
             break
+        if real_path in protected_paths:
+            continue
         try:
             os.unlink(path)
             total -= size
         except OSError:
             pass
+    return total <= max_bytes
 
 
 def _json_sanitize(value, depth=0):
@@ -378,7 +503,40 @@ def cca_rank(text, target_chars=6000):
     return "\n\n".join(rendered)
 
 
+def _is_binary_text(text):
+    """Return whether text contains binary or control-heavy content.
+
+    Args:
+        text (str): Decoded tool output. Ordinary tabs, newlines, carriage
+            returns, Unicode, and ANSI terminal escapes remain text.
+
+    Returns:
+        bool: True for any NUL byte or when other control characters exceed
+        five percent of ANSI-stripped content (with an eight-character floor).
+
+    This conservative trust-boundary check is deterministic and has no side
+    effects. It prevents destructive compression of binary diagnostics.
+    """
+    if "\x00" in text or "\ufffd" in text:
+        return True
+    visible = ANSI_RE.sub("", text)
+    controls = sum(1 for char in visible if ord(char) < 32 and char not in "\t\n\r")
+    return controls > max(8, len(visible) // 20)
+
+
 def classify(text):
+    """Classify decoded tool output for deterministic compression policy.
+
+    Args:
+        text (str): Complete decoded stream or combined stream body.
+
+    Returns:
+        str: One of ``binary``, ``diff``, ``code``, ``json``, ``config``,
+        ``error``, ``log``, or ``plain``. Binary detection runs first so later
+        format heuristics can never authorize destructive transformation.
+    """
+    if _is_binary_text(text):
+        return "binary"
     stripped = text.lstrip()
     if DIFF_RE.search(text):
         return "diff"
@@ -407,6 +565,21 @@ def classify(text):
 
 
 def compress(text, category):
+    """Apply the deterministic transform selected for a content category.
+
+    Args:
+        text (str): Complete decoded output to transform.
+        category (str): Result from :func:`classify`.
+
+    Returns:
+        tuple[str, str]: Strategy label and candidate output. Binary and
+        unsupported categories return exact passthrough content.
+
+    Compression is local and side-effect free; callers remain responsible for
+    size comparison and recoverable raw spooling before replacement.
+    """
+    if category == "binary":
+        return "passthrough", text
     if category == "json":
         return "lite-json", lite_json(text)
     if category == "log":
@@ -475,36 +648,87 @@ def _extract_output(payload):
 
 
 def _append_metric(metric, path=None):
+    """Append one privacy-bounded metric to a secure rotating JSONL file.
+
+    Args:
+        metric (dict[str, object]): Coarse counters and labels that contain no
+            command arguments, prompts, or raw tool output.
+        path (str | None): Optional metrics path; defaults to private user state.
+
+    Returns:
+        None: The row is appended and the descriptor is closed before return.
+
+    Raises:
+        OSError: Secure traversal, locking, rotation, or writing fails.
+        ValueError: The target is not a single-link user-owned regular file.
+
+    Parent and final symlinks are refused with no chmod, append, or truncation.
+    Rotation and append occur under one advisory lock. Callers intentionally
+    suppress failures because metrics must never affect tool output.
+    """
     path = path or _metrics_path()
-    _mkdir_private(os.path.dirname(path))
+    parent = os.path.dirname(path)
+    name = os.path.basename(path)
+    if not name:
+        raise ValueError("metrics path has no file name")
+    parent_fd = _open_private_dir(parent, create=True)
     encoded = (json.dumps(metric, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
     max_bytes = max(4096, int(os.environ.get("TOKENPIPE_METRICS_MAX_BYTES", str(8 * 1024 * 1024))))
-    flags = os.O_RDWR | os.O_CREAT | os.O_APPEND
-    fd = os.open(path, flags, 0o600)
+    flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     try:
-        os.fchmod(fd, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        size = os.fstat(fd).st_size
-        if size + len(encoded) > max_bytes:
-            # Keep complete recent JSONL rows. Rotation happens under the same
-            # advisory lock and never copies prompt/tool contents elsewhere.
-            os.lseek(fd, max(0, size - max_bytes // 2), os.SEEK_SET)
-            tail = os.read(fd, max_bytes // 2)
-            newline = tail.find(b"\n")
-            tail = tail[newline + 1:] if newline >= 0 else b""
-            os.ftruncate(fd, 0)
-            os.lseek(fd, 0, os.SEEK_SET)
-            _write_all(fd, tail)
-        _write_all(fd, encoded)
-    finally:
+        fd = os.open(name, flags, 0o600, dir_fd=parent_fd)
         try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        os.close(fd)
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_nlink != 1):
+                raise ValueError("metrics target is not a private regular file")
+            os.fchmod(fd, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            size = os.fstat(fd).st_size
+            if size + len(encoded) > max_bytes:
+                # Keep complete recent JSONL rows. Rotation happens under the
+                # same lock and never copies private content elsewhere.
+                os.lseek(fd, max(0, size - max_bytes // 2), os.SEEK_SET)
+                tail = os.read(fd, max_bytes // 2)
+                newline = tail.find(b"\n")
+                tail = tail[newline + 1:] if newline >= 0 else b""
+                os.ftruncate(fd, 0)
+                os.lseek(fd, 0, os.SEEK_SET)
+                _write_all(fd, tail)
+            _write_all(fd, encoded)
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(fd)
+    finally:
+        os.close(parent_fd)
 
 
-def process(payload, mode=None):
+def process(payload, mode=None, cleanup=True, record_metric=True):
+    """Process one tool-output payload with recoverable fail-open semantics.
+
+    Args:
+        payload (dict[str, object]): Bounded hook payload containing output and
+            optional lifecycle/category metadata. It is not mutated.
+        mode (str | None): Explicit ``audit``, ``safe``, or ``full`` override.
+        cleanup (bool): When true, enforce spool retention immediately. Claude
+            multi-stream callers pass false and finalize all refs together.
+        record_metric (bool): Append the decision metric immediately. A false
+            value defers its bounded metric in the private ``_metric`` result
+            field so a multi-stream caller can commit it only after recovery.
+
+    Returns:
+        dict[str, object]: Compression decision, shown output, recovery path,
+        estimates, and bounded diagnostic metadata.
+
+    Compressor, metric, and spool failures fail open to the exact original
+    output. With immediate cleanup, replacement is returned only after the raw
+    file survives cleanup and reads back byte-for-byte. Deferred multi-stream
+    callers must perform that transaction before exposing the result or metric.
+    Metrics never change the decision.
+    """
     started = time.time()
     requested_mode = mode or payload.get("mode") or os.environ.get("TOKENPIPE_MODE") or configured_mode()
     mode = requested_mode if requested_mode in ("audit", "safe", "full") else "audit"
@@ -521,7 +745,7 @@ def process(payload, mode=None):
     try:
         if original_est < threshold:
             skip_reason = "below-threshold"
-        elif category in ("code", "diff"):
+        elif category in ("binary", "code", "diff"):
             skip_reason = category + "-passthrough"
         else:
             strategy, candidate = compress(original, category)
@@ -545,8 +769,18 @@ def process(payload, mode=None):
                 payload.get("session_id"),
                 payload.get("tool_call_id"),
             )
-            cleanup_spool()
+            if cleanup:
+                if not cleanup_spool(protected=(raw_ref,)):
+                    raise OSError(errno.ENOSPC, "raw output exceeds configured spool cap")
+                if show_raw(raw_ref) != original:
+                    raise OSError(errno.EIO, "raw output failed recovery validation")
         except Exception as exc:  # no recoverable raw means no destructive compression
+            if raw_ref:
+                try:
+                    os.unlink(raw_ref)
+                except OSError:
+                    pass
+                raw_ref = None
             compressor_error = "raw-spool-" + type(exc).__name__
             skip_reason = "raw-spool-error"
             replace = False
@@ -583,12 +817,13 @@ def process(payload, mode=None):
         ),
         "rtk_used": False,
     }
-    try:
-        _append_metric(metric)
-    except Exception:
-        # Telemetry must never alter tool execution.
-        pass
-    return {
+    if record_metric:
+        try:
+            _append_metric(metric)
+        except Exception:
+            # Telemetry must never alter tool execution.
+            pass
+    result = {
         "ok": True,
         "action": "replace" if replace else "passthrough",
         "output": shown,
@@ -602,10 +837,18 @@ def process(payload, mode=None):
         "skip_reason": skip_reason,
         "compressor_error": compressor_error,
     }
+    if not record_metric:
+        result["_metric"] = metric
+    return result
 
 
 SAFE_EXEC_CATEGORIES = frozenset(("git-read", "search", "filesystem-read", "docker-read"))
 FULL_EXEC_CATEGORIES = SAFE_EXEC_CATEGORIES | frozenset(("test", "build", "lint"))
+# Explicit installed-entry roots. Tests may replace this immutable set in
+# process; untrusted child environments cannot extend it.
+_TRUSTED_EXECUTABLE_DIRS = frozenset((
+    "/bin", "/usr/bin", "/usr/sbin", "/sbin", "/usr/local/bin", "/opt/homebrew/bin",
+))
 NATIVE_MARKER = "tokenpipe-native-v1"
 _INTERACTIVE_FLAGS = frozenset((
     "-i", "-w", "--interactive", "--watch", "--watchall", "--watch-all",
@@ -657,11 +900,20 @@ def _argv_category(argv):
 
 
 def _strict_argv_category(argv):
-    """Return a category only for argv accepted by the native wrapper.
+    """Authorize one direct argv vector for the native wrapper.
 
-    This is authoritative and intentionally duplicates the hook's conservative
-    policy. The wrapper is directly invocable, so it must never rely on the
-    PreToolUse hook as its only security boundary.
+    Args:
+        argv (Sequence[str]): Candidate executable and arguments. Values are
+            inspected only; the sequence is not mutated.
+
+    Returns:
+        str: Coarse category when every command-specific flag is read-only, or
+        ``unknown`` when interactive, mutating, output-writing, or Git helper
+        configuration could broaden execution.
+
+    This authoritative check intentionally duplicates the hook's conservative
+    policy because the wrapper is directly invocable. It performs no I/O and
+    never relies on PreToolUse as its only security boundary.
     """
     category = _argv_category(argv)
     if category == "unknown" or not argv:
@@ -682,6 +934,17 @@ def _strict_argv_category(argv):
     ):
         return "unknown"
     head = os.path.basename(str(argv[0])).lower()
+    if head == "git":
+        forbidden_git = {
+            "--ext-diff", "--textconv", "--config-env", "--exec-path",
+            "--git-dir", "--work-tree", "--namespace", "--no-index",
+        }
+        if any(
+            item in forbidden_git
+            or any(item.startswith(prefix + "=") for prefix in forbidden_git)
+            for item in args
+        ):
+            return "unknown"
     if head == "find" and any(item in _FIND_MUTATING for item in args):
         return "unknown"
     if head == "docker" and any(item in ("-f", "--follow") for item in args):
@@ -690,7 +953,21 @@ def _strict_argv_category(argv):
 
 
 def _resolve_trusted_executable(value):
-    """Resolve argv[0] through PATH and reject path-spoofed executables."""
+    """Resolve argv[0] only from trusted installed executable directories.
+
+    Args:
+        value (str | os.PathLike | None): Supplied executable name or absolute
+            path from validated argv.
+
+    Returns:
+        str | None: Canonical executable path, or None when PATH resolution,
+        containment, type, ownership, permissions, or executability is unsafe.
+
+    Project/cwd/temp and ad-hoc home PATH entries are rejected even when their
+    files are user-owned ``0755``. System, Homebrew, ``/usr/local`` and a
+    non-project interpreter installation bin are explicit entry roots. The
+    resolved file and ancestors must be root/user-owned and not world-writable.
+    """
     value = str(value or "")
     if not value:
         return None
@@ -698,11 +975,24 @@ def _resolve_trusted_executable(value):
     located = shutil.which(basename)
     if not located:
         return None
+    located = os.path.abspath(located)
     resolved = os.path.realpath(located)
     if os.sep in value:
         supplied = os.path.realpath(os.path.abspath(value))
         if supplied != resolved:
             return None
+    cwd = os.path.realpath(os.getcwd())
+    temp_root = os.path.realpath(tempfile.gettempdir())
+    home_root = os.path.realpath(os.path.expanduser("~"))
+    interpreter_bin = os.path.dirname(os.path.realpath(sys.executable))
+    trusted_entries = {os.path.realpath(path) for path in _TRUSTED_EXECUTABLE_DIRS}
+    if not any(
+        os.path.commonpath((interpreter_bin, root)) == root
+        for root in (cwd, temp_root, home_root)
+    ):
+        trusted_entries.add(interpreter_bin)
+    if os.path.realpath(os.path.dirname(located)) not in trusted_entries:
+        return None
     try:
         info = os.stat(resolved)
     except OSError:
@@ -711,6 +1001,18 @@ def _resolve_trusted_executable(value):
         return None
     if info.st_uid not in (0, os.getuid()) or info.st_mode & 0o022:
         return None
+    ancestor = os.path.dirname(resolved)
+    while ancestor and ancestor != os.path.dirname(ancestor):
+        try:
+            parent_info = os.stat(ancestor)
+        except OSError:
+            return None
+        sticky = bool(parent_info.st_mode & stat.S_ISVTX)
+        if (not stat.S_ISDIR(parent_info.st_mode)
+                or parent_info.st_uid not in (0, os.getuid())
+                or (parent_info.st_mode & 0o002 and not sticky)):
+            return None
+        ancestor = os.path.dirname(ancestor)
     return resolved if os.access(resolved, os.X_OK) else None
 
 
@@ -897,7 +1199,26 @@ def _metric_base(payload, mode, category, strategy, content_category, original, 
 
 def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None,
                    use_rtk=None, exec_fallback=False):
-    """Execute direct argv without a shell and render one native tool-role result."""
+    """Execute validated argv without a shell and render one tool-role result.
+
+    Args:
+        argv (Sequence[str]): Direct command vector; argv[0] must resolve from a
+            trusted installed directory and match the supplied category.
+        category (str): Coarse expected command category from the hook.
+        mode (str | None): Persisted mode override.
+        session_id (str | None): Sanitized only for metrics/raw file names.
+        tool_call_id (str | None): Sanitized only for metrics/raw file names.
+        use_rtk (bool | None): Optional explicit RTK routing decision.
+        exec_fallback (bool): Replace the wrapper with safe validated argv when
+            capture storage is unavailable.
+
+    Returns:
+        tuple[str, int]: Model-visible output and normalized child exit status.
+
+    Git reads receive a sanitized config/environment that disables hooks,
+    fsmonitor, pagers, external diff, and textconv. Capture/compressor/metric
+    failures preserve execution or fail open without broadening argv authority.
+    """
     started = time.time()
     mode = mode or configured_mode()
     mode = mode if mode in ("audit", "safe", "full") else "audit"
@@ -931,13 +1252,36 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
             pass
         return output, 126
     original_command_argv = [resolved_executable] + list(argv[1:])
+    child_env = os.environ.copy()
+    if supplied_category == "git-read":
+        subcommand = str(argv[1]).lower()
+        if subcommand in ("diff", "log", "show"):
+            original_command_argv[2:2] = ["--no-ext-diff", "--no-textconv"]
+        for key in list(child_env):
+            if key.startswith("GIT_CONFIG_") or key in {
+                "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_EXEC_PATH", "GIT_EXTERNAL_DIFF",
+            }:
+                child_env.pop(key, None)
+        child_env.update({
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_COUNT": "2",
+            "GIT_CONFIG_KEY_0": "core.hooksPath",
+            "GIT_CONFIG_VALUE_0": os.devnull,
+            "GIT_CONFIG_KEY_1": "core.fsmonitor",
+            "GIT_CONFIG_VALUE_1": "false",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_PAGER": "cat",
+            "PAGER": "cat",
+        })
     command_argv = list(original_command_argv)
     rtk_path, persisted_rtk_enabled = configured_rtk()
     want_rtk = use_rtk if use_rtk is not None else persisted_rtk_enabled
     rtk_used = bool(want_rtk and category_ok and trusted_rtk_path(rtk_path))
     if rtk_used:
         command_argv = [rtk_path, os.path.basename(str(argv[0]))] + command_argv[1:]
-    child_env = os.environ.copy()
     try:
         if rtk_used:
             child_env.setdefault("RTK_DB_PATH", os.path.join(_runtime_home(), "rtk-history.db"))
@@ -955,7 +1299,7 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
             )
     except (PermissionError, OSError) as exc:
         if exec_fallback:
-            os.execvpe(original_command_argv[0], original_command_argv, os.environ.copy())
+            os.execvpe(original_command_argv[0], original_command_argv, child_env)
         exit_status = 127
         stdout = ""
         stderr = "%s: %s" % (type(exc).__name__, exc)
@@ -973,7 +1317,7 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
             strategy = "capture-overflow"
             skip_reason = "capture-overflow"
             candidate = bound_candidate(body)
-        elif content_category in ("code", "diff", "config"):
+        elif content_category in ("binary", "code", "diff", "config"):
             skip_reason = content_category + "-passthrough"
         elif estimate_tokens(body) < max(1, int(os.environ.get("TOKENPIPE_MIN_TOKENS_ESTIMATE", "1500"))):
             skip_reason = "below-threshold"
@@ -1003,10 +1347,16 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
         try:
             runtime_raw = _runtime_raw_root()
             raw_ref = spool_raw(body, session_id, tool_call_id, runtime_raw)
-            cleanup_spool(root=runtime_raw)  # enforce cap including new file
-            if not os.path.exists(raw_ref):
+            if not cleanup_spool(root=runtime_raw, protected=(raw_ref,)):
                 raise OSError(errno.ENOSPC, "raw output exceeds configured spool cap")
+            if show_raw(raw_ref) != body:
+                raise OSError(errno.EIO, "raw output failed recovery validation")
         except Exception as exc:
+            if raw_ref:
+                try:
+                    os.unlink(raw_ref)
+                except OSError:
+                    pass
             candidate = body
             replace = False
             raw_ref = None

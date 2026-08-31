@@ -66,13 +66,29 @@ def _recovery_context(streams: Dict[str, Dict[str, Any]]) -> str:
 
 
 def adapt(event: Dict[str, Any], active_mode: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """Return Claude hookSpecificOutput, or None for exact fail-open passthrough."""
+    """Build one transactional Claude PostToolUse replacement response.
+
+    Args:
+        event: Claude Bash hook event. The input mapping is never mutated.
+        active_mode: Optional explicit ``audit``, ``safe``, or ``full`` mode.
+
+    Returns:
+        A Claude ``hookSpecificOutput`` mapping when every changed stream has a
+        recoverable raw file, otherwise ``None`` for exact host passthrough.
+
+    Stdout and stderr are spooled before one shared cleanup transaction. Every
+    surviving reference is read back and compared with its exact original; a
+    cap, cleanup, or recovery failure removes new refs and fails open for the
+    whole response. Images, unsupported shapes, and oversized streams pass
+    through without side effects beyond bounded metrics.
+    """
     if event.get("tool_name") not in (None, "Bash"):
         return None
     response = event.get("tool_response")
     if not isinstance(response, dict) or response.get("isImage") is True:
         return None
     streams = {}
+    deferred_metrics = []
     updated = dict(response)
     limit = _limit()
     selected_mode = active_mode or mode()
@@ -83,15 +99,51 @@ def adapt(event: Dict[str, Any], active_mode: Optional[str] = None) -> Optional[
         if len(output) > limit or len(output.encode("utf-8", "replace")) > limit:
             continue
         try:
-            result = tokenpipe.process(_request(event, stream, output), selected_mode)
+            result = tokenpipe.process(
+                _request(event, stream, output), selected_mode,
+                cleanup=False, record_metric=False,
+            )
         except Exception:
             continue
+        metric = result.pop("_metric", None)
+        if metric:
+            deferred_metrics.append((metric, result.get("action") == "replace"))
         if result.get("action") != "replace" or not result.get("raw_ref"):
             continue
         updated[stream] = result["output"]
         streams[stream] = result
     if not streams:
+        for metric, _ in deferred_metrics:
+            try:
+                tokenpipe._append_metric(metric)
+            except Exception:
+                pass
         return None
+    refs = [result["raw_ref"] for result in streams.values()]
+    try:
+        if not tokenpipe.cleanup_spool(protected=refs):
+            raise OSError("raw output exceeds configured spool cap")
+        for stream, result in streams.items():
+            if tokenpipe.show_raw(result["raw_ref"]) != response[stream]:
+                raise OSError("raw output failed recovery validation")
+    except Exception:
+        for raw_ref in refs:
+            try:
+                os.unlink(raw_ref)
+            except OSError:
+                pass
+        for metric, was_replacement in deferred_metrics:
+            if not was_replacement:
+                try:
+                    tokenpipe._append_metric(metric)
+                except Exception:
+                    pass
+        return None
+    for metric, _ in deferred_metrics:
+        try:
+            tokenpipe._append_metric(metric)
+        except Exception:
+            pass
     return {
         "hookSpecificOutput": {
             "hookEventName": "PostToolUse",

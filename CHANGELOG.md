@@ -28,6 +28,19 @@ All notable changes to this project are documented here. The format follows
   rejected.
 - Output replacement fails open unless a private recovery copy is available.
 - Runtime processing is local and makes no model, telemetry, or network calls.
+- Git reads disable external diff/textconv, fsmonitor hooks, pagers, and
+  environment-supplied Git configuration.
+- Native executables are accepted only from explicit installed roots; project
+  and temporary PATH shims are refused.
+- Raw-output and metrics paths use no-follow directory traversal and reject
+  symlinked or foreign-owned storage.
+- Claude stdout/stderr recovery and metrics commit as one transaction; binary,
+  control-heavy, and invalid-UTF-8 output is never compressed.
+
+### Changed
+
+- Claude hook commands use absolute `/usr/bin/python3` instead of a
+  machine-specific Python Framework path or a project-controlled PATH lookup.
 
 [Unreleased]: https://github.com/DKotsyuba/agent-pipline-compressor/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/DKotsyuba/agent-pipline-compressor/releases/tag/v0.1.0
