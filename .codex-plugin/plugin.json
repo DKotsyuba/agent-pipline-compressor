@@ -1,6 +1,6 @@
 {
   "name": "agent-pipline-compressor",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Local deterministic compression and recovery for noisy Codex Bash output.",
   "author": {
     "name": "wild-feather",

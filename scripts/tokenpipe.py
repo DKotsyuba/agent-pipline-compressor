@@ -26,7 +26,7 @@ import time
 import uuid
 
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 ANSI_RE = re.compile(r"\x1b(?:[@-_][0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 SECRET_KEY_RE = re.compile(r"(?i)(token|secret|password|authorization|api[_-]?key|cookie)")
 ERROR_RE = re.compile(
@@ -219,6 +219,20 @@ def set_configured_mode(mode):
     settings["mode"] = mode
     _write_settings(settings)
     return mode
+
+
+def configured_post_replace():
+    value = configured_settings().get("post_replace")
+    return value if isinstance(value, str) and value else None
+
+
+def set_post_replace(value):
+    settings = configured_settings()
+    if value in ("off", "0", ""):
+        settings.pop("post_replace", None)
+    else:
+        settings["post_replace"] = value
+    _write_settings(settings)
 
 
 def _safe_component(value, fallback):
@@ -762,6 +776,13 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
 
     candidate_est = estimate_tokens(candidate)
     replace = mode != "audit" and candidate != original
+    if replace and mode in ("safe", "full"):
+        # A caller-provided allowlist restricts which content categories may be
+        # replaced; the counterfactual candidate still feeds honest estimates.
+        replace_categories = payload.get("replace_categories")
+        if isinstance(replace_categories, list) and category not in replace_categories:
+            replace = False
+            skip_reason = "category-gated"
     if replace:
         try:
             raw_ref = spool_raw(
@@ -829,6 +850,7 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
         "output": shown,
         "mode": mode,
         "strategy": strategy,
+        "content_category": category,
         "raw_ref": raw_ref,
         "original_tokens_estimate": original_est,
         "shown_tokens_estimate": shown_est,
@@ -1551,6 +1573,9 @@ def main(argv=None):
     show.add_argument("raw_ref")
     mode_cmd = commands.add_parser("mode", help="print or persist audit/safe/full mode")
     mode_cmd.add_argument("value", nargs="?", choices=("audit", "safe", "full"))
+    replace_cmd = commands.add_parser(
+        "post-replace", help="print or persist the post-replacement gate (1, category list, or off)")
+    replace_cmd.add_argument("value", nargs="?")
     rtk_cmd = commands.add_parser("rtk", help="show, enable, or disable trusted RTK integration")
     rtk_cmd.add_argument("value", nargs="?", help="absolute RTK executable path, or 'off'")
     native = commands.add_parser("exec", help="execute direct argv and emit native compressed output")
@@ -1623,6 +1648,11 @@ def main(argv=None):
         if args.value:
             set_configured_mode(args.value)
         print(configured_mode())
+        return 0
+    if args.command == "post-replace":
+        if args.value is not None:
+            set_post_replace(args.value.strip())
+        print(configured_post_replace() or "off")
         return 0
     if args.command == "rtk":
         try:
