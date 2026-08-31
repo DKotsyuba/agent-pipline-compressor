@@ -218,14 +218,18 @@ def run_audit(event: Dict[str, Any], output: str) -> None:
         return
 
 
-def run_post_process(event: Dict[str, Any], output: str, active_mode: str) -> Optional[Dict[str, Any]]:
+def run_post_process(event: Dict[str, Any], output: str, active_mode: str,
+                     categories: Optional[frozenset] = None) -> Optional[Dict[str, Any]]:
     """Run the shared compressor and return only its bounded structured result."""
     if active_mode not in {"safe", "full"} or not TOKENPIPE.is_file():
         return None
+    request = post_request(event, output)
+    if categories is not None:
+        request["replace_categories"] = sorted(categories)
     try:
         completed = subprocess.run(
             [sys.executable, str(TOKENPIPE), "post", "--mode", active_mode],
-            input=json.dumps(post_request(event, output), ensure_ascii=False),
+            input=json.dumps(request, ensure_ascii=False),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,

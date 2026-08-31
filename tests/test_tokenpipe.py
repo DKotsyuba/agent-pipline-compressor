@@ -66,6 +66,34 @@ class TokenpipeTests(unittest.TestCase):
         self.assertEqual(result["output"], "ok")
         self.assertEqual(result["skip_reason"], "below-threshold")
 
+    def test_replace_categories_gate_suppresses_spool_not_counterfactual(self):
+        raw = "same log line\n" * 200
+        payload = self.payload(raw)
+        payload["replace_categories"] = ["json", "error"]
+        result = tokenpipe.process(payload, "safe")
+        self.assertEqual(result["action"], "passthrough")
+        self.assertEqual(result["output"], raw)
+        self.assertEqual(result["skip_reason"], "category-gated")
+        self.assertIsNone(result["raw_ref"])
+        self.assertLess(result["counterfactual_tokens_estimate"], result["original_tokens_estimate"])
+        self.assertEqual(result["shown_tokens_estimate"], result["original_tokens_estimate"])
+
+    def test_replace_categories_allow_replaces_matching_category(self):
+        raw = "same log line\n" * 200
+        payload = self.payload(raw)
+        payload["replace_categories"] = ["log"]
+        result = tokenpipe.process(payload, "safe")
+        self.assertEqual(result["action"], "replace")
+        self.assertIsNotNone(result["raw_ref"])
+        self.assertLess(result["shown_tokens_estimate"], result["original_tokens_estimate"])
+
+    def test_no_replace_categories_replaces_as_before(self):
+        raw = "same log line\n" * 200
+        result = tokenpipe.process(self.payload(raw), "safe")
+        self.assertEqual(result["action"], "replace")
+        self.assertIsNotNone(result["raw_ref"])
+        self.assertLess(result["shown_tokens_estimate"], result["original_tokens_estimate"])
+
     def test_audit_measures_without_changing_output(self):
         raw = "same log line\n" * 200
         result = tokenpipe.process(self.payload(raw), "audit")

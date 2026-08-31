@@ -3,6 +3,7 @@
 
 import os
 import sys
+from typing import FrozenSet, Optional, Tuple
 
 sys.dont_write_bytecode = True
 
@@ -30,6 +31,30 @@ def is_native_output(output: str) -> bool:
     return marker in output.replace("\r\n", "\n")
 
 
+def post_replace_gate() -> Tuple[bool, Optional[FrozenSet[str]]]:
+    """Parse TOKENPIPE_POST_REPLACE into (replace enabled, category allowlist).
+
+    A None allowlist means every content category is eligible ("1"). Unset,
+    "0", or empty values disable replacement; a comma-separated list restricts
+    replacement to the named categories. Case and surrounding whitespace are
+    ignored, unrecognized tokens never match, and ambiguous mixes of switch
+    values with categories fail closed to audit-only.
+    """
+    raw = os.environ.get("TOKENPIPE_POST_REPLACE")
+    if raw is None:
+        return False, None
+    tokens = frozenset(
+        token for token in (part.strip().lower() for part in raw.split(",")) if token
+    )
+    if not tokens or tokens == frozenset(("0",)):
+        return False, None
+    if tokens == frozenset(("1",)):
+        return True, None
+    if "0" in tokens or "1" in tokens:
+        return False, None
+    return True, tokens
+
+
 def main() -> int:
     if os.environ.get("CLAUDE_PLUGIN_ROOT") and not os.environ.get("PLUGIN_ROOT"):
         from claude_post_tool import main as claude_main
@@ -54,16 +79,20 @@ def main() -> int:
         run_skip(event, "audit-output-overflow")
         return 0
     active_mode = mode()
-    if os.environ.get("TOKENPIPE_POST_REPLACE") == "1" and active_mode in {"safe", "full"}:
-        result = run_post_process(event, output, active_mode)
-        if result and result.get("action") == "replace" and result.get("raw_ref"):
-            status = exit_status(event)
-            header = "tokenpipe-post-v1 mode=%s strategy=%s" % (
-                active_mode, result.get("strategy") or "unknown")
-            if status is not None:
-                header += " exit=%d" % status
-            header += " raw_ref=" + result["raw_ref"]
-            emit({"decision": "block", "reason": header + "\n" + result["output"]})
+    replace_enabled, categories = post_replace_gate()
+    if replace_enabled and active_mode in {"safe", "full"}:
+        result = run_post_process(event, output, active_mode, categories)
+        if result is not None:
+            # The compressor already recorded exactly one honest metric for this
+            # event; a follow-up audit pass would double-count it.
+            if result.get("action") == "replace" and result.get("raw_ref"):
+                status = exit_status(event)
+                header = "tokenpipe-post-v1 mode=%s strategy=%s" % (
+                    active_mode, result.get("strategy") or "unknown")
+                if status is not None:
+                    header += " exit=%d" % status
+                header += " raw_ref=" + result["raw_ref"]
+                emit({"decision": "block", "reason": header + "\n" + result["output"]})
             return 0
     # Always force audit: PostToolUse is observation-only in every configured
     # ordinary Codex mode and deliberately emits no stdout whatsoever.

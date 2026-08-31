@@ -149,6 +149,157 @@ class HookSecurityTests(unittest.TestCase):
         finally:
             post_tool.run_post_process = original
 
+    def stub_post_process(self, holder):
+        def fake_process(event, output, active_mode, categories=None):
+            return {
+                "action": "replace",
+                "raw_ref": "/tmp/tokenpipe-test-raw",
+                "output": "compressed",
+                "strategy": "lite",
+                "content_category": holder[0],
+            }
+        return fake_process
+
+    def test_post_replace_one_replaces_any_content_category(self):
+        os.environ["TOKENPIPE_POST_REPLACE"] = "1"
+        holder = ["log"]
+        audited = []
+        original_process, original_audit = post_tool.run_post_process, post_tool.run_audit
+        try:
+            post_tool.run_post_process = self.stub_post_process(holder)
+            post_tool.run_audit = lambda event, output: audited.append(output)
+            visible = self.run_post("same line\n" * 400, "safe")
+            self.assertIn('"decision":"block"', visible)
+            self.assertIn("raw_ref=/tmp/tokenpipe-test-raw", visible)
+            self.assertEqual(audited, [])
+        finally:
+            post_tool.run_post_process, post_tool.run_audit = original_process, original_audit
+
+    def test_post_replace_category_list_gates_on_compressor_category(self):
+        os.environ["TOKENPIPE_POST_REPLACE"] = " Error , error "
+        seen_categories = []
+        audited = []
+
+        def fake_process(event, output, active_mode, categories=None):
+            seen_categories.append(categories)
+            return {
+                "action": "replace",
+                "raw_ref": "/tmp/tokenpipe-test-raw",
+                "output": "compressed",
+                "strategy": "lite",
+                "content_category": "error",
+            }
+
+        original_process, original_audit = post_tool.run_post_process, post_tool.run_audit
+        try:
+            post_tool.run_post_process = fake_process
+            post_tool.run_audit = lambda event, output: audited.append(output)
+            visible = self.run_post("same line\n" * 400, "safe")
+            self.assertIn('"decision":"block"', visible)
+            self.assertEqual(seen_categories, [frozenset(("error",))])
+            self.assertEqual(audited, [])
+        finally:
+            post_tool.run_post_process, post_tool.run_audit = original_process, original_audit
+
+    def test_post_replace_unset_audits_only(self):
+        os.environ.pop("TOKENPIPE_POST_REPLACE", None)
+        calls, audited = [], []
+        original_process, original_audit = post_tool.run_post_process, post_tool.run_audit
+        try:
+            post_tool.run_post_process = lambda *args: calls.append(args)
+            post_tool.run_audit = lambda event, output: audited.append(output)
+            self.assertEqual(self.run_post("same line\n" * 400, "safe"), "")
+            self.assertEqual(calls, [])
+            self.assertEqual(len(audited), 1)
+        finally:
+            post_tool.run_post_process, post_tool.run_audit = original_process, original_audit
+
+    def test_post_replace_malformed_values_fall_back_to_audit(self):
+        original_process, original_audit = post_tool.run_post_process, post_tool.run_audit
+        try:
+            for value, expect_audit in (("yes", False), (" ,", True), ("unknowncat", False)):
+                os.environ["TOKENPIPE_POST_REPLACE"] = value
+                audited = []
+                post_tool.run_post_process = lambda *args: {
+                    "action": "passthrough",
+                    "raw_ref": None,
+                    "output": "original",
+                    "strategy": "passthrough",
+                    "content_category": "error",
+                }
+                post_tool.run_audit = lambda event, output: audited.append(output)
+                self.assertEqual(self.run_post("same line\n" * 400, "safe"), "")
+                self.assertEqual(len(audited), 1 if expect_audit else 0)
+        finally:
+            post_tool.run_post_process, post_tool.run_audit = original_process, original_audit
+
+    def _metrics(self):
+        path = Path(os.environ["TOKENPIPE_HOME"]) / "metrics.jsonl"
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text().splitlines() if line]
+
+    def test_post_replace_gated_category_records_one_honest_metric(self):
+        os.environ["TOKENPIPE_MODE"] = "safe"
+        os.environ["TOKENPIPE_POST_REPLACE"] = "json"
+        token_home = tempfile.TemporaryDirectory()
+        self.addCleanup(token_home.cleanup)
+        os.environ["TOKENPIPE_HOME"] = token_home.name
+        os.environ["TOKENPIPE_MIN_TOKENS_ESTIMATE"] = "10"
+        event = {
+            "session_id": "post-session",
+            "tool_use_id": "post-call",
+            "tool_input": {"cmd": "find . -type f -print", "shell": "bash"},
+            "tool_response": {"aggregatedOutput": "same line\n" * 400, "exitCode": 0},
+        }
+        old_stdin = sys.stdin
+        sys.stdin = io.StringIO(json.dumps(event))
+        visible = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(visible):
+                post_tool.main()
+        finally:
+            sys.stdin = old_stdin
+        self.assertEqual(visible.getvalue(), "")
+        metrics = self._metrics()
+        self.assertEqual(len(metrics), 1)
+        metric = metrics[0]
+        self.assertEqual(metric["mode"], "safe")
+        self.assertEqual(metric["skip_reason"], "category-gated")
+        self.assertFalse(metric["raw_ref_present"])
+        self.assertEqual(metric["shown_tokens_estimate"], metric["original_tokens_estimate"])
+        self.assertEqual(metric["shown_bytes"], metric["original_bytes"])
+
+    def test_post_replace_action_replace_records_one_metric(self):
+        os.environ["TOKENPIPE_MODE"] = "safe"
+        os.environ["TOKENPIPE_POST_REPLACE"] = "1"
+        token_home = tempfile.TemporaryDirectory()
+        self.addCleanup(token_home.cleanup)
+        os.environ["TOKENPIPE_HOME"] = token_home.name
+        os.environ["TOKENPIPE_MIN_TOKENS_ESTIMATE"] = "10"
+        event = {
+            "session_id": "post-session",
+            "tool_use_id": "post-call",
+            "tool_input": {"cmd": "find . -type f -print", "shell": "bash"},
+            "tool_response": {"aggregatedOutput": "same line\n" * 400, "exitCode": 0},
+        }
+        old_stdin = sys.stdin
+        sys.stdin = io.StringIO(json.dumps(event))
+        visible = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(visible):
+                post_tool.main()
+        finally:
+            sys.stdin = old_stdin
+        self.assertIn('"decision":"block"', visible.getvalue())
+        metrics = self._metrics()
+        self.assertEqual(len(metrics), 1)
+        metric = metrics[0]
+        self.assertEqual(metric["mode"], "safe")
+        self.assertTrue(metric["raw_ref_present"])
+        self.assertIsNone(metric["skip_reason"])
+        self.assertLess(metric["shown_tokens_estimate"], metric["original_tokens_estimate"])
+
     def test_safe_and_full_allowlists(self):
         safe_yes = ["git status", "git diff --stat", "rg TODO src", "find . -type f", "ls -la", "docker ps"]
         full_only = ["pytest -q", "cargo test", "go build ./...", "npm run lint", "ruff check ."]

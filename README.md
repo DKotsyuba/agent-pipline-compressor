@@ -129,6 +129,7 @@ Persist a mode with `python3 scripts/tokenpipe.py mode audit|safe|full`. `TOKENP
 | `TOKENPIPE_RAW_MAX_BYTES` | `256 MiB` | Raw-output storage cap. |
 | `TOKENPIPE_METRICS_MAX_BYTES` | `8 MiB` | Metrics-file rotation cap. |
 | `TOKENPIPE_HOOK_TIMEOUT_SEC` | `30` | Hook post-processing timeout. |
+| `TOKENPIPE_POST_REPLACE` | `0` | Codex post-output replacement gate: `0`/absent audits only; `1` replaces any eligible content category; a comma-separated category list (e.g. `error,log`) replaces only output the compressor classifies into a listed category, and any other value audits only. |
 | `TOKENPIPE_AUDIT_MAX_BYTES` | `1 MiB` | Largest single Codex audit output copied to the compressor; larger output is recorded as metadata only. |
 | `TOKENPIPE_CLAUDE_MAX_BYTES` | `16 MiB` | Largest Claude text stream considered by its post-tool hook. |
 | `RTK_DB_PATH` | private runtime DB | Optional RTK history location; an explicit value takes precedence. |

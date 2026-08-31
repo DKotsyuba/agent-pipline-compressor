@@ -762,6 +762,13 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
 
     candidate_est = estimate_tokens(candidate)
     replace = mode != "audit" and candidate != original
+    if replace and mode in ("safe", "full"):
+        # A caller-provided allowlist restricts which content categories may be
+        # replaced; the counterfactual candidate still feeds honest estimates.
+        replace_categories = payload.get("replace_categories")
+        if isinstance(replace_categories, list) and category not in replace_categories:
+            replace = False
+            skip_reason = "category-gated"
     if replace:
         try:
             raw_ref = spool_raw(
@@ -829,6 +836,7 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
         "output": shown,
         "mode": mode,
         "strategy": strategy,
+        "content_category": category,
         "raw_ref": raw_ref,
         "original_tokens_estimate": original_est,
         "shown_tokens_estimate": shown_est,
