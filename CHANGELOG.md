@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-01
+
 ### Added
 
 - Claude Code PostToolUse coverage beyond Bash: Grep, WebFetch, and MCP tool
@@ -16,6 +18,10 @@ All notable changes to this project are documented here. The format follows
   example toolchains installed under the home directory) pass through
   unwrapped instead of failing with exit 126, making `full` mode safe to
   enable on machines with home-directory toolchains.
+
+### Changed
+
+- Plugin manifests carry the maintainer's real name and canonical profile URL.
 
 ## [0.2.0] - 2026-08-31
 
@@ -71,6 +77,7 @@ All notable changes to this project are documented here. The format follows
 - Claude hook commands use absolute `/usr/bin/python3` instead of a
   machine-specific Python Framework path or a project-controlled PATH lookup.
 
-[Unreleased]: https://github.com/DKotsyuba/agent-pipline-compressor/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/DKotsyuba/agent-pipline-compressor/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/DKotsyuba/agent-pipline-compressor/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/DKotsyuba/agent-pipline-compressor/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/DKotsyuba/agent-pipline-compressor/releases/tag/v0.1.0
