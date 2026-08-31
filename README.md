@@ -209,19 +209,6 @@ python3 scripts/tokenpipe.py --version
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution flow and [AGENTS.md](AGENTS.md) for repository engineering guidance.
 
-## Releases
-
-The public baseline is SemVer `0.1.0`; release tags are `vMAJOR.MINOR.PATCH`. Pull requests and pushes to `main` are validated by CI; release tags rerun the full test matrix before publication. A valid tag produces a GitHub Release archive named `agent-pipline-compressor-vX.Y.Z.tar.gz`, its checksum, generated release notes, and a provenance attestation. See [CHANGELOG.md](CHANGELOG.md) for Keep a Changelog release notes. GitHub Packages, Docker, and GHCR are intentionally not used.
-
-Download and verify a GitHub Release asset:
-
-```bash
-gh release download v0.1.0 --repo DKotsyuba/agent-pipline-compressor --dir release
-(cd release && shasum -a 256 -c agent-pipline-compressor-v0.1.0.tar.gz.sha256)
-gh attestation verify release/agent-pipline-compressor-v0.1.0.tar.gz \
-  --repo DKotsyuba/agent-pipline-compressor
-```
-
 ## Contributing, security, and license
 
 Contributions are welcome: read [CONTRIBUTING.md](CONTRIBUTING.md), report security vulnerabilities privately through [GitHub Security Advisories](https://github.com/DKotsyuba/agent-pipline-compressor/security/advisories/new), and review [SECURITY.md](SECURITY.md). Released under the [MIT License](LICENSE).
