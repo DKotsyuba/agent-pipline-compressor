@@ -484,7 +484,43 @@ def cleanup_spool(now=None, root=None, protected=None):
     return total <= max_bytes
 
 
+def _similar_object_keys(value):
+    """Return the shared key set of a homogeneous object array.
+
+    Args:
+        value (list): Parsed JSON array to inspect.
+
+    Returns:
+        list[str] or None: Sorted shared key names when ``value`` holds at
+        least six dictionaries that all expose exactly the same key set;
+        ``None`` for shorter arrays or any non-homogeneous content.
+    """
+    if len(value) < 6 or not isinstance(value[0], dict):
+        return None
+    keys = set(value[0])
+    for item in value:
+        if not isinstance(item, dict) or set(item) != keys:
+            return None
+    return sorted(keys)
+
+
 def _json_sanitize(value, depth=0):
+    """Recursively reduce a parsed JSON value to a bounded model-facing form.
+
+    Args:
+        value (object): Parsed JSON value of any type.
+        depth (int): Current nesting depth; levels beyond 12 are elided.
+
+    Returns:
+        object: JSON-serializable counterpart of ``value``. Dicts keep at most
+        40 keys plus an ``__tokenpipe_omitted_keys__`` count; homogeneous
+        object arrays of six or more items collapse to the first two items,
+        one ``__tokenpipe_similar_items__`` marker, and the last item; other
+        lists longer than 30 items keep 20 head items, an
+        ``__tokenpipe_omitted_items__`` marker, and 5 tail items; strings over
+        1200 characters keep a 900-character head and 150-character tail.
+        Scalars are returned unchanged.
+    """
     if depth > 12:
         return "[depth elided]"
     if isinstance(value, dict):
@@ -502,6 +538,13 @@ def _json_sanitize(value, depth=0):
             result["__tokenpipe_omitted_keys__"] = len(items) - len(chosen)
         return result
     if isinstance(value, list):
+        similar_keys = _similar_object_keys(value)
+        if similar_keys is not None:
+            return (
+                [_json_sanitize(x, depth + 1) for x in value[:2]]
+                + [{"__tokenpipe_similar_items__": len(value) - 3, "keys": similar_keys}]
+                + [_json_sanitize(value[-1], depth + 1)]
+            )
         if len(value) <= 30:
             return [_json_sanitize(x, depth + 1) for x in value]
         return (

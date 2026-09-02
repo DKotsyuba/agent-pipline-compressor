@@ -116,6 +116,11 @@ def corpus():
     mixed_log = _repeat("INFO worker started\n", 100) + "WARN retrying request id=42\n" + _repeat("INFO worker finished\n", 90) + "ERROR request failed status=503\nTraceback: timeout\n"
     nested_json = json.dumps({"status": "ok", "items": [{"id": i, "meta": {"active": True, "labels": ["lab", "fixture"]}} for i in range(80)], "page": {"number": 1, "next": None}}, indent=2, sort_keys=True)
     error_json = json.dumps({"status": "failed", "error": {"type": "AssertionError", "message": "expected total", "trace": ["setup", "assert", "teardown"]}, "keys": ["status", "error"]}, indent=2, sort_keys=True)
+    inventory_json = json.dumps({"schema": "inventory/v1", "hosts": [
+        {"host": "node-%03d" % i, "region": "us-east-%d" % (i % 3), "uptime_s": i * 60,
+         "checks": [{"name": name, "ok": (i + j) % 5 != 0, "value": (i * 7 + j * 3) % 97}
+                    for j, name in enumerate(("disk", "memory", "cpu", "load", "io", "net", "gpu"))]}
+        for i in range(48)]}, indent=2, sort_keys=True)
     ansi_progress = "\x1b[2K\rprogress 10%\x1b[2K\rprogress 50%\x1b[2K\rprogress 100%\ncompleted successfully\n"
     protected_code = "\n".join("def protected_%03d(value):\n    return value + %d" % (i, i) for i in range(20)) + "\n"
     protected_config = "[service]\nname = lab\nmode = protected\n" + "\n".join("option_%02d = value_%02d" % (i, i) for i in range(20)) + "\n"
@@ -144,6 +149,11 @@ def corpus():
             {"path": ("status",), "type": "string", "value": "failed"}, {"path": ("error",), "type": "object"},
             {"path": ("error", "type"), "type": "string", "value": "AssertionError"}, {"path": ("error", "trace"), "type": "array", "count": 3},
         )),
+        Case("inventory-json", "json", "json", 3, 0, inventory_json, must_keep=("inventory/v1",), json_keys=("hosts", "schema"), json_expectations=(
+            {"path": ("schema",), "type": "string", "value": "inventory/v1"}, {"path": ("hosts",), "type": "array", "count": 48},
+            {"path": ("hosts", 0, "host"), "type": "string", "value": "node-000"}, {"path": ("hosts", 0, "region"), "type": "string", "value": "us-east-0"},
+            {"path": ("hosts", 0, "checks"), "type": "array", "count": 7}, {"path": ("hosts", 0, "checks", 0, "name"), "type": "string", "value": "disk"},
+        )),
         Case("ansi-progress", "logs", "log", 1, 0, ansi_progress, must_keep=("completed successfully",)), Case("small-output", "plain", "small", 1, 0, "ok\n"),
         Case("protected-code", "protected", "code", 5, 0, protected_code, must_keep=("def protected_019",), exact_policy={"mode": "exact", "reason": "source code is protected"}),
         Case("protected-config", "protected", "config", 5, 0, protected_config, must_keep=("mode = protected",), exact_policy={"mode": "exact", "reason": "configuration is protected"}),
@@ -160,7 +170,19 @@ def canonical_hash(value):
 
 
 def _applicable_stages(case):
-    if case.route == "json":
+    """Return the local stages a case's route is allowed to evaluate.
+
+    Args:
+        case (Case or CommandCase): Case whose ``route`` string selects the
+            applicable stage set.
+
+    Returns:
+        tuple[str]: Stage names forming a sub-order of ``STAGES``. JSON routes
+        (``json`` and any route suffixed ``-json``, such as ``rtk-json``) get
+        ``json-lite``; textual log routes get ``log-lite``; protected
+        diff/code/config routes keep only non-destructive stages.
+    """
+    if case.route == "json" or case.route.endswith("-json"):
         return ("ansi", "json-lite", "bound")
     if case.route in ("log", "rg-io-errors", "git-log", "pytest", "unittest", "generic-test", "rtk-log"):
         return ("ansi", "log-lite", "cca", "bound")
@@ -270,10 +292,43 @@ def _json_type(value):
     return "unknown"
 
 
+def _marker_omitted_count(item):
+    """Return the omitted-item count a tokenpipe fold marker declares.
+
+    Args:
+        item (object): Candidate JSON value of any type.
+
+    Returns:
+        int or None: The declared omitted count when ``item`` is exactly a
+        ``__tokenpipe_omitted_items__`` or ``__tokenpipe_similar_items__``
+        marker object; ``None`` when ``item`` is ordinary array content.
+    """
+    if not isinstance(item, dict):
+        return None
+    if set(item) == {"__tokenpipe_omitted_items__"} and isinstance(item["__tokenpipe_omitted_items__"], int):
+        return item["__tokenpipe_omitted_items__"]
+    if set(item) == {"__tokenpipe_similar_items__", "keys"} and isinstance(item["__tokenpipe_similar_items__"], int):
+        return item["__tokenpipe_similar_items__"]
+    return None
+
+
 def _effective_array_count(value):
+    """Count the items a sanitized JSON array represents.
+
+    Args:
+        value (object): Candidate JSON value of any type.
+
+    Returns:
+        int or None: Effective item count with fold markers expanded to their
+        declared omitted counts; ``None`` when ``value`` is not a list.
+    """
     if not isinstance(value, list):
         return None
-    return sum(item.get("__tokenpipe_omitted_items__", 0) if isinstance(item, dict) and set(item) == {"__tokenpipe_omitted_items__"} and isinstance(item.get("__tokenpipe_omitted_items__"), int) else 1 for item in value)
+    total = 0
+    for item in value:
+        omitted = _marker_omitted_count(item)
+        total += omitted if omitted is not None else 1
+    return total
 
 
 def schema_check(case, candidate):
@@ -346,7 +401,7 @@ def _candidate(case, raw, source, order, raw_recoverable, observed_exit, case_id
         candidate = apply_order(raw, order)
     except Exception as exc:
         result = evaluate_candidate(case, raw, raw, observed_exit, raw_recoverable, source, order, base_latency_ms, case_id, normalization, exact_raw)
-        result.update(valid=False, invalid_reasons=["stage-error", type(exc).__name__])
+        result.update(valid=False, invalid_reasons=result["invalid_reasons"] + ["stage-error", type(exc).__name__])
         return result
     return evaluate_candidate(case, raw, candidate, observed_exit, raw_recoverable, source, order,
                               round(base_latency_ms + (time.perf_counter() - started) * 1000.0, 3), case_id, normalization, exact_raw)
@@ -576,7 +631,7 @@ def _run_in_root(root, enable_rtk=True, explicit_rtk=None):
                     candidate = apply_order(rtk_quality, order); latency = rtk_overhead + round((time.perf_counter() - started) * 1000.0, 3)
                     candidates.append(evaluate_candidate(quality_case, quality_raw, candidate, rtk_exit, rtk_recoverable, "rtk->local", order, latency, command.case_id, normalization, raw))
                 except Exception as exc:
-                    failed = evaluate_candidate(quality_case, quality_raw, rtk_quality, rtk_exit, rtk_recoverable, "rtk->local", order, rtk_overhead, command.case_id, normalization, raw); failed.update(valid=False, invalid_reasons=["stage-error", type(exc).__name__]); candidates.append(failed)
+                    failed = evaluate_candidate(quality_case, quality_raw, rtk_quality, rtk_exit, rtk_recoverable, "rtk->local", order, rtk_overhead, command.case_id, normalization, raw); failed.update(valid=False, invalid_reasons=failed["invalid_reasons"] + ["stage-error", type(exc).__name__]); candidates.append(failed)
         best = _best(candidates); record = {"id": command.case_id, "scope": "command-matrix", "category": command.category, "route": command.route, "weight": command.weight, "exit_code": command.exit_code, "observed_exit_code": exit_code, "raw_sha256": sha256(normalized_raw), "raw_bytes": len(normalized_raw.encode()), "raw_tokens": tokenpipe.estimate_tokens(normalized_raw), "capture_latency_ms": capture_latency, "raw_recoverable": recoverable, "normalization": {"rules": normalization, "raw_changed": raw != normalized_raw}, "rtk_capture": rtk_capture, "winner": best["id"] if best else None, "candidates": candidates}; records.append(record); invalid += [(record["id"], item) for item in candidates if not item["valid"]]
     manifest = {"synthetic_corpus": {"cases": [{key: value for key, value in record.items() if key in ("id", "category", "route", "weight", "exit_code", "must_keep", "alternative_markers", "secret_like_count", "secret_like_sha256", "exact_policy", "json_keys", "json_expectations", "raw_sha256")} for record in records if record["scope"] == "synthetic"], "partial_order": [list(item) for item in PARTIAL_ORDER], "orders": sorted(orders_seen)}, "command_matrix": {"cases": [{"id": case.case_id, "category": case.category, "route": case.route, "weight": case.weight, "argv": _manifest_argv(case.argv, root), "rtk_argv": _manifest_argv(case.rtk_argv, root), "exit_code": case.exit_code, "must_keep": list(case.must_keep), "alternative_markers": [list(group) for group in case.alternative_markers], "exact_policy": case.exact_policy, "json_expectations": [dict(item) for item in case.json_expectations]} for case in command_cases], "discovered": discovered}}
     synthetic_rows = _aggregate_rows(records, "synthetic"); command_rows = _aggregate_rows(records, "command-matrix")
