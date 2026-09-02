@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Observe Bash output without ever changing model-visible tool results."""
 
+import importlib.util
 import os
 import sys
 from typing import FrozenSet, Optional, Tuple
 
 sys.dont_write_bytecode = True
 
-from common import (NATIVE_MARKER, emit, exit_status, mode, post_replace_value,
-                    read_event, run_audit, run_post_process, run_skip,
-                    tool_output)
+from common import (NATIVE_MARKER, TOKENPIPE, emit, exit_status, mode,
+                    post_replace_value, read_event, run_audit,
+                    run_post_process, run_skip, tool_output)
 
 
 def audit_limit() -> int:
@@ -56,6 +57,35 @@ def post_replace_gate() -> Tuple[bool, Optional[FrozenSet[str]]]:
     return True, tokens
 
 
+def recovery_header(active_mode: str, strategy: Optional[str],
+                    status: Optional[int], raw_ref: str) -> Optional[str]:
+    """Render the replacement header from the compressor's shared template.
+
+    The template lives in ``scripts/tokenpipe.py`` so the header this hook
+    shows and the header cost the net-win gate prices cannot drift apart. The
+    compressor module is loaded lazily, so audit-only events never pay for it.
+
+    Args:
+        active_mode: Resolved ``safe`` or ``full`` mode for this event.
+        strategy: Compression strategy reported by the compressor; ``None`` or
+            an empty value renders ``unknown``.
+        status: Child exit status, or ``None`` to omit the field.
+        raw_ref: Absolute recovery path returned with the replacement.
+
+    Returns:
+        The single header line without a trailing newline, or ``None`` when the
+        compressor module cannot be loaded. A ``None`` result makes the caller
+        fail open and leave the exact original output visible.
+    """
+    try:
+        spec = importlib.util.spec_from_file_location("tokenpipe_post_core", str(TOKENPIPE))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.post_recovery_header(active_mode, strategy, status, raw_ref)
+    except Exception:
+        return None
+
+
 def main() -> int:
     if os.environ.get("CLAUDE_PLUGIN_ROOT") and not os.environ.get("PLUGIN_ROOT"):
         from claude_post_tool import main as claude_main
@@ -87,13 +117,12 @@ def main() -> int:
             # The compressor already recorded exactly one honest metric for this
             # event; a follow-up audit pass would double-count it.
             if result.get("action") == "replace" and result.get("raw_ref"):
-                status = exit_status(event)
-                header = "tokenpipe-post-v1 mode=%s strategy=%s" % (
-                    active_mode, result.get("strategy") or "unknown")
-                if status is not None:
-                    header += " exit=%d" % status
-                header += " raw_ref=" + result["raw_ref"]
-                emit({"decision": "block", "reason": header + "\n" + result["output"]})
+                header = recovery_header(
+                    active_mode, result.get("strategy"), exit_status(event),
+                    result["raw_ref"],
+                )
+                if header is not None:
+                    emit({"decision": "block", "reason": header + "\n" + result["output"]})
             return 0
     # Always force audit: PostToolUse is observation-only in every configured
     # ordinary Codex mode and deliberately emits no stdout whatsoever.

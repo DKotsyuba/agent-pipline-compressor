@@ -8,6 +8,18 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Net-win gate for output replacement. A replacement is emitted only when the
+  compressed candidate plus the recovery header the host renders with it is
+  smaller than the original; otherwise the exact original is returned with
+  `skip_reason=net-loss` and no raw file is spooled. The metric counterfactual
+  still measures the compressed candidate, so `stats` reports the potential the
+  header cost cancelled out. The native wrapper prices the recovery field its
+  own header would gain, and a cross-call repeat notice replaces output only
+  when it is smaller than the compressed candidate, which carries the same
+  header. The Codex and Claude post-tool headers are now rendered from
+  templates owned by `scripts/tokenpipe.py`, so the text shown and the cost
+  priced cannot drift apart.
+
 - Homogeneous JSON array folding: object arrays with six or more items that
   share exactly the same key set collapse to their first two items, a
   `__tokenpipe_similar_items__` marker carrying the exact omitted count and
