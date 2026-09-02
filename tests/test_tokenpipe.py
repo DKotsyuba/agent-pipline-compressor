@@ -703,6 +703,67 @@ class TokenpipeTests(unittest.TestCase):
         finally:
             victim_dir.cleanup()
 
+    def test_shared_runtime_metrics_are_scoped_to_their_home(self):
+        """Native rows in the shared runtime file must not leak between homes."""
+        os.environ["TOKENPIPE_RUNTIME_HOME"] = os.path.join(self.temp.name, "shared-runtime")
+        os.makedirs(tokenpipe._runtime_home(), mode=0o700, exist_ok=True)
+        home_a = os.path.join(self.temp.name, "home-a")
+        home_b = os.path.join(self.temp.name, "home-b")
+
+        def native_row(home, session):
+            os.environ["TOKENPIPE_HOME"] = home
+            return tokenpipe._metric_base(
+                {"session_id": session, "tool_name": "exec_command"},
+                "safe", "test", "passthrough", "log", "out", "out", "out",
+                0, None, None, None, time.time(),
+            )
+
+        row_a = native_row(home_a, "from-a")
+        row_b = native_row(home_b, "from-b")
+        self.assertNotEqual(row_a["home"], row_b["home"])
+        self.assertNotIn(home_a, json.dumps(row_a))
+        legacy = dict(row_a, session="legacy")
+        legacy.pop("home")
+        with open(tokenpipe._runtime_metrics_path(), "w", encoding="utf-8") as handle:
+            for row in (row_a, row_b, legacy):
+                handle.write(json.dumps(row) + "\n")
+
+        os.environ["TOKENPIPE_HOME"] = home_a
+        self.assertEqual([row["session"] for row in tokenpipe.load_metrics()],
+                         ["from-a", "legacy"])
+        os.environ["TOKENPIPE_HOME"] = home_b
+        self.assertEqual([row["session"] for row in tokenpipe.load_metrics()],
+                         ["from-b", "legacy"])
+
+    def test_spool_cleanup_is_amortized_between_replacements(self):
+        """A fresh stamp suppresses the spool sweep; a stale one runs it again."""
+        os.environ["TOKENPIPE_CLEANUP_INTERVAL_SECONDS"] = "600"
+        raw = "repeat\n" * 200
+        calls = []
+        original = tokenpipe.cleanup_spool
+
+        def counting(*args, **kwargs):
+            calls.append(1)
+            return original(*args, **kwargs)
+
+        tokenpipe.cleanup_spool = counting
+        try:
+            self.assertEqual(tokenpipe.process(self.payload(raw), "safe")["action"], "replace")
+            self.assertEqual(len(calls), 1)
+            stamp = tokenpipe._cleanup_stamp_path()
+            self.assertTrue(os.path.exists(stamp))
+            second = tokenpipe.process(self.payload(raw, tool_call_id="second"), "safe")
+            self.assertEqual(second["action"], "replace")
+            self.assertEqual(len(calls), 1)
+            stale = time.time() - 3600
+            os.utime(stamp, (stale, stale))
+            third = tokenpipe.process(self.payload(raw, tool_call_id="third"), "safe")
+            self.assertEqual(third["action"], "replace")
+            self.assertEqual(len(calls), 2)
+            self.assertGreater(os.path.getmtime(stamp), stale)
+        finally:
+            tokenpipe.cleanup_spool = original
+
 
 if __name__ == "__main__":
     unittest.main()

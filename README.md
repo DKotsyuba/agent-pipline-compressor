@@ -128,6 +128,7 @@ Persist a mode with `python3 scripts/tokenpipe.py mode audit|safe|full`. `TOKENP
 | `TOKENPIPE_RAW_TTL_SECONDS` | `7 days` | Raw-output retention target. |
 | `TOKENPIPE_RAW_MAX_BYTES` | `256 MiB` | Raw-output storage cap. |
 | `TOKENPIPE_METRICS_MAX_BYTES` | `8 MiB` | Metrics-file rotation cap. |
+| `TOKENPIPE_CLEANUP_INTERVAL_SECONDS` | `600` | Minimum seconds between raw-spool retention sweeps; `0` sweeps on every replacement. |
 | `TOKENPIPE_HOOK_TIMEOUT_SEC` | `30` | Hook post-processing timeout. |
 | `TOKENPIPE_POST_REPLACE` | `0` | Codex post-output replacement gate: `0`/absent audits only; `1` replaces any eligible content category; a comma-separated category list (e.g. `error,log`) replaces only output the compressor classifies into a listed category, and any other value audits only. The environment variable overrides the persisted `post-replace` setting. |
 | `TOKENPIPE_AUDIT_MAX_BYTES` | `1 MiB` | Largest single Codex audit output copied to the compressor; larger output is recorded as metadata only. |
