@@ -209,11 +209,134 @@ def _mkdir_private(path):
     os.close(directory_fd)
 
 
-def estimate_tokens(text):
-    """Return a clearly approximate o200k-like token count.
+TOKEN_CLASS_RATIOS = {
+    "hexid": 1.8,
+    "cjk": 1.0,
+    "prose": 4.0,
+    "letters": 2.0,
+    "digits": 2.5,
+    "space": 4.0,
+    "punct": 1.5,
+    "symbol": 1.0,
+}
+"""Characters per estimated token, keyed by character class (str -> float).
 
-    UTF-8 byte length / 3.5 is intentionally conservative for mixed source code,
-    JSON, and English logs. It is not provider usage accounting.
+A single bytes-per-token average hides a threefold spread between classes: a
+subword vocabulary merges English words into few long tokens, keeps punctuation
+and operators as roughly one token each, and splits hashes, identifiers, and
+non-Latin scripts into very short pieces. Charging each class separately stops
+hex/base64 identifiers from being under-counted by about 70% and stops prose
+from being over-counted. The per-class idea follows the ``tokenx`` project
+(MIT); the hex/base64 class is an addition here and no code was copied.
+
+The values are heuristics calibrated against published OpenAI ``o200k``-style
+measurements, not against the Claude tokenizer, and are never provider usage
+accounting.
+
+Keys:
+    hexid (float): Hex, base64, and mixed alphanumeric runs of eight or more
+        characters, including one absorbed leading space.
+    cjk (float): CJK ideographs, kana, Hangul, and fullwidth forms.
+    prose (float): ASCII letter words, including one absorbed leading space,
+        because a subword vocabulary merges ``" word"`` into one token.
+    letters (float): Non-ASCII alphabetic scripts such as Cyrillic or Greek,
+        including one absorbed leading space.
+    digits (float): Digit runs, which split into short groups.
+    space (float): Characters of a whitespace run; a run holding a line break
+        or other non-space whitespace costs one whole token for the run plus
+        this rate for each further character.
+    punct (float): ASCII punctuation and operators.
+    symbol (float): Emoji and other symbols, counted in UTF-16 code units so a
+        non-BMP character costs two.
+"""
+
+TOKEN_CLASS_RE = re.compile(
+    r"(?P<hexid>[ ]?(?:(?=[0-9A-Za-z]*[0-9])(?=[0-9A-Za-z]*[A-Za-z])[0-9A-Za-z]{8,}"
+    r"|(?=[0-9A-Fa-f]*[A-Fa-f])[0-9A-Fa-f]{8,}))"
+    r"|(?P<cjk>[\u2e80-\u303f\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff"
+    r"\uac00-\ud7af\uf900-\ufaff\uff00-\uffef]+)"
+    r"|(?P<prose>[ ]?[A-Za-z]+)"
+    r"|(?P<letters>[ ]?[^\W\d_]+)"
+    r"|(?P<digits>[0-9]+)"
+    r"|(?P<space>\s+)"
+    r"|(?P<punct>[!-/:-@\[-`{-~]+)"
+    r"|(?P<symbol>.)",
+    re.DOTALL,
+)
+"""Ordered alternation that splits text into one run per ``TOKEN_CLASS_RATIOS``
+class (``re.Pattern``).
+
+Every alternative consumes at least one character and the trailing ``symbol``
+alternative matches anything left, so ``finditer`` partitions the input exactly
+once and the estimator stays linear in the input length. Order is significant:
+identifier runs are tried before words and digits so a hash is not read as
+prose, and ``cjk`` is tried before ``letters`` because both accept ideographs.
+The group name of a match (``Match.lastgroup``) is the class name.
+"""
+
+_TOKEN_CLASS_COST = dict((name, 1.0 / ratio) for name, ratio in TOKEN_CLASS_RATIOS.items())
+"""Estimated tokens per character, keyed by character class (str -> float).
+
+The inverse of ``TOKEN_CLASS_RATIOS``, precomputed once so the estimator's inner
+loop is one dictionary lookup and one multiplication per run.
+"""
+
+
+def estimate_tokens(text):
+    """Return a clearly approximate token count from character-class ratios.
+
+    One left-to-right pass over ``TOKEN_CLASS_RE`` splits the text into runs of
+    a single character class and charges each run at its ``TOKEN_CLASS_RATIOS``
+    rate. A whitespace run holding a line break or other non-space whitespace
+    also costs one whole token for the run itself; a run of plain spaces does
+    not, because a lone space is already absorbed into the following word run.
+    A non-BMP symbol is charged as its two UTF-16 code units.
+
+    Args:
+        text (str | None): Text to estimate. ``None``, ``""``, and any other
+            falsy value are accepted.
+
+    Returns:
+        int: Estimated token count. ``0`` for empty input, otherwise at least
+        ``1``. The result never decreases when text is appended.
+
+    Note:
+        This is a local estimate for measurement only, not provider usage
+        accounting. ``estimate_tokens_bytes`` keeps the previous UTF-8-byte
+        formula for one release.
+    """
+    if not text:
+        return 0
+    total = 0.0
+    space_cost = _TOKEN_CLASS_COST["space"]
+    for match in TOKEN_CLASS_RE.finditer(text):
+        name = match.lastgroup
+        length = match.end() - match.start()
+        if name == "space":
+            if match.group().strip(" "):
+                total += 1.0 + (length - 1) * space_cost
+            else:
+                total += length * space_cost
+        elif name == "symbol":
+            total += 2.0 if ord(match.group()) > 0xFFFF else 1.0
+        else:
+            total += length * _TOKEN_CLASS_COST[name]
+    return max(1, int(math.ceil(total)))
+
+
+def estimate_tokens_bytes(text):
+    """Return the previous UTF-8-byte token estimate, kept for one release.
+
+    Retained so the compression lab can report the shift introduced by the
+    character-class estimator. The runtime itself no longer calls it.
+
+    Args:
+        text (str | None): Text to estimate. ``None``, ``""``, and any other
+            falsy value are accepted.
+
+    Returns:
+        int: ``ceil(utf8_bytes / 3.5)``. ``0`` for empty input, otherwise at
+        least ``1``.
     """
     if not text:
         return 0
@@ -2511,7 +2634,8 @@ def main(argv=None):
             json.dump(report, sys.stdout, ensure_ascii=False, indent=2, sort_keys=True)
             sys.stdout.write("\n")
         else:
-            print("Token counts are estimates (UTF-8 bytes / 3.5), not provider usage.")
+            print("Token counts are estimates from character-class ratios, not provider usage.")
+            print("Estimator: class-ratio v1")
             print("Calls: %d" % report["calls"])
             print("Audit-only calls: %d" % report["audit_calls"])
             print("Native calls: %d (%.2f%% of calls, %.2f%% of estimated tokens)" % (

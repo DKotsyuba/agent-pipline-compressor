@@ -667,7 +667,11 @@ class TokenpipeTests(unittest.TestCase):
             metric = tokenpipe.load_metrics()[-1]
             self.assertTrue(metric["rtk_used"])
             report = tokenpipe.aggregate([metric])
-            self.assertEqual(report["groups"]["strategy"]["rtk-direct"]["rtk_calls"], 1)
+            # The rtk route owns the call whether or not the deterministic
+            # compressor then finds a saving and appends its own strategy.
+            strategies = [key for key in report["groups"]["strategy"] if key.startswith("rtk-direct")]
+            self.assertEqual(len(strategies), 1)
+            self.assertEqual(report["groups"]["strategy"][strategies[0]]["rtk_calls"], 1)
             self.assertEqual(report["native_calls"], 1)
             self.assertEqual(report["rtk_owned_calls"], 1)
             self.assertEqual(report["native_call_coverage_percent_estimate"], 100.0)
