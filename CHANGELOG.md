@@ -6,7 +6,21 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Homogeneous JSON array folding: object arrays with six or more items that
+  share exactly the same key set collapse to their first two items, a
+  `__tokenpipe_similar_items__` marker carrying the exact omitted count and
+  the sorted key list, and the last item, applied recursively at any depth.
+  Non-homogeneous arrays keep the previous `__tokenpipe_omitted_items__`
+  behaviour.
+
 ### Fixed
+
+- The compression lab mapped only the literal `json` route to the `json-lite`
+  stage, so real `rtk-json` captures scored as 1.000 passthrough; any route
+  suffixed `-json` now gets the JSON stage set, and the lab's array-count gate
+  understands the new fold marker.
 
 - `stats` no longer counts native (RTK) metric rows written by other
   `TOKENPIPE_HOME`s: rows carry a non-reversible `home` tag and the shared

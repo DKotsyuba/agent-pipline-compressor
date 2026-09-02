@@ -116,6 +116,11 @@ def corpus():
     mixed_log = _repeat("INFO worker started\n", 100) + "WARN retrying request id=42\n" + _repeat("INFO worker finished\n", 90) + "ERROR request failed status=503\nTraceback: timeout\n"
     nested_json = json.dumps({"status": "ok", "items": [{"id": i, "meta": {"active": True, "labels": ["lab", "fixture"]}} for i in range(80)], "page": {"number": 1, "next": None}}, indent=2, sort_keys=True)
     error_json = json.dumps({"status": "failed", "error": {"type": "AssertionError", "message": "expected total", "trace": ["setup", "assert", "teardown"]}, "keys": ["status", "error"]}, indent=2, sort_keys=True)
+    inventory_json = json.dumps({"schema": "inventory/v1", "hosts": [
+        {"host": "node-%03d" % i, "region": "us-east-%d" % (i % 3), "uptime_s": i * 60,
+         "checks": [{"name": name, "ok": (i + j) % 5 != 0, "value": (i * 7 + j * 3) % 97}
+                    for j, name in enumerate(("disk", "memory", "cpu", "load", "io", "net", "gpu"))]}
+        for i in range(48)]}, indent=2, sort_keys=True)
     ansi_progress = "\x1b[2K\rprogress 10%\x1b[2K\rprogress 50%\x1b[2K\rprogress 100%\ncompleted successfully\n"
     protected_code = "\n".join("def protected_%03d(value):\n    return value + %d" % (i, i) for i in range(20)) + "\n"
     protected_config = "[service]\nname = lab\nmode = protected\n" + "\n".join("option_%02d = value_%02d" % (i, i) for i in range(20)) + "\n"
@@ -144,6 +149,11 @@ def corpus():
             {"path": ("status",), "type": "string", "value": "failed"}, {"path": ("error",), "type": "object"},
             {"path": ("error", "type"), "type": "string", "value": "AssertionError"}, {"path": ("error", "trace"), "type": "array", "count": 3},
         )),
+        Case("inventory-json", "json", "json", 3, 0, inventory_json, must_keep=("inventory/v1",), json_keys=("hosts", "schema"), json_expectations=(
+            {"path": ("schema",), "type": "string", "value": "inventory/v1"}, {"path": ("hosts",), "type": "array", "count": 48},
+            {"path": ("hosts", 0, "host"), "type": "string", "value": "node-000"}, {"path": ("hosts", 0, "region"), "type": "string", "value": "us-east-0"},
+            {"path": ("hosts", 0, "checks"), "type": "array", "count": 7}, {"path": ("hosts", 0, "checks", 0, "name"), "type": "string", "value": "disk"},
+        )),
         Case("ansi-progress", "logs", "log", 1, 0, ansi_progress, must_keep=("completed successfully",)), Case("small-output", "plain", "small", 1, 0, "ok\n"),
         Case("protected-code", "protected", "code", 5, 0, protected_code, must_keep=("def protected_019",), exact_policy={"mode": "exact", "reason": "source code is protected"}),
         Case("protected-config", "protected", "config", 5, 0, protected_config, must_keep=("mode = protected",), exact_policy={"mode": "exact", "reason": "configuration is protected"}),
@@ -160,7 +170,19 @@ def canonical_hash(value):
 
 
 def _applicable_stages(case):
-    if case.route == "json":
+    """Return the local stages a case's route is allowed to evaluate.
+
+    Args:
+        case (Case or CommandCase): Case whose ``route`` string selects the
+            applicable stage set.
+
+    Returns:
+        tuple[str]: Stage names forming a sub-order of ``STAGES``. JSON routes
+        (``json`` and any route suffixed ``-json``, such as ``rtk-json``) get
+        ``json-lite``; textual log routes get ``log-lite``; protected
+        diff/code/config routes keep only non-destructive stages.
+    """
+    if case.route == "json" or case.route.endswith("-json"):
         return ("ansi", "json-lite", "bound")
     if case.route in ("log", "rg-io-errors", "git-log", "pytest", "unittest", "generic-test", "rtk-log"):
         return ("ansi", "log-lite", "cca", "bound")
@@ -270,10 +292,43 @@ def _json_type(value):
     return "unknown"
 
 
+def _marker_omitted_count(item):
+    """Return the omitted-item count a tokenpipe fold marker declares.
+
+    Args:
+        item (object): Candidate JSON value of any type.
+
+    Returns:
+        int or None: The declared omitted count when ``item`` is exactly a
+        ``__tokenpipe_omitted_items__`` or ``__tokenpipe_similar_items__``
+        marker object; ``None`` when ``item`` is ordinary array content.
+    """
+    if not isinstance(item, dict):
+        return None
+    if set(item) == {"__tokenpipe_omitted_items__"} and isinstance(item["__tokenpipe_omitted_items__"], int):
+        return item["__tokenpipe_omitted_items__"]
+    if set(item) == {"__tokenpipe_similar_items__", "keys"} and isinstance(item["__tokenpipe_similar_items__"], int):
+        return item["__tokenpipe_similar_items__"]
+    return None
+
+
 def _effective_array_count(value):
+    """Count the items a sanitized JSON array represents.
+
+    Args:
+        value (object): Candidate JSON value of any type.
+
+    Returns:
+        int or None: Effective item count with fold markers expanded to their
+        declared omitted counts; ``None`` when ``value`` is not a list.
+    """
     if not isinstance(value, list):
         return None
-    return sum(item.get("__tokenpipe_omitted_items__", 0) if isinstance(item, dict) and set(item) == {"__tokenpipe_omitted_items__"} and isinstance(item.get("__tokenpipe_omitted_items__"), int) else 1 for item in value)
+    total = 0
+    for item in value:
+        omitted = _marker_omitted_count(item)
+        total += omitted if omitted is not None else 1
+    return total
 
 
 def schema_check(case, candidate):

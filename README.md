@@ -170,6 +170,8 @@ Host hook
   -> emit compressed output + raw_ref (otherwise emit original output)
 ```
 
+Compression is strategy-per-category and deterministic: JSON output folds arrays of six or more objects that all share exactly the same key set down to their first two items, a `__tokenpipe_similar_items__` marker with the exact omitted count and sorted key list, and the last item, recursively at any depth, while non-homogeneous arrays keep the head/tail truncation markers.
+
 Key files:
 
 - [`scripts/tokenpipe.py`](scripts/tokenpipe.py) — compressor, storage, statistics, CLI, and native wrapper.
