@@ -54,6 +54,23 @@ CONFIG_RE = re.compile(
     r"(?m)(^\s*\[[A-Za-z0-9_.-]+\]\s*$|^\s*[A-Za-z_][A-Za-z0-9_.-]*\s*=\s*\S+|"
     r"^\s*[A-Za-z_][A-Za-z0-9_.-]*:\s+\S+)"
 )
+# Search-result shapes: `path:line:text` (ripgrep, `grep -n`), `path:text`
+# (`grep` without `-n`), `path-line-text` (grep context), and bare path
+# listings (`find`, `git ls-files`). A path never contains whitespace or a
+# colon and must carry a directory separator (an extension dot is enough only
+# for the numbered forms), so `tool: message`, `key: value`, and timestamped
+# log lines are never read as search results.
+_SEARCH_PATH = r"[^\s:]*?[./][^\s:]*?"
+_SEARCH_DIR_PATH = r"[^\s:]*?/[^\s:]*?"
+MATCH_LINE_RE = re.compile(r"^(%s):(\d+):" % _SEARCH_PATH)
+PLAIN_MATCH_RE = re.compile(r"^(%s):" % _SEARCH_DIR_PATH)
+CONTEXT_LINE_RE = re.compile(r"^(%s)-(\d+)-" % _SEARCH_PATH)
+PATH_LINE_RE = re.compile(r"^(%s)$" % _SEARCH_DIR_PATH)
+# Shape detection samples the leading non-empty lines only; below the minimum
+# line count, search output is left exactly as produced.
+_SEARCH_SAMPLE_LINES = 200
+_SEARCH_MIN_LINES = 12
+_SEARCH_SHAPE_RATIO = 0.8
 
 
 def plugin_version():
@@ -1008,6 +1025,210 @@ def _is_binary_text(text):
     return controls > max(8, len(visible) // 20)
 
 
+def _match_path(line):
+    """Return the file path of one search-result line, or None.
+
+    Args:
+        line (str): One decoded output line without its trailing newline.
+
+    Returns:
+        str | None: The path component of a ``path:line:text`` (ripgrep or
+        ``grep -n``), ``path:text`` (``grep`` without ``-n``), or
+        ``path-line-text`` (grep context) line; None when the line carries no
+        such shape.
+
+    Pure and side-effect free.
+    """
+    for pattern in (MATCH_LINE_RE, PLAIN_MATCH_RE, CONTEXT_LINE_RE):
+        found = pattern.match(line)
+        if found:
+            return found.group(1)
+    return None
+
+
+def _is_match_lines(text):
+    """Report whether output is dense per-file search-match output.
+
+    Args:
+        text (str): Complete decoded output.
+
+    Returns:
+        bool: True when the sampled leading non-empty lines number at least
+        ``_SEARCH_MIN_LINES`` and at least ``_SEARCH_SHAPE_RATIO`` of them
+        carry a match shape; False for shorter or mixed output.
+
+    Deterministic, side-effect free, and bounded by ``_SEARCH_SAMPLE_LINES``.
+    """
+    sample = [line for line in text.splitlines() if line.strip()][:_SEARCH_SAMPLE_LINES]
+    if len(sample) < _SEARCH_MIN_LINES:
+        return False
+    matched = sum(1 for line in sample if _match_path(line) is not None)
+    return matched >= _SEARCH_SHAPE_RATIO * len(sample)
+
+
+def _is_path_lines(text):
+    """Report whether output is a flat listing of one path per line.
+
+    Args:
+        text (str): Complete decoded output.
+
+    Returns:
+        bool: True when the sampled leading non-empty lines number at least
+        ``_SEARCH_MIN_LINES`` and at least ``_SEARCH_SHAPE_RATIO`` of them are
+        whitespace-free paths that contain a directory separator and no colon.
+
+    Deterministic, side-effect free, and bounded by ``_SEARCH_SAMPLE_LINES``.
+    """
+    sample = [line for line in text.splitlines() if line.strip()][:_SEARCH_SAMPLE_LINES]
+    if len(sample) < _SEARCH_MIN_LINES:
+        return False
+    matched = sum(1 for line in sample if PATH_LINE_RE.match(line))
+    return matched >= _SEARCH_SHAPE_RATIO * len(sample)
+
+
+def _bounded_sample(items, head, tail, marker):
+    """Reduce ordered entries to their first and last members with a marker.
+
+    Args:
+        items (list[str]): Ordered rendered lines.
+        head (int): Count of leading entries kept verbatim.
+        tail (int): Count of trailing entries kept verbatim.
+        marker (str): A ``%d`` template formatted with the omitted count.
+
+    Returns:
+        list[str]: A copy of ``items`` when it holds at most ``head + tail``
+        entries, otherwise the head entries, one formatted marker, and the
+        tail entries.
+
+    Pure; the argument list is never mutated.
+    """
+    if len(items) <= head + tail:
+        return list(items)
+    return list(items[:head]) + [marker % (len(items) - head - tail)] + list(items[len(items) - tail:])
+
+
+def _keep_edges(lines, rendered):
+    """Keep the first and last original lines present in a structural fold.
+
+    Args:
+        lines (list[str]): Non-empty original lines in input order.
+        rendered (list[str]): Rendered replacement lines; mutated in place.
+
+    Returns:
+        list[str]: The same ``rendered`` list object, with the first original
+        line prepended and the last one appended when either is absent.
+
+    Membership is an exact string comparison, so an edge line that a sample
+    already renders is never duplicated.
+    """
+    if lines and lines[0] not in rendered:
+        rendered.insert(0, lines[0])
+    if lines and lines[-1] not in rendered:
+        rendered.append(lines[-1])
+    return rendered
+
+
+def group_matches(text, per_file=3, max_files=20):
+    """Group dense search matches by file with bounded per-file samples.
+
+    Args:
+        text (str): Decoded search output, normally one that satisfies
+            :func:`_is_match_lines`.
+        per_file (int): Matches kept verbatim at each end of a file group.
+        max_files (int): Files rendered in full before the remainder is
+            summarized by a single marker line.
+
+    Returns:
+        str: Per file, the path with its match count, its first and last
+        ``per_file`` matches verbatim, and a ``... N more matches in this
+        file`` marker; files keep first-seen order. A ``... M more files (N
+        matches)`` marker closes the capped remainder, and lines without a
+        match shape follow, bounded the same way. The first and last original
+        lines are always present verbatim. The exact input is returned when
+        the output holds fewer than ``_SEARCH_MIN_LINES`` non-empty lines, or
+        when grouping would not shorten it.
+
+    Deterministic and side-effect free. Omitted matches remain recoverable
+    only from the spooled raw output.
+    """
+    lines = [line for line in text.splitlines() if line.strip()]
+    if len(lines) < _SEARCH_MIN_LINES:
+        return text
+    groups = {}
+    other = []
+    for line in lines:
+        path = _match_path(line)
+        if path is None:
+            other.append(line)
+        else:
+            groups.setdefault(path, []).append(line)
+    rendered = []
+    for path in list(groups)[:max_files]:
+        rendered.append("%s (%d matches)" % (path, len(groups[path])))
+        rendered.extend(_bounded_sample(groups[path], per_file, per_file,
+                                        "... %d more matches in this file"))
+    hidden = list(groups)[max_files:]
+    if hidden:
+        rendered.append("... %d more files (%d matches)" % (
+            len(hidden), sum(len(groups[path]) for path in hidden)))
+    if other:
+        rendered.extend(_bounded_sample(other, per_file, per_file,
+                                        "... %d more unmatched lines"))
+    candidate = "\n".join(_keep_edges(lines, rendered))
+    return candidate if len(candidate) < len(text) else text
+
+
+def fold_paths(text, head=3, tail=2, depth=3):
+    """Fold a flat path listing into per-directory samples.
+
+    Args:
+        text (str): Decoded listing, normally one that satisfies
+            :func:`_is_path_lines`.
+        head (int): Entries kept verbatim at the start of each directory.
+        tail (int): Entries kept verbatim at the end of each directory.
+        depth (int): Directory levels rendered below the listing's common
+            directory prefix; anything deeper collapses into a single
+            ``dir/… (N entries)`` line.
+
+    Returns:
+        str: Per directory, its path with an entry count followed by the head
+        and tail entry names and a ``... N more entries`` marker, in first-seen
+        order. The first and last original lines stay verbatim. The exact
+        input is returned when the listing holds fewer than
+        ``_SEARCH_MIN_LINES`` non-empty lines, or when folding would not
+        shorten it.
+
+    Deterministic and side-effect free. Omitted entries remain recoverable
+    only from the spooled raw output.
+    """
+    lines = [line for line in text.splitlines() if line.strip()]
+    if len(lines) < _SEARCH_MIN_LINES:
+        return text
+    entries = []
+    common = (lines[0].rpartition("/")[0] or ".").split("/")
+    for line in lines:
+        directory, _, name = line.rpartition("/")
+        parts = (directory or ".").split("/")
+        entries.append((parts, name or line))
+        shared = 0
+        while shared < min(len(common), len(parts)) and common[shared] == parts[shared]:
+            shared += 1
+        common = common[:shared]
+    groups = {}
+    for parts, name in entries:
+        collapsed = len(parts) > len(common) + depth
+        groups.setdefault(("/".join(parts[:len(common) + depth]), collapsed), []).append(name)
+    rendered = []
+    for (directory, collapsed), names in groups.items():
+        if collapsed:
+            rendered.append("%s/… (%d entries)" % (directory, len(names)))
+            continue
+        rendered.append("%s/ (%d entries)" % (directory, len(names)))
+        rendered.extend(_bounded_sample(names, head, tail, "... %d more entries"))
+    candidate = "\n".join(_keep_edges(lines, rendered))
+    return candidate if len(candidate) < len(text) else text
+
+
 def classify(text):
     """Classify decoded tool output for deterministic compression policy.
 
@@ -1015,9 +1236,11 @@ def classify(text):
         text (str): Complete decoded stream or combined stream body.
 
     Returns:
-        str: One of ``binary``, ``diff``, ``code``, ``json``, ``config``,
-        ``error``, ``log``, or ``plain``. Binary detection runs first so later
-        format heuristics can never authorize destructive transformation.
+        str: One of ``binary``, ``diff``, ``code``, ``json``, ``search``,
+        ``config``, ``error``, ``log``, or ``plain``. Binary detection runs
+        first so later format heuristics can never authorize destructive
+        transformation; search shapes outrank the error heuristics so matches
+        that merely mention a failure stay search output.
     """
     if _is_binary_text(text):
         return "binary"
@@ -1032,6 +1255,10 @@ def classify(text):
             return "json"
         except (ValueError, TypeError):
             pass
+    # Search results are recognized before any error heuristic: a grep hit that
+    # merely contains the word "error" is still search-shaped output.
+    if _is_match_lines(text) or _is_path_lines(text):
+        return "search"
     # Strong runtime failures outrank config-like `tool: message` lines such as
     # ripgrep's repeated `rg: path: IO error ...` stderr.
     if STRONG_ERROR_RE.search(text):
@@ -1056,7 +1283,9 @@ def compress(text, category):
         category (str): Result from :func:`classify`.
 
     Returns:
-        tuple[str, str]: Strategy label and candidate output. Binary and
+        tuple[str, str]: Strategy label (``lite-json``, ``lite-log``,
+        ``cca-log``, ``cca-error``, ``cca-plain``, ``search-group``,
+        ``search-fold``, or ``passthrough``) and candidate output. Binary and
         unsupported categories return exact passthrough content.
 
     Compression is local and side-effect free; callers remain responsible for
@@ -1066,6 +1295,12 @@ def compress(text, category):
         return "passthrough", text
     if category == "json":
         return "lite-json", lite_json(text)
+    if category == "search":
+        if _is_match_lines(text):
+            return "search-group", group_matches(text)
+        if _is_path_lines(text):
+            return "search-fold", fold_paths(text)
+        return "passthrough", text
     if category == "log":
         lite = lite_log(text)
         if len(lite) > 8000:

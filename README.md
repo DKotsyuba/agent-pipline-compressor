@@ -149,6 +149,8 @@ When active, RTK owns filtering. Tokenpipe does not stack its own Lite/CCA trans
 
 ## Recovery, statistics, and privacy
 
+Search-shaped output is compressed structurally: the `search-group` strategy prints each matching file once with its match count and the first and last matches verbatim, and the `search-fold` strategy prints each directory once with its entry count and the first and last entries. Both mark every omission, keep the original first and last lines, leave short or sparse results untouched, and rely on `show <raw_ref>` for the complete result.
+
 Replacement is allowed only after raw output is securely spooled; a spool error leaves the original output unchanged. Raw files are private runtime state (`0700` directories and `0600` files), may contain secrets from commands, and are subject to retention and size caps. Treat any `raw_ref` as sensitive.
 
 `stats` reads private metrics and reports estimates by mode, command category, strategy, and plugin version. Metrics omit prompts, command arguments, and tool output. They are not provider billing/usage measurements. The `Repeat outputs` line counts calls whose output was byte-identical to the previous output of the same identity and the estimated tokens a repeat notice would have avoided, whether or not `TOKENPIPE_REPEAT_REPLACE` is on.
