@@ -61,6 +61,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- Concurrent metric appends no longer lose rows to a spurious `ENOENT`.
+  On macOS/APFS, simultaneous `openat(dir_fd, "metrics.jsonl",
+  O_CREAT | O_APPEND)` calls intermittently fail even though the private
+  directory exists; the creating open is now retried up to three more
+  times with millisecond backoff. Every other `OSError` still propagates,
+  a genuinely missing directory still fails fast, and callers keep their
+  fail-open behaviour.
+
 - The compression lab mapped only the literal `json` route to the `json-lite`
   stage, so real `rtk-json` captures scored as 1.000 passthrough; any route
   suffixed `-json` now gets the JSON stage set, and the lab's array-count gate

@@ -1392,6 +1392,13 @@ def _append_metric(metric, path=None):
     Parent and final symlinks are refused with no chmod, append, or truncation.
     Rotation and append occur under one advisory lock. Callers intentionally
     suppress failures because metrics must never affect tool output.
+
+    The creating ``os.open`` is retried up to three more times with a few
+    milliseconds of backoff on ``FileNotFoundError``: on macOS/APFS concurrent
+    ``openat(dir_fd, name, O_CREAT | O_APPEND)`` calls into one directory
+    intermittently fail with ``ENOENT`` even though the directory exists. The
+    bound keeps a genuinely missing directory failing fast instead of looping,
+    and every other ``OSError`` still propagates unchanged.
     """
     path = path or _metrics_path()
     parent = os.path.dirname(path)
@@ -1403,7 +1410,14 @@ def _append_metric(metric, path=None):
     max_bytes = max(4096, int(os.environ.get("TOKENPIPE_METRICS_MAX_BYTES", str(8 * 1024 * 1024))))
     flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     try:
-        fd = os.open(name, flags, 0o600, dir_fd=parent_fd)
+        for delay in (0.002, 0.005, 0.010):
+            try:
+                fd = os.open(name, flags, 0o600, dir_fd=parent_fd)
+                break
+            except FileNotFoundError:
+                time.sleep(delay)
+        else:
+            fd = os.open(name, flags, 0o600, dir_fd=parent_fd)
         try:
             info = os.fstat(fd)
             if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
