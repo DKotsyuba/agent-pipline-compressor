@@ -98,6 +98,55 @@ def _repeat(line, count):
     return line * count
 
 
+def _varying_log(rounds=31):
+    """Render a log that repeats ten templates but never a byte-identical line.
+
+    Args:
+        rounds (int): Number of passes over the templates. Each pass emits ten
+            lines plus, every tenth pass, one ERROR line.
+
+    Returns:
+        str: Newline-terminated log text with monotonically increasing ISO
+        timestamps and varying hex ids, uuids, durations, byte sizes, and
+        percentages, so adjacent-repeat collapsing alone can save nothing.
+        Three ERROR lines are included and must survive any transform.
+    """
+    lines = []
+    for index in range(rounds):
+        stamp = "2026-01-01T00:%02d:%02dZ" % (index // 60, index % 60)
+        lines.append("%s INFO worker heartbeat interval 5s" % stamp)
+        lines.append("%s INFO fetched object %012x in %dms" % (stamp, index * 7919, 3 + index % 40))
+        lines.append("%s INFO cache hit ratio %d.%d%%" % (stamp, 90 + index % 9, index % 10))
+        lines.append("%s DEBUG mapped segment 0x%08x size %d.%dMB" % (stamp, index * 4096, 1 + index % 7, index % 10))
+        lines.append("%s INFO job 550e8400-e29b-41d4-a716-4466554400%02d accepted" % (stamp, index % 100))
+        lines.append("%s DEBUG flushed buffer %dKiB in %d.%ds" % (stamp, 4 + index % 60, index % 3, index % 10))
+        lines.append("%s INFO peer handshake %016x established" % (stamp, index * 104729))
+        lines.append("%s DEBUG gc pause %dms heap %d.%dMB" % (stamp, index % 25, 100 + index % 40, index % 10))
+        lines.append("%s INFO replicated shard %010x to node-3 in %dms" % (stamp, index * 31337, 5 + index % 20))
+        lines.append("%s DEBUG queue depth 4 backlog %dms" % (stamp, index % 90))
+        if index % 10 == 9:
+            lines.append("%s ERROR upload rejected by node-3 status=503" % stamp)
+    return "\n".join(lines) + "\n"
+
+
+def _varying_log_streams(rounds=31):
+    """Split :func:`_varying_log` across both captured streams.
+
+    Args:
+        rounds (int): Number of passes over the templates, as for
+            :func:`_varying_log`.
+
+    Returns:
+        tuple[str, str]: Stdout text carrying the INFO lines and stderr text
+        carrying the DEBUG and ERROR lines, so a fixture built from them
+        exercises the stderr capture path instead of declaring ``stderr=""``.
+    """
+    out, err = [], []
+    for line in _varying_log(rounds).splitlines():
+        (err if (" DEBUG " in line or " ERROR " in line) else out).append(line)
+    return "\n".join(out) + "\n", "\n".join(err) + "\n"
+
+
 def corpus():
     """Synthetic text corpus; no executable command cases are in this list."""
     pytest_pass = "============================= test session starts =============================\ncollected 3 items\n\ntests/test_math.py ...                                             [100%]\n\n3 passed in 0.01s\n"
@@ -125,6 +174,10 @@ def corpus():
     protected_code = "\n".join("def protected_%03d(value):\n    return value + %d" % (i, i) for i in range(20)) + "\n"
     protected_config = "[service]\nname = lab\nmode = protected\n" + "\n".join("option_%02d = value_%02d" % (i, i) for i in range(20)) + "\n"
     adversarial = _repeat("ordinary diagnostic line\n", 35) + "\nAPI_KEY=LAB_ONLY_SECRET\npassword=LAB_ONLY_PASSWORD\n\n" + _repeat("ordinary tail line\n", 35) + "adversarial failure marker\n"
+    varying_log = _varying_log()
+    varying_stdout, varying_stderr = _varying_log_streams()
+    pytest_stderr_stdout = "============================= test session starts =============================\ncollected 2 items\n\ntests/test_io.py .F                                                [100%]\n=================================== FAILURES ===================================\nFAILED tests/test_io.py::test_write - OSError: disk quota exceeded\n=========================== short test summary info ============================\n1 failed, 1 passed in 0.03s\n"
+    pytest_stderr_stderr = _repeat("WARNING: ssl module is compiled with an unsupported LibreSSL build\n", 30) + "Traceback (most recent call last):\n  File \"tests/test_io.py\", line 8, in test_write\nOSError: disk quota exceeded\n"
     return [
         Case("pytest-pass", "tests", "pytest", 3, 0, pytest_pass, must_keep=("3 passed",)),
         Case("pytest-fail", "tests", "pytest", 4, 1, pytest_fail, must_keep=("FAILED", "1 failed", "AssertionError")),
@@ -158,6 +211,9 @@ def corpus():
         Case("protected-code", "protected", "code", 5, 0, protected_code, must_keep=("def protected_019",), exact_policy={"mode": "exact", "reason": "source code is protected"}),
         Case("protected-config", "protected", "config", 5, 0, protected_config, must_keep=("mode = protected",), exact_policy={"mode": "exact", "reason": "configuration is protected"}),
         Case("adversarial-secret-like", "adversarial", "plain", 5, 0, adversarial, must_keep=("adversarial failure marker",), secret_like=("API_KEY=LAB_ONLY_SECRET", "password=LAB_ONLY_PASSWORD")),
+        Case("varying-timestamp-log", "logs", "log", 4, 0, varying_log, must_keep=("worker heartbeat", "ERROR upload rejected", "status=503")),
+        Case("varying-timestamp-log-stderr", "logs", "log", 4, 1, varying_stdout, stderr=varying_stderr, must_keep=("worker heartbeat", "ERROR upload rejected", "gc pause")),
+        Case("pytest-fail-stderr", "tests", "pytest", 4, 1, pytest_stderr_stdout, stderr=pytest_stderr_stderr, must_keep=("FAILED", "1 failed", "disk quota exceeded", "WARNING")),
     ]
 
 

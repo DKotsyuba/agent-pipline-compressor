@@ -26,6 +26,16 @@ All notable changes to this project are documented here. The format follows
   `repeat-replace` setting) is on, the mode is `safe`/`full`, and the earlier
   raw copy still reads back byte-for-byte; every other case, including an
   unreadable index, keeps the previous behavior.
+- Log compression collapses non-adjacent near-repeats. Volatile fields
+  (timestamps, UUIDs, hex ids of eight or more characters, durations, byte
+  sizes, percentages, and memory addresses) are masked to build a comparison
+  key only; later lines sharing a key are dropped and the first, verbatim
+  occurrence gains a `[seen N times]` marker. Status codes, exit codes, and
+  plain integers below eight digits are never masked, and error, summary, and
+  final lines are never dropped.
+- Compression lab fixtures for a varying-timestamp log and for two cases with
+  non-empty interleaved `stderr`, so the log ratios and the stderr path are
+  measured honestly.
 
 ### Fixed
 
