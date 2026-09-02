@@ -123,7 +123,8 @@ Persist a mode with `python3 scripts/tokenpipe.py mode audit|safe|full`. `TOKENP
 | `TOKENPIPE_HOME` | `~/.codex/tokenpipe` | Private settings, raw-output and metrics root. |
 | `TOKENPIPE_RUNTIME_HOME` | system temp `codex-tokenpipe-<uid>` | Private runtime output used by the native wrapper. |
 | `TOKENPIPE_MIN_TOKENS_ESTIMATE` | `1500` | Minimum estimated input size before compression is considered. |
-| `TOKENPIPE_MAX_SHOWN_CHARS` | `7000` | Bound for shown compressed text. |
+| `TOKENPIPE_MAX_SHOWN_CHARS` | `7000` | Global ceiling for shown compressed text; every per-category budget is clamped to it. |
+| `TOKENPIPE_BUDGET_<CATEGORY>` | `error`/`code`/`diff` `7000`, `log`/`json` `6000`, `plain`/`search`/`config` `5000` | Shown-character budget for one content category, e.g. `TOKENPIPE_BUDGET_ERROR=4000`. Clamped to `[256, TOKENPIPE_MAX_SHOWN_CHARS]`; an unparsable value keeps the default. |
 | `TOKENPIPE_CAPTURE_MAX_BYTES` | `64 MiB` | Native child-output capture limit. |
 | `TOKENPIPE_RAW_TTL_SECONDS` | `7 days` | Raw-output retention target. |
 | `TOKENPIPE_RAW_MAX_BYTES` | `256 MiB` | Raw-output storage cap. |
@@ -152,6 +153,14 @@ When active, RTK owns filtering. Tokenpipe does not stack its own Lite/CCA trans
 Search-shaped output is compressed structurally: the `search-group` strategy prints each matching file once with its match count and the first and last matches verbatim, and the `search-fold` strategy prints each directory once with its entry count and the first and last entries. Both mark every omission, keep the original first and last lines, leave short or sparse results untouched, and rely on `show <raw_ref>` for the complete result.
 
 Replacement must also pay for itself. A replacement ships with the recovery header the host renders above it, so the estimated saving is compared against the compressed output *plus* that header; when the saving does not exceed it, the exact original output is returned with `skip_reason=net-loss` and nothing is spooled. The metric row still records the compressed candidate as the counterfactual, so `stats` keeps reporting the potential the header cost cancelled out. The native wrapper applies the same rule to the recovery field its own header would gain.
+
+When bounding elides a middle section, the recovery header states how many characters were omitted and the exact command that prints them back, so no separate lookup is needed:
+
+```bash
+python3 scripts/tokenpipe.py show <raw_ref> --range <start>:<end>
+```
+
+`--range` takes character offsets into the decoded original as a half-open `START:END` span, prints exactly those characters, and rejects a malformed range with exit status `2`. Without `--range`, `show` prints the whole original.
 
 Replacement is allowed only after raw output is securely spooled; a spool error leaves the original output unchanged. Raw files are private runtime state (`0700` directories and `0600` files), may contain secrets from commands, and are subject to retention and size caps. Treat any `raw_ref` as sensitive.
 

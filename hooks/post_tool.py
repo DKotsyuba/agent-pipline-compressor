@@ -122,6 +122,10 @@ def main() -> int:
                     result["raw_ref"],
                 )
                 if header is not None:
+                    # The compressor owns the preview shape; the hook only places it.
+                    preview = result.get("recovery_preview")
+                    if preview:
+                        header += "; " + preview
                     emit({"decision": "block", "reason": header + "\n" + result["output"]})
             return 0
     # Always force audit: PostToolUse is observation-only in every configured
