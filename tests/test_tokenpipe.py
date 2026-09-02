@@ -154,6 +154,16 @@ class TokenpipeTests(unittest.TestCase):
         failed_json = json.dumps({"status": "failed", "items": list(range(200))})
         self.assertEqual(tokenpipe.classify(failed_json), "json")
 
+    def test_error_category_strategy_label_carries_no_failure_word(self):
+        outline = "\n".join(
+            "%d: class SpoolError%d(Exception)  # raised when step %d failed" % (line, line, line)
+            for line in range(1, 60)
+        )
+        self.assertEqual(tokenpipe.classify(outline), "error")
+        strategy, _ = tokenpipe.compress(outline, "error")
+        self.assertEqual(strategy, "cca-rank")
+        self.assertNotIn("error", strategy)
+
     def test_plugin_version_fails_open_for_non_object_manifest(self):
         with mock.patch("builtins.open", mock.mock_open(read_data="[]")):
             self.assertEqual(tokenpipe.plugin_version(), tokenpipe.VERSION)

@@ -602,7 +602,9 @@ def compress(text, category):
             return "cca-log", cca_rank(lite)
         return "lite-log", lite
     if category in ("error", "plain"):
-        return "cca-" + category, cca_rank(text)
+        # The label is model-visible in the envelope header; never let the
+        # content category ("error") read as the tool's outcome.
+        return "cca-rank", cca_rank(text)
     return "passthrough", text
 
 
