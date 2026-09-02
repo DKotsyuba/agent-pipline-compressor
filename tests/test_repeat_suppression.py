@@ -66,6 +66,21 @@ class RepeatSuppressionTests(unittest.TestCase):
         """
         return (marker + "\n") * 200
 
+    def varied_sample(self):
+        """Return output whose compressed form stays larger than a notice.
+
+        The notice replaces the output only when it is the smaller body, so a
+        gate test needs output that does not collapse to a couple of lines the
+        way :meth:`sample` does.
+
+        Returns:
+            str: Deterministic multi-line log text with no repeated line.
+        """
+        return "".join(
+            "2024-01-01T00:00:%02d worker-%d handled request %d\n" % (i % 60, i, i * 7)
+            for i in range(200)
+        )
+
     def read_index(self):
         """Return the parsed private repeat index for the active home.
 
@@ -113,7 +128,7 @@ class RepeatSuppressionTests(unittest.TestCase):
 
     def test_gate_on_in_safe_mode_shows_notice_with_recoverable_raw_ref(self):
         os.environ["TOKENPIPE_REPEAT_REPLACE"] = "1"
-        raw = self.sample()
+        raw = self.varied_sample()
         first = tokenpipe.process(self.payload(raw), "safe")
         self.assertEqual(first["action"], "replace")
         second = tokenpipe.process(self.payload(raw, tool_call_id="call-two"), "safe")
@@ -141,7 +156,7 @@ class RepeatSuppressionTests(unittest.TestCase):
         tokenpipe.set_repeat_replace("1")
         self.assertTrue(tokenpipe.configured_repeat_replace())
         self.assertEqual(stat.S_IMODE(os.stat(tokenpipe._config_path()).st_mode), 0o600)
-        raw = self.sample()
+        raw = self.varied_sample()
         tokenpipe.process(self.payload(raw), "safe")
         second = tokenpipe.process(self.payload(raw, tool_call_id="call-two"), "safe")
         self.assertEqual(second["strategy"], "repeat-notice")

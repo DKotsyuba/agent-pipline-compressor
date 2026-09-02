@@ -1570,6 +1570,107 @@ def _append_metric(metric, path=None):
         os.close(parent_fd)
 
 
+POST_HEADER_TEMPLATE = "tokenpipe-post-v1 mode=%s strategy=%s%s raw_ref=%s"
+CLAUDE_RECOVERY_MARKER = "tokenpipe-claude-v1"
+CLAUDE_RECOVERY_TEMPLATE = "%s compressed %s; recover with: %s <raw_ref>"
+
+
+def post_recovery_header(mode, strategy, exit_status, raw_ref):
+    """Render the Codex PostToolUse recovery header shown with a replacement.
+
+    The Codex hook prefixes replaced output with this single line so the reader
+    can always recover the exact original. The template lives here, not in the
+    hook, so :func:`_replacement_overhead_estimate` prices exactly the text the
+    host renders and the two can never drift apart.
+
+    Args:
+        mode (str): Active ``audit``, ``safe``, or ``full`` mode, rendered
+            verbatim.
+        strategy (str | None): Compression strategy name; ``None`` or an empty
+            value renders ``unknown``.
+        exit_status (int | None): Child exit status; ``None`` omits the field.
+        raw_ref (str): Absolute recovery path of the spooled raw output.
+
+    Returns:
+        str: One header line with no trailing newline. Pure function: no I/O
+        and no dependence on process state.
+    """
+    exit_field = " exit=%d" % exit_status if isinstance(exit_status, int) else ""
+    return POST_HEADER_TEMPLATE % (mode, strategy or "unknown", exit_field, raw_ref)
+
+
+def claude_recovery_header(references, recover_command, marker=CLAUDE_RECOVERY_MARKER):
+    """Render the Claude ``additionalContext`` recovery line for a replacement.
+
+    Shares the ownership rule of :func:`post_recovery_header`: the hook renders
+    this exact text, so replacement cost is priced against the same template.
+
+    Args:
+        references (Iterable[str]): Per-stream recovery fragments already
+            formatted by the caller, for example ``"stdout raw_ref=/path"``.
+            Joined with ``", "`` in the given order.
+        recover_command (str): Shell-quoted command the reader runs to restore
+            the raw output, rendered before the ``<raw_ref>`` placeholder.
+        marker (str): Host marker opening the line; defaults to
+            :data:`CLAUDE_RECOVERY_MARKER`.
+
+    Returns:
+        str: One context line with no trailing newline. Pure function.
+    """
+    return CLAUDE_RECOVERY_TEMPLATE % (marker, ", ".join(references), recover_command)
+
+
+def _raw_ref_placeholder(root=None):
+    """Return a recovery path shaped like the one :func:`spool_raw` will create.
+
+    The net-win gate runs before any raw file exists, so header cost is priced
+    against a path of representative length instead of the real reference.
+
+    Args:
+        root (str | None): Spool root to price against; ``None`` uses the
+            configured private spool root.
+
+    Returns:
+        str: Absolute placeholder path. No file is created or read.
+    """
+    return os.path.join(
+        root or _raw_root(), "unknown-session", "call-000000000000-000000000000.log"
+    )
+
+
+def _replacement_overhead_estimate(raw_ref_placeholder=None):
+    """Estimate the token cost of the recovery header a host adds to output.
+
+    A replacement never ships alone: the Codex hook prepends
+    :func:`post_recovery_header` and the Claude hook adds
+    :func:`claude_recovery_header`. The larger of the two is used so a
+    replacement judged a win is a win on either host. Mode, strategy, and exit
+    fields are priced with representative values because the caller decides
+    before those are final; the recovery path dominates the length.
+
+    Args:
+        raw_ref_placeholder (str | None): Representative recovery path standing
+            in for the not-yet-spooled reference; ``None`` uses
+            :func:`_raw_ref_placeholder`.
+
+    Returns:
+        int: Non-negative ``estimate_tokens`` cost of one recovery header, or
+        ``0`` if the estimate cannot be rendered, which disables the gate
+        instead of changing the decision. Pure function apart from reading the
+        configured spool root.
+    """
+    try:
+        reference = raw_ref_placeholder or _raw_ref_placeholder()
+        codex = post_recovery_header("audit", "passthrough", 0, reference)
+        claude = claude_recovery_header(
+            ["stdout raw_ref=" + reference],
+            "/usr/bin/python3 %s show" % os.path.abspath(__file__),
+        )
+        return max(estimate_tokens(codex), estimate_tokens(claude))
+    except Exception:  # fail open: header pricing must never block output
+        return 0
+
+
 def process(payload, mode=None, cleanup=True, record_metric=True):
     """Process one tool-output payload with recoverable fail-open semantics.
 
@@ -1597,6 +1698,13 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
     ``bounded-<category>`` strategy, subject to the same category gate, raw
     spooling, and recovery validation as every other replacement.
 
+    A replacement also costs the reader the recovery header its host renders
+    with it (:func:`_replacement_overhead_estimate`). When the compressed
+    candidate saves no more than that header, the exact original is returned
+    with ``skip_reason="net-loss"`` and nothing is spooled; the metric
+    counterfactual still measures the compressed candidate so ``stats`` keeps
+    reporting the unrealized potential.
+
     Compressor, metric, and spool failures fail open to the exact original
     output. With immediate cleanup, replacement is returned only after the raw
     file survives any due cleanup and reads back byte-for-byte. Deferred
@@ -1609,7 +1717,9 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
     mode, and its counterfactual estimate then measures a short notice instead
     of the compressed candidate. The notice becomes the shown output only when
     :func:`configured_repeat_replace` is on, the mode is ``safe`` or ``full``,
-    and the earlier raw copy still reads back byte-for-byte; the strategy is
+    the earlier raw copy still reads back byte-for-byte, and the notice is
+    smaller than that compressed candidate, which carries the same recovery
+    header cost; otherwise the candidate is shown. The strategy is
     then ``repeat-notice`` and this call's own output is spooled as usual.
     Otherwise the call is compressed exactly as before. Any repeat-index
     failure falls back to normal processing. Side effect: the private repeat
@@ -1622,9 +1732,11 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
     original_est = estimate_tokens(original)
     original_bytes = len(original.encode("utf-8", "replace"))
     threshold = max(1, int(os.environ.get("TOKENPIPE_MIN_TOKENS_ESTIMATE", "1500")))
+    overhead_est = _replacement_overhead_estimate()
     category = classify(original)
     strategy = "passthrough"
     candidate = original
+    net_loss_candidate = None
     skip_reason = None
     compressor_error = None
     raw_ref = None
@@ -1637,7 +1749,7 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
     repeat_of_previous = repeat_entry is not None
     repeat_notice = (
         _repeat_notice(original_bytes, repeat_entry.get("raw_ref")) if repeat_of_previous else None)
-    if repeat_notice is not None and estimate_tokens(repeat_notice) >= original_est:
+    if repeat_notice is not None and estimate_tokens(repeat_notice) + overhead_est >= original_est:
         repeat_notice = None
     repeat_replace = bool(
         repeat_notice is not None and mode in ("safe", "full")
@@ -1652,23 +1764,38 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
         else:
             strategy, candidate = compress(original, category)
             candidate = bound_candidate(candidate)
-            if estimate_tokens(candidate) >= original_est:
+            candidate_est = estimate_tokens(candidate)
+            if candidate_est >= original_est:
                 candidate = original
                 strategy = "passthrough"
                 skip_reason = "no-savings"
+            elif candidate_est + overhead_est >= original_est:
+                # Every replacement also costs the reader one recovery header,
+                # so a saving no larger than that header is a net loss.
+                net_loss_candidate = candidate
+                candidate = original
+                strategy = "passthrough"
+                skip_reason = "net-loss"
     except Exception as exc:  # fail open: tool output must survive compressor faults
         candidate = original
         strategy = "passthrough"
         skip_reason = "compressor-error"
         compressor_error = type(exc).__name__
 
+    if repeat_replace and estimate_tokens(repeat_notice) >= estimate_tokens(candidate):
+        # Notice and compressed candidate ship with the same recovery header,
+        # so the smaller body wins the shown output; a tie keeps the candidate,
+        # which carries more of the original. The counterfactual below still
+        # measures the notice.
+        repeat_replace = False
     if repeat_replace:
         # Only the explicit gate lets the notice reach the shown output; the
         # measurement below runs in every mode.
         strategy = "repeat-notice"
         candidate = repeat_notice
         skip_reason = None
-    counterfactual = repeat_notice if repeat_notice is not None else candidate
+    counterfactual = repeat_notice if repeat_notice is not None else (
+        candidate if net_loss_candidate is None else net_loss_candidate)
     counterfactual_est = estimate_tokens(counterfactual)
     replace = mode != "audit" and candidate != original
     if replace and mode in ("safe", "full"):
@@ -2187,7 +2314,11 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
     ``code``/``diff``/``config`` output estimated below
     ``TOKENPIPE_MIN_TOKENS_ESTIMATE`` stay byte-exact with a
     ``<category>-passthrough`` skip reason; larger protected output is bounded
-    to its verbatim head and tail like any other replacement.
+    to its verbatim head and tail like any other replacement. A replacement
+    widens the native header by its recovery reference: when the compressed
+    body saves no more than that widening, the exact body is kept with
+    ``skip_reason="net-loss"`` and no raw file is written, while the metric
+    counterfactual still measures the compressed body.
     Capture/compressor/metric failures preserve execution or fail open without
     broadening argv authority.
     """
@@ -2281,6 +2412,7 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
     content_category = classify(stdout + "\n" + stderr)
     strategy = "rtk-direct" if rtk_used else "passthrough"
     candidate = body
+    net_loss_candidate = None
     skip_reason = None
     compressor_error = None
     raw_ref = None
@@ -2306,10 +2438,26 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
                 compressed_strategy, candidate = compress(body, content_category)
             strategy = ("rtk-direct+" if rtk_used else "") + compressed_strategy
             candidate = bound_candidate(candidate)
-            if estimate_tokens(candidate) >= estimate_tokens(body):
+            candidate_est = estimate_tokens(candidate)
+            body_est = estimate_tokens(body)
+            passthrough_strategy = "rtk-direct" if rtk_used else "passthrough"
+            # A replacement widens the native header by the recovery reference;
+            # price that difference against the saving before replacing.
+            overhead_est = max(0, estimate_tokens(_native_header(
+                supplied_category, exit_status, mode, strategy,
+                _raw_ref_placeholder(_runtime_raw_root()),
+            )) - estimate_tokens(_native_header(
+                supplied_category, exit_status, mode, passthrough_strategy, None,
+            )))
+            if candidate_est >= body_est:
                 candidate = body
-                strategy = "rtk-direct" if rtk_used else "passthrough"
+                strategy = passthrough_strategy
                 skip_reason = "no-savings"
+            elif candidate_est + overhead_est >= body_est:
+                net_loss_candidate = candidate
+                candidate = body
+                strategy = passthrough_strategy
+                skip_reason = "net-loss"
     except Exception as exc:
         candidate = body
         strategy = "rtk-direct" if rtk_used else "passthrough"
@@ -2344,8 +2492,11 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
     shown = shown_header + shown_body
     original_header = _native_header(supplied_category, exit_status, mode, "passthrough", None)
     original_native = original_header + body
-    counter_header = _native_header(supplied_category, exit_status, mode, strategy, "available-on-compression" if candidate != body else None)
-    counter_native = counter_header + candidate
+    # A net-loss decision keeps the compressed body as the counterfactual so
+    # `stats` still reports the saving that the header cost cancelled out.
+    counterfactual_body = candidate if net_loss_candidate is None else net_loss_candidate
+    counter_header = _native_header(supplied_category, exit_status, mode, strategy, "available-on-compression" if counterfactual_body != body else None)
+    counter_native = counter_header + counterfactual_body
     metric = _metric_base(
         payload, mode, supplied_category, strategy, content_category,
         original_native, shown, counter_native, exit_status, skip_reason, raw_ref,
