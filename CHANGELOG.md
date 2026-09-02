@@ -15,6 +15,18 @@ All notable changes to this project are documented here. The format follows
   Non-homogeneous arrays keep the previous `__tokenpipe_omitted_items__`
   behaviour.
 
+- Cross-call exact-repeat suppression, measurement-first. Every metric row now
+  carries `repeat_of_previous`, and `stats` prints a `Repeat outputs` line with
+  the tokens a repeat notice would avoid. Identity is a digest of the
+  normalized command category, tool name, session id, and the output digest;
+  the private `repeat-index.json` beside the raw spool stores only digests,
+  byte lengths, timestamps, and recovery paths, inherits the raw-output TTL,
+  and never holds command lines or output text. The notice replaces shown
+  output only when `TOKENPIPE_REPEAT_REPLACE=1` (or the persisted
+  `repeat-replace` setting) is on, the mode is `safe`/`full`, and the earlier
+  raw copy still reads back byte-for-byte; every other case, including an
+  unreadable index, keeps the previous behavior.
+
 ### Fixed
 
 - The compression lab mapped only the literal `json` route to the `json-lite`

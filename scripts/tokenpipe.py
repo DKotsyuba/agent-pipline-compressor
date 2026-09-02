@@ -251,6 +251,51 @@ def set_post_replace(value):
     _write_settings(settings)
 
 
+def configured_repeat_replace():
+    """Report whether exact-repeat notices may replace shown output.
+
+    Returns:
+        bool: True only when ``TOKENPIPE_REPEAT_REPLACE`` is exactly ``1``, or
+        the variable is unset and the persisted ``repeat_replace`` setting is
+        ``1``. Every other value, an absent setting, and an unreadable or
+        malformed settings file all read as disabled.
+
+    Reads the environment and the private settings file; it never writes.
+    The gate alone never replaces output: the mode must also be ``safe`` or
+    ``full`` and the earlier raw copy must still read back byte-for-byte.
+    """
+    value = os.environ.get("TOKENPIPE_REPEAT_REPLACE")
+    if value is None:
+        value = configured_settings().get("repeat_replace")
+    return str(value).strip() == "1"
+
+
+def set_repeat_replace(value):
+    """Persist or clear the exact-repeat replacement gate in private settings.
+
+    Args:
+        value (str | None): ``"1"`` enables replacement; ``"off"``, ``"0"``,
+            ``""``, and ``None`` remove the setting. Any other string is stored
+            verbatim and therefore reads back as disabled.
+
+    Returns:
+        None
+
+    Raises:
+        OSError: The private settings file cannot be written.
+        ValueError: The settings directory is not private and user-owned.
+
+    Rewrites ``config.json`` atomically with mode ``0600``; no other state is
+    touched. ``TOKENPIPE_REPEAT_REPLACE`` still overrides the stored value.
+    """
+    settings = configured_settings()
+    if value in ("off", "0", "", None):
+        settings.pop("repeat_replace", None)
+    else:
+        settings["repeat_replace"] = value
+    _write_settings(settings)
+
+
 def _safe_component(value, fallback):
     value = str(value or fallback)
     value = re.sub(r"[^A-Za-z0-9_.-]", "_", value)[:96]
@@ -502,6 +547,200 @@ def _similar_object_keys(value):
         if not isinstance(item, dict) or set(item) != keys:
             return None
     return sorted(keys)
+
+
+# Bounds for the private cross-call repeat index. The index only ever holds
+# digests, byte lengths, timestamps, and recovery paths, so these caps bound
+# state growth rather than protecting content.
+REPEAT_INDEX_MAX_ENTRIES = 512
+REPEAT_INDEX_MAX_BYTES = 1024 * 1024
+REPEAT_NOTICE_TEMPLATE = "[tokenpipe] identical to previous output (%d bytes); raw_ref=%s"
+
+
+def _repeat_index_path():
+    """Return the path of the private cross-call repeat index.
+
+    Returns:
+        str: ``repeat-index.json`` inside the active ``TOKENPIPE_HOME``, beside
+        the raw spool. The file may not exist yet.
+    """
+    return os.path.join(_home(), "repeat-index.json")
+
+
+def _repeat_ttl():
+    """Return the repeat-index retention window in seconds.
+
+    Returns:
+        int: ``TOKENPIPE_RAW_TTL_SECONDS`` clamped to a minimum of 0, so index
+        entries never outlive the raw spool they point at. ``0`` disables
+        expiry. A malformed value falls back to the seven-day default.
+    """
+    try:
+        return max(0, int(os.environ.get("TOKENPIPE_RAW_TTL_SECONDS", str(7 * 86400))))
+    except (TypeError, ValueError):
+        return 7 * 86400
+
+
+def _repeat_identity(payload, text):
+    """Derive the opaque identity of one tool output for repeat detection.
+
+    Args:
+        payload (dict[str, object]): Bounded hook payload, read for
+            ``command_category``/``command``, ``tool_name``, and ``session_id``
+            only. It is not mutated.
+        text (str): Exact tool output; hashed, never stored.
+
+    Returns:
+        str: A 64-character hexadecimal SHA-256 digest over the normalized
+        command category, tool name, session id, and the SHA-256 digest of the
+        output bytes. The value is irreversible: no command line, argument,
+        path, or output text can be recovered from it.
+
+    Pure: it performs no I/O and has no side effects.
+    """
+    digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+    parts = (
+        command_category(payload),
+        str(payload.get("tool_name") or ""),
+        str(payload.get("session_id") or ""),
+        digest,
+    )
+    return hashlib.sha256("\x00".join(parts).encode("utf-8", "replace")).hexdigest()
+
+
+def _load_repeat_index():
+    """Read the bounded repeat index, failing safely to an empty mapping.
+
+    Returns:
+        dict[str, object]: Parsed index contents, or ``{}`` when the file is
+        missing, larger than ``REPEAT_INDEX_MAX_BYTES``, unreadable, or not a
+        JSON object. Entry values are not validated here.
+
+    Never raises: a corrupt index only disables repeat suppression.
+    """
+    try:
+        with open(_repeat_index_path(), "r", encoding="utf-8") as handle:
+            if os.fstat(handle.fileno()).st_size > REPEAT_INDEX_MAX_BYTES:
+                return {}
+            value = json.load(handle)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _repeat_lookup(identity, now=None):
+    """Return the live index entry recorded for one identity.
+
+    Args:
+        identity (str): Digest produced by :func:`_repeat_identity`.
+        now (float | None): Unix timestamp for deterministic TTL checks;
+            defaults to the current wall clock.
+
+    Returns:
+        dict[str, object] | None: The stored entry with ``raw_ref`` (str or
+        None), ``bytes`` (int), and ``timestamp`` (float epoch seconds), or
+        ``None`` when no entry exists, the entry is malformed, or it is older
+        than :func:`_repeat_ttl`.
+
+    Read-only and never raises; stale entries are ignored here and reclaimed by
+    the next :func:`_repeat_record`.
+    """
+    entry = _load_repeat_index().get(identity)
+    if not isinstance(entry, dict):
+        return None
+    stamp = entry.get("timestamp")
+    if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
+        return None
+    ttl = _repeat_ttl()
+    now = time.time() if now is None else now
+    if ttl and now - stamp > ttl:
+        return None
+    return entry
+
+
+def _repeat_record(identity, raw_ref, byte_length, now=None):
+    """Record one identity in the private repeat index and prune stale entries.
+
+    Args:
+        identity (str): Digest produced by :func:`_repeat_identity`.
+        raw_ref (str | None): Recovery path of the spooled copy of this output,
+            or ``None`` when nothing was spooled.
+        byte_length (int): UTF-8 byte length of the output, stored for the
+            notice text only.
+        now (float | None): Unix timestamp for deterministic tests; defaults to
+            the current wall clock.
+
+    Returns:
+        None
+
+    Rewrites the whole index atomically as a ``0600`` file inside a ``0700``
+    home, dropping entries past :func:`_repeat_ttl` and keeping only the
+    ``REPEAT_INDEX_MAX_ENTRIES`` newest. No command line, argument, or raw
+    output text is written. Every failure is swallowed: an unwritable index
+    only means the next identical output is not recognized. Concurrent writers
+    are last-writer-wins under the atomic rename, so a racing entry may be
+    dropped; that also only costs one missed repeat.
+    """
+    now = time.time() if now is None else now
+    ttl = _repeat_ttl()
+    try:
+        kept = {
+            key: item for key, item in _load_repeat_index().items()
+            if isinstance(item, dict) and not isinstance(item.get("timestamp"), bool)
+            and isinstance(item.get("timestamp"), (int, float))
+            and not (ttl and now - item["timestamp"] > ttl)
+        }
+        kept[identity] = {
+            "raw_ref": raw_ref if isinstance(raw_ref, str) and raw_ref else None,
+            "bytes": int(byte_length),
+            "timestamp": float(now),
+        }
+        if len(kept) > REPEAT_INDEX_MAX_ENTRIES:
+            newest = sorted(kept.items(), key=lambda item: item[1]["timestamp"], reverse=True)
+            kept = dict(newest[:REPEAT_INDEX_MAX_ENTRIES])
+        _atomic_private_write(
+            _repeat_index_path(), (json.dumps(kept, sort_keys=True) + "\n").encode("utf-8"))
+    except Exception:
+        # The index is an optimization; it must never affect tool output.
+        return
+
+
+def _repeat_recoverable(entry, text):
+    """Report whether an index entry still recovers the exact same output.
+
+    Args:
+        entry (dict[str, object] | None): Entry from :func:`_repeat_lookup`.
+        text (str): Exact current output to compare against.
+
+    Returns:
+        bool: True only when the recorded ``raw_ref`` is inside a private spool
+        root, still readable, and byte-for-byte equal to ``text``. Any missing
+        path, containment refusal, or read error returns False so the caller
+        fails open to normal processing.
+    """
+    raw_ref = entry.get("raw_ref") if isinstance(entry, dict) else None
+    if not isinstance(raw_ref, str) or not raw_ref:
+        return False
+    try:
+        return show_raw(raw_ref) == text
+    except (OSError, ValueError):
+        return False
+
+
+def _repeat_notice(byte_length, raw_ref):
+    """Render the short notice that stands in for a repeated output.
+
+    Args:
+        byte_length (int): UTF-8 byte length of the suppressed output.
+        raw_ref (str | None): Recovery path shown to the reader; ``None``
+            renders as an empty reference and is used for estimates only.
+
+    Returns:
+        str: ``[tokenpipe] identical to previous output (N bytes);
+        raw_ref=<path>`` with no trailing newline. Deterministic for equal
+        inputs.
+    """
+    return REPEAT_NOTICE_TEMPLATE % (int(byte_length), raw_ref or "")
 
 
 def _json_sanitize(value, depth=0):
@@ -879,12 +1118,24 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
     multi-stream callers must perform that transaction before exposing the
     result or metric.
     Metrics never change the decision.
+
+    Output byte-identical to the previous output of the same identity (see
+    :func:`_repeat_identity`) is reported as ``repeat_of_previous`` in every
+    mode, and its counterfactual estimate then measures a short notice instead
+    of the compressed candidate. The notice becomes the shown output only when
+    :func:`configured_repeat_replace` is on, the mode is ``safe`` or ``full``,
+    and the earlier raw copy still reads back byte-for-byte; the strategy is
+    then ``repeat-notice`` and this call's own output is spooled as usual.
+    Otherwise the call is compressed exactly as before. Any repeat-index
+    failure falls back to normal processing. Side effect: the private repeat
+    index under ``TOKENPIPE_HOME`` is refreshed for every non-empty output.
     """
     started = time.monotonic()
     requested_mode = mode or payload.get("mode") or os.environ.get("TOKENPIPE_MODE") or configured_mode()
     mode = requested_mode if requested_mode in ("audit", "safe", "full") else "audit"
     original = _extract_output(payload)
     original_est = estimate_tokens(original)
+    original_bytes = len(original.encode("utf-8", "replace"))
     threshold = max(1, int(os.environ.get("TOKENPIPE_MIN_TOKENS_ESTIMATE", "1500")))
     category = classify(original)
     strategy = "passthrough"
@@ -892,6 +1143,21 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
     skip_reason = None
     compressor_error = None
     raw_ref = None
+
+    try:
+        repeat_identity = _repeat_identity(payload, original)
+        repeat_entry = _repeat_lookup(repeat_identity)
+    except Exception:  # fail open: a broken repeat index must not change output
+        repeat_identity, repeat_entry = None, None
+    repeat_of_previous = repeat_entry is not None
+    repeat_notice = (
+        _repeat_notice(original_bytes, repeat_entry.get("raw_ref")) if repeat_of_previous else None)
+    if repeat_notice is not None and estimate_tokens(repeat_notice) >= original_est:
+        repeat_notice = None
+    repeat_replace = bool(
+        repeat_notice is not None and mode in ("safe", "full")
+        and configured_repeat_replace() and _repeat_recoverable(repeat_entry, original)
+    )
 
     try:
         if original_est < threshold:
@@ -911,7 +1177,14 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
         skip_reason = "compressor-error"
         compressor_error = type(exc).__name__
 
-    candidate_est = estimate_tokens(candidate)
+    if repeat_replace:
+        # Only the explicit gate lets the notice reach the shown output; the
+        # measurement below runs in every mode.
+        strategy = "repeat-notice"
+        candidate = repeat_notice
+        skip_reason = None
+    counterfactual = repeat_notice if repeat_notice is not None else candidate
+    counterfactual_est = estimate_tokens(counterfactual)
     replace = mode != "audit" and candidate != original
     if replace and mode in ("safe", "full"):
         # A caller-provided allowlist restricts which content categories may be
@@ -934,6 +1207,11 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
             if cleanup:
                 if show_raw(raw_ref) != original:
                     raise OSError(errno.EIO, "raw output failed recovery validation")
+            if repeat_replace:
+                # Point the notice at this call's own spooled copy.
+                candidate = _repeat_notice(original_bytes, raw_ref)
+                counterfactual = candidate
+                counterfactual_est = estimate_tokens(candidate)
         except Exception as exc:  # no recoverable raw means no destructive compression
             if raw_ref:
                 try:
@@ -946,9 +1224,15 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
             replace = False
             candidate = original
 
+    if repeat_identity and original:
+        _repeat_record(
+            repeat_identity,
+            raw_ref or (repeat_entry.get("raw_ref") if repeat_entry else None),
+            original_bytes,
+        )
     shown = candidate if replace else original
     shown_est = estimate_tokens(shown)
-    saved = 0.0 if not original_est else 100.0 * (original_est - candidate_est) / original_est
+    saved = 0.0 if not original_est else 100.0 * (original_est - counterfactual_est) / original_est
     now = _dt.datetime.now(_dt.timezone.utc)
     metric = {
         "timestamp": now.isoformat(),
@@ -960,12 +1244,13 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
         "content_category": category,
         "plugin_version": plugin_version(),
         "mode": mode,
-        "original_bytes": len(original.encode("utf-8", "replace")),
+        "original_bytes": original_bytes,
         "shown_bytes": len(shown.encode("utf-8", "replace")),
-        "counterfactual_bytes": len(candidate.encode("utf-8", "replace")),
+        "counterfactual_bytes": len(counterfactual.encode("utf-8", "replace")),
+        "repeat_of_previous": repeat_of_previous,
         "original_tokens_estimate": original_est,
         "shown_tokens_estimate": shown_est,
-        "counterfactual_tokens_estimate": candidate_est,
+        "counterfactual_tokens_estimate": counterfactual_est,
         "saved_percent": round(saved, 2),
         "latency_ms": round((time.monotonic() - started) * 1000.0, 3),
         "exit_status": payload.get("exit_status") if isinstance(payload.get("exit_status"), int) else None,
@@ -993,7 +1278,7 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
         "raw_ref": raw_ref,
         "original_tokens_estimate": original_est,
         "shown_tokens_estimate": shown_est,
-        "counterfactual_tokens_estimate": candidate_est,
+        "counterfactual_tokens_estimate": counterfactual_est,
         "saved_percent": round(saved, 2),
         "skip_reason": skip_reason,
         "compressor_error": compressor_error,
@@ -1330,7 +1615,8 @@ def _label_streams(stdout, stderr):
 
 def _metric_base(payload, mode, category, strategy, content_category, original, shown,
                  counterfactual, exit_status, skip_reason, raw_ref, compressor_error,
-                 started, native_header_bytes=0, audit_overflow=False, rtk_used=False):
+                 started, native_header_bytes=0, audit_overflow=False, rtk_used=False,
+                 repeat_of_previous=False):
     """Build one bounded metric row for the native and skip recording paths.
 
     Args:
@@ -1352,6 +1638,9 @@ def _metric_base(payload, mode, category, strategy, content_category, original, 
         native_header_bytes (int): Byte size of the synthesized native header.
         audit_overflow (bool): True when audit output exceeded the shown bound.
         rtk_used (bool): True when the external token counter was consulted.
+        repeat_of_previous (bool): True when this exact output was already
+            recorded for the same identity; paths without cross-call repeat
+            detection leave it false.
 
     Returns:
         dict[str, object]: A JSON-serializable metric row tagged with
@@ -1386,6 +1675,7 @@ def _metric_base(payload, mode, category, strategy, content_category, original, 
         "raw_ref_present": bool(raw_ref), "compressor_error": compressor_error,
         "audit_overflow": bool(audit_overflow),
         "rtk_used": bool(rtk_used),
+        "repeat_of_previous": bool(repeat_of_previous),
     }
 
 
@@ -1658,6 +1948,22 @@ def load_metrics(since=None, session=None):
 
 
 def aggregate(rows):
+    """Summarize metric rows into per-dimension groups and overall estimates.
+
+    Args:
+        rows (list[dict[str, object]]): Metric rows from :func:`load_metrics`.
+            Missing or malformed numeric fields count as zero, so partially
+            written rows never raise. The rows are not mutated.
+
+    Returns:
+        dict[str, object]: Call counts, native-coverage and saved percentages,
+        token estimates, the ``repeat_calls`` count with the
+        ``repeat_saved_tokens_estimate`` those repeats would avoid, and a
+        ``groups`` mapping of dimension to per-key counters.
+
+    Pure: no I/O and no side effects. Every token figure is an estimate, never
+    provider usage accounting.
+    """
     groups = {
         "day": {}, "session": {}, "command_category": {},
         "strategy": {}, "content_category": {}, "skip_reason": {},
@@ -1691,6 +1997,7 @@ def aggregate(rows):
     ]
     native_original = sum(int(row.get("original_tokens_estimate") or 0) for row in native_rows)
     native_shown = sum(int(row.get("shown_tokens_estimate") or 0) for row in native_rows)
+    repeat_rows = [row for row in rows if row.get("repeat_of_previous")]
     return {
         "token_counts_are_estimates": True,
         "calls": len(rows),
@@ -1709,6 +2016,12 @@ def aggregate(rows):
         "counterfactual_tokens_estimate": counterfactual,
         "actual_saved_percent_estimate": round(100.0 * (original - shown) / original, 2) if original else 0.0,
         "counterfactual_saved_percent_estimate": round(100.0 * (original - counterfactual) / original, 2) if original else 0.0,
+        "repeat_calls": len(repeat_rows),
+        "repeat_saved_tokens_estimate": max(0, sum(
+            int(row.get("original_tokens_estimate") or 0)
+            - int(row.get("counterfactual_tokens_estimate") or 0)
+            for row in repeat_rows
+        )),
         "groups": groups,
     }
 
@@ -1756,6 +2069,22 @@ def show_raw(path):
 
 
 def main(argv=None):
+    """Run one command-line invocation of the local compressor.
+
+    Args:
+        argv (list[str] | None): Argument vector without the program name;
+            ``None`` reads ``sys.argv``.
+
+    Returns:
+        int: Process exit status. ``0`` on success, ``2`` for an unusable
+        recovery reference or settings value, and the child status for ``exec``.
+
+    Side effects depend on the subcommand: ``post`` may spool raw output and
+    append metrics, ``mode``/``post-replace``/``repeat-replace``/``rtk`` rewrite
+    private settings, ``exec`` runs the given argv without a shell, and
+    ``stats``/``show`` only read private state. Payload and settings failures
+    are reported as data, not raised.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", action="version", version=VERSION)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -1772,6 +2101,9 @@ def main(argv=None):
     replace_cmd = commands.add_parser(
         "post-replace", help="print or persist the post-replacement gate (1, category list, or off)")
     replace_cmd.add_argument("value", nargs="?")
+    repeat_cmd = commands.add_parser(
+        "repeat-replace", help="print or persist the exact-repeat replacement gate (1 or off)")
+    repeat_cmd.add_argument("value", nargs="?")
     rtk_cmd = commands.add_parser("rtk", help="show, enable, or disable trusted RTK integration")
     rtk_cmd.add_argument("value", nargs="?", help="absolute RTK executable path, or 'off'")
     native = commands.add_parser("exec", help="execute direct argv and emit native compressed output")
@@ -1821,6 +2153,8 @@ def main(argv=None):
             print("Shown: %d est. tokens" % report["shown_tokens_estimate"])
             print("Tokenpipe-owned saved: %.2f%%" % report["actual_saved_percent_estimate"])
             print("Counterfactual saved: %.2f%%" % report["counterfactual_saved_percent_estimate"])
+            print("Repeat outputs: %d calls, %d est. tokens avoidable" % (
+                report["repeat_calls"], report["repeat_saved_tokens_estimate"]))
             if report["rtk_owned_calls"]:
                 print("RTK savings are external to these estimates; verify them with `rtk gain`.")
             for dimension in (
@@ -1849,6 +2183,11 @@ def main(argv=None):
         if args.value is not None:
             set_post_replace(args.value.strip())
         print(configured_post_replace() or "off")
+        return 0
+    if args.command == "repeat-replace":
+        if args.value is not None:
+            set_repeat_replace(args.value.strip())
+        print("1" if configured_repeat_replace() else "off")
         return 0
     if args.command == "rtk":
         try:
