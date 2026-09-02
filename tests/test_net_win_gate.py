@@ -150,6 +150,29 @@ class NetWinGateTests(unittest.TestCase):
         _, candidate = tokenpipe.compress(sample, tokenpipe.classify(sample))
         return tokenpipe.estimate_tokens(tokenpipe.bound_candidate(candidate))
 
+    def outpriced_placeholder(self, sample):
+        """Return a recovery reference the native header can never earn back.
+
+        Args:
+            sample (str): Body the native path will compress.
+
+        Returns:
+            str: Placeholder path grown until the reference alone widens the
+            native header by more tokens than compressing ``sample`` could ever
+            save, so the net-loss branch is taken under any token estimator
+            rather than under a hand-tuned fixture size.
+        """
+        budget = 2 * tokenpipe.estimate_tokens(sample)
+        baseline = tokenpipe.estimate_tokens(
+            tokenpipe._native_header("search", 0, "safe", "passthrough", None)
+        )
+        reference = "/" + "x" * 256
+        while tokenpipe.estimate_tokens(tokenpipe._native_header(
+            "search", 0, "safe", "passthrough", reference
+        )) - baseline < budget:
+            reference += "x" * len(reference)
+        return reference
+
     def raw_files(self):
         """List every file spooled under the private raw roots.
 
@@ -255,7 +278,7 @@ class NetWinGateTests(unittest.TestCase):
         sample = compressible_sample()
         # The native header grows by the recovery reference; an implausibly long
         # reference makes that growth outweigh any saving.
-        self.patch_placeholder("/" + "x" * 4000)
+        self.patch_placeholder(self.outpriced_placeholder(sample))
         rg = self.executable("rg", "print(%r, end='')\n" % sample)
         output, status = tokenpipe.execute_native(
             [rg, "needle"], "search", "safe", "native-session", "native-net-loss"
