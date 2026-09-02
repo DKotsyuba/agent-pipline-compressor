@@ -160,7 +160,7 @@ When bounding elides a middle section, the recovery header states how many chara
 python3 scripts/tokenpipe.py show <raw_ref> --range <start>:<end>
 ```
 
-`--range` takes character offsets into the decoded original as a half-open `START:END` span, prints exactly those characters, and rejects a malformed range with exit status `2`. Without `--range`, `show` prints the whole original.
+`--range` takes character offsets into the decoded original as a half-open `START:END` span, prints exactly those characters, and rejects a malformed range with exit status `2`. Without `--range`, `show` prints the whole original. The preview follows the `raw_ref` field of the same header, after a `;`, and the net-win gate above prices that longer line so a bounded replacement is never judged a win on a header cost it does not pay.
 
 Replacement is allowed only after raw output is securely spooled; a spool error leaves the original output unchanged. Raw files are private runtime state (`0700` directories and `0600` files), may contain secrets from commands, and are subject to retention and size caps. Treat any `raw_ref` as sensitive.
 

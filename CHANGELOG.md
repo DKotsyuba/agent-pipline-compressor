@@ -44,8 +44,10 @@ All notable changes to this project are documented here. The format follows
   section, the header states how many characters were omitted and the exact
   `show <raw_ref> --range <start>:<end>` command that prints them back; the new
   `--range START:END` option of `show` prints exactly those characters of the
-  decoded original and refuses a malformed range with exit status 2. Both host
-  hooks render the shape the compressor owns instead of their own copy.
+  decoded original and refuses a malformed range with exit status 2. The
+  preview is part of the shared header renderers, so each host hook calls one
+  renderer and assembles no header text of its own, and the net-win gate prices
+  the longer header a bounded replacement actually ships.
 
 - Homogeneous JSON array folding: object arrays with six or more items that
   share exactly the same key set collapse to their first two items, a

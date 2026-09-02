@@ -1774,7 +1774,7 @@ CLAUDE_RECOVERY_MARKER = "tokenpipe-claude-v1"
 CLAUDE_RECOVERY_TEMPLATE = "%s compressed %s; recover with: %s <raw_ref>"
 
 
-def post_recovery_header(mode, strategy, exit_status, raw_ref):
+def post_recovery_header(mode, strategy, exit_status, raw_ref, preview=""):
     """Render the Codex PostToolUse recovery header shown with a replacement.
 
     The Codex hook prefixes replaced output with this single line so the reader
@@ -1789,16 +1789,24 @@ def post_recovery_header(mode, strategy, exit_status, raw_ref):
             value renders ``unknown``.
         exit_status (int | None): Child exit status; ``None`` omits the field.
         raw_ref (str): Absolute recovery path of the spooled raw output.
+        preview (str): One-line recovery preview from :func:`recovery_preview`
+            naming the elided middle; ``""`` (the default) adds nothing.
 
     Returns:
-        str: One header line with no trailing newline. Pure function: no I/O
-        and no dependence on process state.
+        str: One header line with no trailing newline. A non-empty ``preview``
+        follows the ``raw_ref`` field after a ``"; "`` separator, the same
+        shape :func:`_native_header` uses. Pure function: no I/O and no
+        dependence on process state.
     """
     exit_field = " exit=%d" % exit_status if isinstance(exit_status, int) else ""
-    return POST_HEADER_TEMPLATE % (mode, strategy or "unknown", exit_field, raw_ref)
+    line = POST_HEADER_TEMPLATE % (mode, strategy or "unknown", exit_field, raw_ref)
+    if preview:
+        line += "; " + preview
+    return line
 
 
-def claude_recovery_header(references, recover_command, marker=CLAUDE_RECOVERY_MARKER):
+def claude_recovery_header(references, recover_command, marker=CLAUDE_RECOVERY_MARKER,
+                           previews=()):
     """Render the Claude ``additionalContext`` recovery line for a replacement.
 
     Shares the ownership rule of :func:`post_recovery_header`: the hook renders
@@ -1812,11 +1820,21 @@ def claude_recovery_header(references, recover_command, marker=CLAUDE_RECOVERY_M
             the raw output, rendered before the ``<raw_ref>`` placeholder.
         marker (str): Host marker opening the line; defaults to
             :data:`CLAUDE_RECOVERY_MARKER`.
+        previews (Iterable[str]): Per-stream recovery previews from
+            :func:`recovery_preview`, each already named by its stream, for
+            example ``"stdout omitted 4200 chars; ..."``. Empty entries are
+            dropped; the default adds nothing.
 
     Returns:
-        str: One context line with no trailing newline. Pure function.
+        str: One context line with no trailing newline. Every non-empty preview
+        follows the recovery command, each after a ``"; "`` separator. Pure
+        function.
     """
-    return CLAUDE_RECOVERY_TEMPLATE % (marker, ", ".join(references), recover_command)
+    line = CLAUDE_RECOVERY_TEMPLATE % (marker, ", ".join(references), recover_command)
+    kept = [preview for preview in previews if preview]
+    if kept:
+        line += "; " + "; ".join(kept)
+    return line
 
 
 def _raw_ref_placeholder(root=None):
@@ -1837,7 +1855,38 @@ def _raw_ref_placeholder(root=None):
     )
 
 
-def _replacement_overhead_estimate(raw_ref_placeholder=None):
+_PREVIEW_PLACEHOLDER_CHARS = max(SHOWN_BUDGET_CHARS.values())
+"""Character count the placeholder recovery preview is priced with (int).
+
+The gate decides before the real omitted span is known, so the placeholder is
+built from the widest per-category budget (:data:`SHOWN_BUDGET_CHARS`) used as
+both the omitted length and the first ``--range`` offset, with the second
+offset at twice that. Deriving it from the budgets keeps the number
+deterministic and as wide as a bounded replacement's own preview normally gets;
+output far larger than one budget can carry offsets with one or two more
+digits, which the estimator charges a fraction of a token for.
+"""
+
+
+def _preview_placeholder(raw_ref):
+    """Return a representative recovery preview line for header pricing.
+
+    Args:
+        raw_ref (str): Recovery path to render, normally the placeholder from
+            :func:`_raw_ref_placeholder`; its length dominates the line.
+
+    Returns:
+        str: A :data:`RECOVERY_PREVIEW_TEMPLATE` line whose numbers come from
+        :data:`_PREVIEW_PLACEHOLDER_CHARS`, so the same input always yields the
+        same text. Reads ``sys.executable`` and this module's path through
+        :func:`_recovery_command`; creates and reads nothing.
+    """
+    return RECOVERY_PREVIEW_TEMPLATE % (
+        _PREVIEW_PLACEHOLDER_CHARS, _recovery_command(), raw_ref,
+        _PREVIEW_PLACEHOLDER_CHARS, 2 * _PREVIEW_PLACEHOLDER_CHARS)
+
+
+def _replacement_overhead_estimate(raw_ref_placeholder=None, bounded=False):
     """Estimate the token cost of the recovery header a host adds to output.
 
     A replacement never ships alone: the Codex hook prepends
@@ -1847,10 +1896,19 @@ def _replacement_overhead_estimate(raw_ref_placeholder=None):
     fields are priced with representative values because the caller decides
     before those are final; the recovery path dominates the length.
 
+    A bounded replacement makes both headers longer: each carries the
+    ``show --range`` preview naming the elided middle. Pricing the header
+    without that line would under-charge exactly the replacements it is longest
+    for, so ``bounded`` adds a deterministic placeholder preview
+    (:func:`_preview_placeholder`).
+
     Args:
         raw_ref_placeholder (str | None): Representative recovery path standing
             in for the not-yet-spooled reference; ``None`` uses
             :func:`_raw_ref_placeholder`.
+        bounded (bool): True when the replacement being priced would elide a
+            middle section and therefore ship a recovery preview. False, the
+            default, prices the bare header.
 
     Returns:
         int: Non-negative ``estimate_tokens`` cost of one recovery header, or
@@ -1860,10 +1918,12 @@ def _replacement_overhead_estimate(raw_ref_placeholder=None):
     """
     try:
         reference = raw_ref_placeholder or _raw_ref_placeholder()
-        codex = post_recovery_header("audit", "passthrough", 0, reference)
+        preview = _preview_placeholder(reference) if bounded else ""
+        codex = post_recovery_header("audit", "passthrough", 0, reference, preview)
         claude = claude_recovery_header(
             ["stdout raw_ref=" + reference],
             "/usr/bin/python3 %s show" % os.path.abspath(__file__),
+            previews=["stdout " + preview] if preview else (),
         )
         return max(estimate_tokens(codex), estimate_tokens(claude))
     except Exception:  # fail open: header pricing must never block output
@@ -1902,8 +1962,10 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
     :func:`shown_budget`), which the metric records as ``budget_chars``.
 
     A replacement also costs the reader the recovery header its host renders
-    with it (:func:`_replacement_overhead_estimate`). When the compressed
-    candidate saves no more than that header, the exact original is returned
+    with it (:func:`_replacement_overhead_estimate`), including the
+    ``show --range`` preview a bounded candidate's header carries. When the
+    compressed candidate saves no more than that header, the exact original is
+    returned
     with ``skip_reason="net-loss"`` and nothing is spooled; the metric
     counterfactual still measures the compressed candidate so ``stats`` keeps
     reporting the unrealized potential.
@@ -1974,11 +2036,16 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
             strategy, candidate = compress(original, category)
             candidate = bound_candidate(candidate, category=category)
             candidate_est = estimate_tokens(candidate)
+            # A bounded candidate ships a longer header: it carries the
+            # recovery preview naming the elided span, so price that line too.
+            candidate_overhead = (
+                _replacement_overhead_estimate(bounded=True)
+                if BOUND_MARKER_RE.search(candidate) else overhead_est)
             if candidate_est >= original_est:
                 candidate = original
                 strategy = "passthrough"
                 skip_reason = "no-savings"
-            elif candidate_est + overhead_est >= original_est:
+            elif candidate_est + candidate_overhead >= original_est:
                 # Every replacement also costs the reader one recovery header,
                 # so a saving no larger than that header is a net loss.
                 net_loss_candidate = candidate
@@ -1992,10 +2059,11 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
         compressor_error = type(exc).__name__
 
     if repeat_replace and estimate_tokens(repeat_notice) >= estimate_tokens(candidate):
-        # Notice and compressed candidate ship with the same recovery header,
-        # so the smaller body wins the shown output; a tie keeps the candidate,
-        # which carries more of the original. The counterfactual below still
-        # measures the notice.
+        # Both ship with a recovery header, so the smaller body wins the shown
+        # output; a tie keeps the candidate, which carries more of the
+        # original. Comparing bodies alone only ever favors the candidate,
+        # whose header may additionally carry a preview. The counterfactual
+        # below still measures the notice.
         repeat_replace = False
     if repeat_replace:
         # Only the explicit gate lets the notice reach the shown output; the
@@ -2556,8 +2624,9 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
     ``TOKENPIPE_MIN_TOKENS_ESTIMATE`` stay byte-exact with a
     ``<category>-passthrough`` skip reason; larger protected output is bounded
     to its verbatim head and tail like any other replacement. A replacement
-    widens the native header by its recovery reference: when the compressed
-    body saves no more than that widening, the exact body is kept with
+    widens the native header by its recovery reference, and by the recovery
+    preview when the body was bounded: when the compressed body saves no more
+    than that widening, the exact body is kept with
     ``skip_reason="net-loss"`` and no raw file is written, while the metric
     counterfactual still measures the compressed body.
     Capture/compressor/metric failures preserve execution or fail open without
@@ -2684,11 +2753,14 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
             candidate_est = estimate_tokens(candidate)
             body_est = estimate_tokens(body)
             passthrough_strategy = "rtk-direct" if rtk_used else "passthrough"
-            # A replacement widens the native header by the recovery reference;
-            # price that difference against the saving before replacing.
+            # A replacement widens the native header by the recovery reference,
+            # plus the recovery preview when the body was bounded; price that
+            # whole difference against the saving before replacing.
+            placeholder_ref = _raw_ref_placeholder(_runtime_raw_root())
             overhead_est = max(0, estimate_tokens(_native_header(
-                supplied_category, exit_status, mode, strategy,
-                _raw_ref_placeholder(_runtime_raw_root()),
+                supplied_category, exit_status, mode, strategy, placeholder_ref,
+                _preview_placeholder(placeholder_ref)
+                if BOUND_MARKER_RE.search(candidate) else "",
             )) - estimate_tokens(_native_header(
                 supplied_category, exit_status, mode, passthrough_strategy, None,
             )))

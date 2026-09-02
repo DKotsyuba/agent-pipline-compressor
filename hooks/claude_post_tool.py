@@ -129,10 +129,7 @@ def _recovery_context(streams: Dict[str, Dict[str, Any]]) -> str:
         preview = result.get("recovery_preview")
         if preview:
             previews.append("%s %s" % (stream, preview))
-    line = tokenpipe.claude_recovery_header(parts, recover, CLAUDE_MARKER)
-    if previews:
-        line += "; " + "; ".join(previews)
-    return line
+    return tokenpipe.claude_recovery_header(parts, recover, CLAUDE_MARKER, previews)
 
 
 def adapt(event: Dict[str, Any], active_mode: Optional[str] = None) -> Optional[Dict[str, Any]]:

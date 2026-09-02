@@ -225,6 +225,21 @@ class CategoryBudgetTests(unittest.TestCase):
             "search", 0, "safe", "bounded-code", "/tmp/raw.log", preview)
         self.assertEqual(with_preview, header[:-1] + "; " + preview + "\n")
 
+    def test_host_headers_carry_the_shared_preview(self):
+        """Both host renderers, not the hooks, append the recovery preview."""
+        preview = "omitted 5 chars; fetch the elided middle with: p show /tmp/raw.log --range 1:6"
+        codex = tokenpipe.post_recovery_header("safe", "bounded-code", 0, "/tmp/raw.log")
+        self.assertTrue(codex.endswith("raw_ref=/tmp/raw.log"))
+        self.assertEqual(
+            tokenpipe.post_recovery_header("safe", "bounded-code", 0, "/tmp/raw.log", preview),
+            codex + "; " + preview)
+        claude = tokenpipe.claude_recovery_header(["stdout raw_ref=/tmp/raw.log"], "p show")
+        self.assertEqual(
+            tokenpipe.claude_recovery_header(
+                ["stdout raw_ref=/tmp/raw.log"], "p show",
+                previews=["stdout " + preview, ""]),
+            claude + "; stdout " + preview)
+
 
 if __name__ == "__main__":
     unittest.main()

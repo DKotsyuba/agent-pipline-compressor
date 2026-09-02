@@ -58,7 +58,8 @@ def post_replace_gate() -> Tuple[bool, Optional[FrozenSet[str]]]:
 
 
 def recovery_header(active_mode: str, strategy: Optional[str],
-                    status: Optional[int], raw_ref: str) -> Optional[str]:
+                    status: Optional[int], raw_ref: str,
+                    preview: str = "") -> Optional[str]:
     """Render the replacement header from the compressor's shared template.
 
     The template lives in ``scripts/tokenpipe.py`` so the header this hook
@@ -71,17 +72,20 @@ def recovery_header(active_mode: str, strategy: Optional[str],
             an empty value renders ``unknown``.
         status: Child exit status, or ``None`` to omit the field.
         raw_ref: Absolute recovery path returned with the replacement.
+        preview: The compressor's ``recovery_preview`` for this replacement,
+            naming the elided middle; ``""`` (the default) adds nothing.
 
     Returns:
-        The single header line without a trailing newline, or ``None`` when the
-        compressor module cannot be loaded. A ``None`` result makes the caller
-        fail open and leave the exact original output visible.
+        The single header line without a trailing newline, preview included,
+        or ``None`` when the compressor module cannot be loaded. A ``None``
+        result makes the caller fail open and leave the exact original output
+        visible.
     """
     try:
         spec = importlib.util.spec_from_file_location("tokenpipe_post_core", str(TOKENPIPE))
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        return module.post_recovery_header(active_mode, strategy, status, raw_ref)
+        return module.post_recovery_header(active_mode, strategy, status, raw_ref, preview)
     except Exception:
         return None
 
@@ -117,15 +121,12 @@ def main() -> int:
             # The compressor already recorded exactly one honest metric for this
             # event; a follow-up audit pass would double-count it.
             if result.get("action") == "replace" and result.get("raw_ref"):
+                # The compressor owns every piece of this line, preview included.
                 header = recovery_header(
                     active_mode, result.get("strategy"), exit_status(event),
-                    result["raw_ref"],
+                    result["raw_ref"], result.get("recovery_preview") or "",
                 )
                 if header is not None:
-                    # The compressor owns the preview shape; the hook only places it.
-                    preview = result.get("recovery_preview")
-                    if preview:
-                        header += "; " + preview
                     emit({"decision": "block", "reason": header + "\n" + result["output"]})
             return 0
     # Always force audit: PostToolUse is observation-only in every configured
