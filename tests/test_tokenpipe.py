@@ -599,6 +599,48 @@ class TokenpipeTests(unittest.TestCase):
         rows = tokenpipe.load_metrics()
         self.assertEqual(len(rows), count)
 
+    def test_metric_append_retries_transient_create_enoent(self):
+        """One ENOENT from the concurrent-create race must still write the row."""
+        original_open = tokenpipe.os.open
+        calls = {"count": 0}
+
+        def enoent_once(path, flags, mode=0o777, *, dir_fd=None):
+            """Fail the first metrics create with ENOENT, then delegate."""
+            if dir_fd is not None and path == "metrics.jsonl" and calls["count"] == 0:
+                calls["count"] += 1
+                raise FileNotFoundError(tokenpipe.errno.ENOENT, "transient", path)
+            return original_open(path, flags, mode, dir_fd=dir_fd)
+
+        tokenpipe.os.open = enoent_once
+        try:
+            tokenpipe._append_metric({"skip_reason": "retry-probe"})
+        finally:
+            tokenpipe.os.open = original_open
+        self.assertEqual(calls["count"], 1)
+        with open(tokenpipe._metrics_path(), "r", encoding="utf-8") as handle:
+            rows = handle.read().splitlines()
+        self.assertEqual([json.loads(row) for row in rows], [{"skip_reason": "retry-probe"}])
+
+    def test_metric_append_persistent_enoent_surfaces_and_skip_fails_open(self):
+        """A never-appearing metrics file fails fast while the CLI still exits 0."""
+        original_open = tokenpipe.os.open
+
+        def always_enoent(path, flags, mode=0o777, *, dir_fd=None):
+            """Emulate a metrics file that never becomes creatable."""
+            if dir_fd is not None and path == "metrics.jsonl":
+                raise FileNotFoundError(tokenpipe.errno.ENOENT, "persistent", path)
+            return original_open(path, flags, mode, dir_fd=dir_fd)
+
+        tokenpipe.os.open = always_enoent
+        try:
+            with self.assertRaises(FileNotFoundError):
+                tokenpipe.record_skip("search", "persistent-enoent", "audit", "s", "c")
+            self.assertEqual(tokenpipe.main(
+                ["skip", "--category", "search", "--reason", "persistent-enoent"]
+            ), 0)
+        finally:
+            tokenpipe.os.open = original_open
+
     def test_skip_records_audit_overflow_without_content(self):
         tokenpipe.record_skip("search", "audit-output-overflow", "audit", "s", "c")
         metric = tokenpipe.load_metrics()[-1]
