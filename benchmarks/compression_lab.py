@@ -23,12 +23,14 @@ SPEC = importlib.util.spec_from_file_location("tokenpipe", TOKENPIPE_PATH)
 tokenpipe = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(tokenpipe)
 
-LAB_VERSION = "2.0.0"
+LAB_VERSION = "2.1.0"
 MAX_SELECTION_LATENCY_MS = 250.0
-STAGES = ("ansi", "json-lite", "log-lite", "cca", "bound")
+STAGES = ("ansi", "json-lite", "log-lite", "search-group", "search-fold", "cca", "bound")
 PARTIAL_ORDER = (("ansi", "json-lite"), ("ansi", "log-lite"), ("ansi", "cca"),
                  ("ansi", "bound"), ("json-lite", "bound"), ("log-lite", "cca"),
-                 ("log-lite", "bound"), ("cca", "bound"))
+                 ("log-lite", "bound"), ("cca", "bound"),
+                 ("ansi", "search-group"), ("search-group", "cca"), ("search-group", "bound"),
+                 ("ansi", "search-fold"), ("search-fold", "cca"), ("search-fold", "bound"))
 NORMALIZATION_RULES = (
     "ANSI escape sequences are removed",
     "CRLF and bare CR are normalized to LF",
@@ -178,6 +180,9 @@ def corpus():
     varying_stdout, varying_stderr = _varying_log_streams()
     pytest_stderr_stdout = "============================= test session starts =============================\ncollected 2 items\n\ntests/test_io.py .F                                                [100%]\n=================================== FAILURES ===================================\nFAILED tests/test_io.py::test_write - OSError: disk quota exceeded\n=========================== short test summary info ============================\n1 failed, 1 passed in 0.03s\n"
     pytest_stderr_stderr = _repeat("WARNING: ssl module is compiled with an unsupported LibreSSL build\n", 30) + "Traceback (most recent call last):\n  File \"tests/test_io.py\", line 8, in test_write\nOSError: disk quota exceeded\n"
+    rg_multifile = "\n".join("src/pkg%02d/module%02d.py:%d:needle %02d-%03d" % (i // 4, i, j * 3 + 1, i, j) for i in range(24) for j in range(100)) + "\n"
+    grep_small = "\n".join("src/app/main.py:%d:needle small %d" % (i * 4 + 1, i) for i in range(9)) + "\n"
+    find_nested = "\n".join("./src/pkg%d/sub%d/leaf%d/deep%d/module%02d.py" % (a, b, a, b, k) for a in range(5) for b in range(4) for k in range(15)) + "\n"
     return [
         Case("pytest-pass", "tests", "pytest", 3, 0, pytest_pass, must_keep=("3 passed",)),
         Case("pytest-fail", "tests", "pytest", 4, 1, pytest_fail, must_keep=("FAILED", "1 failed", "AssertionError")),
@@ -214,6 +219,9 @@ def corpus():
         Case("varying-timestamp-log", "logs", "log", 4, 0, varying_log, must_keep=("worker heartbeat", "ERROR upload rejected", "status=503")),
         Case("varying-timestamp-log-stderr", "logs", "log", 4, 1, varying_stdout, stderr=varying_stderr, must_keep=("worker heartbeat", "ERROR upload rejected", "gc pause")),
         Case("pytest-fail-stderr", "tests", "pytest", 4, 1, pytest_stderr_stdout, stderr=pytest_stderr_stderr, must_keep=("FAILED", "1 failed", "disk quota exceeded", "WARNING")),
+        Case("rg-multifile", "search", "rg-multifile", 2, 0, rg_multifile, must_keep=("needle 00-000", "src/pkg02/module11.py", "needle 23-099")),
+        Case("grep-small", "search", "grep-small", 3, 0, grep_small, must_keep=("needle small 8",), exact_policy={"mode": "exact", "reason": "search output below the grouping threshold stays verbatim"}),
+        Case("find-nested", "filesystem", "find-nested", 2, 0, find_nested, must_keep=("./src/pkg0/sub0/leaf0/deep0/module00.py", "./src/pkg2/sub2/leaf2", "./src/pkg4/sub3/leaf4/deep3/module14.py")),
     ]
 
 
@@ -242,6 +250,10 @@ def _applicable_stages(case):
         return ("ansi", "json-lite", "bound")
     if case.route in ("log", "rg-io-errors", "git-log", "pytest", "unittest", "generic-test", "rtk-log"):
         return ("ansi", "log-lite", "cca", "bound")
+    if case.route in ("rg-sparse", "rg-dense", "rg-multifile", "grep-small"):
+        return ("ansi", "search-group", "cca", "bound")
+    if case.route in ("ls", "find", "find-nested"):
+        return ("ansi", "search-fold", "cca", "bound")
     if case.route in ("git-diff", "code", "config"):
         return ("ansi", "cca", "bound")
     return ("ansi", "cca", "bound")
@@ -307,12 +319,30 @@ def _rtk_path(explicit=None, allow=True):
 
 
 def _stage_apply(text, stage):
+    """Apply one named deterministic stage to captured output.
+
+    Args:
+        text (str): Candidate text produced by the preceding stages.
+        stage (str): Stage identifier drawn from :data:`STAGES`.
+
+    Returns:
+        str: The transformed text. Both structural search stages reuse the
+        compressor's own shape detection, so output that is not search shaped
+        is returned unchanged.
+
+    Raises:
+        ValueError: The stage name is not a known stage.
+    """
     if stage == "ansi":
         return tokenpipe.ANSI_RE.sub("", text).replace("\r\n", "\n").replace("\r", "\n")
     if stage == "json-lite":
         return tokenpipe.lite_json(text)
     if stage == "log-lite":
         return tokenpipe.lite_log(text)
+    if stage == "search-group":
+        return tokenpipe.group_matches(text) if tokenpipe._is_match_lines(text) else text
+    if stage == "search-fold":
+        return tokenpipe.fold_paths(text) if tokenpipe._is_path_lines(text) else text
     if stage == "cca":
         return tokenpipe.cca_rank(text, target_chars=1400)
     if stage == "bound":
@@ -623,6 +653,15 @@ def _command_matrix(root, fixture_dir):
     _write(os.path.join(search_root, "sparse.txt"), "\n".join("needle sparse-%02d" % i for i in range(1, 8)) + "\n")
     _write(os.path.join(search_root, "dense.txt"), "\n".join("needle repeated payload %03d" % i for i in range(1, 120)) + "\n")
     for index in range(3): _write(os.path.join(search_root, "module%02d.py" % index), "needle module\n")
+    # Dense multi-file search results and a nested path listing exercise the
+    # structural search strategies on real `rg` and `find` captures.
+    dense_root = os.path.join(search_root, "dense"); os.makedirs(dense_root)
+    for index in range(24): _write(os.path.join(dense_root, "dense%02d.txt" % index), "\n".join("needle repeated payload %03d" % line for line in range(100)) + "\n")
+    tree_root = os.path.join(command_root, "tree")
+    for pkg in range(5):
+        for sub in range(4):
+            leaf = os.path.join(tree_root, "pkg%d" % pkg, "sub%d" % sub, "leaf%d" % pkg, "deep%d" % sub); os.makedirs(leaf)
+            for index in range(15): _write(os.path.join(leaf, "module%02d.py" % index), "fixture\n")
     _write(os.path.join(command_root, "README.md"), "README\n"); _write(os.path.join(command_root, "data.json"), "{}\n")
     cases = []
     if available["pytest"]:
@@ -641,10 +680,12 @@ def _command_matrix(root, fixture_dir):
     if available["rg"]:
         rg_bin = shutil.which("rg")
         cases += [CommandCase("rg-sparse", "search", "rg-sparse", 1, (rg_bin, "needle", os.path.join(search_root, "sparse.txt")), ("rtk", "rg", "needle", os.path.join(search_root, "sparse.txt")), command_root, 0, ("sparse-07",), normalization_root=command_root), CommandCase("rg-dense", "search", "rg-dense", 2, (rg_bin, "needle", os.path.join(search_root, "dense.txt")), ("rtk", "rg", "needle", os.path.join(search_root, "dense.txt")), command_root, 0, ("repeated payload",), normalization_root=command_root), CommandCase("rg-io-errors", "search", "rg-io-errors", 4, (rg_bin, "needle", os.path.join(search_root, "missing.txt")), ("rtk", "rg", "needle", os.path.join(search_root, "missing.txt")), command_root, 2, ("No such file or directory",), normalization_root=command_root)]
+        cases.append(CommandCase("rg-multifile", "search", "rg-multifile", 2, (rg_bin, "needle", dense_root), ("rtk", "rg", "needle", dense_root), command_root, 0, ("needle repeated payload",), normalization_root=command_root))
     if available["ls"]:
         ls_bin = shutil.which("ls"); cases.append(CommandCase("ls-output", "filesystem", "ls", 1, (ls_bin, "-1", command_root), ("rtk", "ls", "-1", command_root), command_root, 0, ("README.md", "data.json"), normalization_root=command_root))
     if available["find"]:
         find_bin = shutil.which("find"); cases.append(CommandCase("find-output", "filesystem", "find", 1, (find_bin, command_root, "-maxdepth", "1", "-type", "f", "-print"), ("rtk", "find", command_root, "-maxdepth", "1", "-type", "f", "-print"), command_root, 0, ("README.md", "fixture.json"), normalization_root=command_root))
+        cases.append(CommandCase("find-nested", "filesystem", "find-nested", 3, (find_bin, tree_root, "-type", "f", "-print"), ("rtk", "find", tree_root, "-type", "f", "-print"), command_root, 0, ("module",), normalization_root=command_root))
     cat = shutil.which("cat") or "/bin/cat"
     cases += [CommandCase("rtk-log", "logs", "rtk-log", 2, (cat, log_path), ("rtk", "log", log_path), command_root, 0, ("ERROR",), alternative_markers=(("heartbeat", "120 info messages"),), normalization_root=command_root), CommandCase("rtk-json", "json", "rtk-json", 3, (cat, json_path), ("rtk", "json", json_path), command_root, 0, ("status",), json_expectations=json_case.json_expectations, normalization_root=command_root)]
     return cases, available

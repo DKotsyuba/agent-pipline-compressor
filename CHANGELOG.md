@@ -36,6 +36,17 @@ All notable changes to this project are documented here. The format follows
 - Compression lab fixtures for a varying-timestamp log and for two cases with
   non-empty interleaved `stderr`, so the log ratios and the stderr path are
   measured honestly.
+- Structural compression for search-shaped output, detected as a new `search`
+  content category ahead of the error heuristics: `search-group` folds dense
+  `path:line:text` matches (ripgrep/grep, including `path:text` and
+  `path-line-text` context lines) into one entry per file with its match count
+  and the first and last matches verbatim, and `search-fold` folds bare path
+  listings (`find`, `git ls-files`) into one entry per directory with its entry
+  count and the first and last names. Both keep the original first and last
+  lines, mark every omission, leave short or sparse results byte-for-byte
+  unchanged, and still require a recoverable `raw_ref` before replacement.
+- Compression lab: dense multi-file `rg`, nested `find`, and short-grep
+  fixtures plus `search-group`/`search-fold` stages (lab version 2.1.0).
 
 ### Fixed
 
