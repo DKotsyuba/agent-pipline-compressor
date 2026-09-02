@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Deterministic local-stage and real-command compression benchmark."""
+"""Deterministic local-stage and real-command compression benchmark.
+
+Protected-content policy (changed): protected fixtures are no longer required
+to stay byte-exact at every size. A protected candidate whose raw capture is
+estimated at or below ``TOKENPIPE_MIN_TOKENS_ESTIMATE`` must still be exact; a
+larger one may also be head/tail bounded, meaning its verbatim head and tail
+around the tokenpipe omission marker. Exact output remains valid above the
+threshold because the runtime deliberately falls back to it whenever raw
+spooling or recovery fails, and the separate ``raw_recoverable`` gate is what
+requires a recoverable original behind any bounded candidate.
+"""
 
 from __future__ import print_function
 
@@ -31,6 +41,7 @@ PARTIAL_ORDER = (("ansi", "json-lite"), ("ansi", "log-lite"), ("ansi", "cca"),
                  ("log-lite", "bound"), ("cca", "bound"),
                  ("ansi", "search-group"), ("search-group", "cca"), ("search-group", "bound"),
                  ("ansi", "search-fold"), ("search-fold", "cca"), ("search-fold", "bound"))
+BOUND_MARKER_RE = re.compile(r"\n\.\.\.\[tokenpipe bounded output; omitted \d+ chars; use raw_ref\]\.\.\.\n")
 NORMALIZATION_RULES = (
     "ANSI escape sequences are removed",
     "CRLF and bare CR are normalized to LF",
@@ -158,6 +169,11 @@ def corpus():
     git_status = "On branch main\nChanges not staged for commit:\n  modified: scripts/tokenpipe.py\n  modified: tests/test_tokenpipe.py\nno changes added to commit\n"
     git_log = "\n".join("commit %040d\nAuthor: Lab User <lab@example.invalid>\nDate:   2026-01-%02d 00:00:00 +0000\n\n    deterministic fixture commit %03d" % (i, (i % 28) + 1, i) for i in range(1, 90)) + "\n"
     git_diff = "diff --git a/example.py b/example.py\nindex 1111111..2222222 100644\n--- a/example.py\n+++ b/example.py\n@@ -1,3 +1,43 @@\n def value():\n-    return 1\n+    return 2\n" + _repeat("+    # protected diff detail %03d\n" % 0, 40)
+    # Oversized protected diff: above the replacement threshold, so the policy
+    # expects head/tail bounding that keeps the first and last hunk headers.
+    oversized_diff = "diff --git a/service.py b/service.py\nindex 5555555..6666666 100644\n--- a/service.py\n+++ b/service.py\n" + "".join(
+        "@@ -%d,7 +%d,9 @@ def handler_%02d(request):\n     context before %02d\n-    return legacy_dispatch(request, %02d)\n+    validated = validate_payload(request, %02d)\n+    return modern_dispatch(validated, %02d)\n     context after %02d\n"
+        % (i * 20 + 1, i * 20 + 1, i, i, i, i, i, i) for i in range(45))
     rg_sparse = "\n".join("src/module%02d.py:%d:needle unique-%02d" % (i, i * 7, i) for i in range(1, 24)) + "\n"
     rg_dense = "\n".join("src/generated.py:%d:needle repeated payload" % i for i in range(1, 700)) + "\n"
     rg_io = "\n".join("rg: /missing-%03d: IO error for operation: No such file or directory" % i for i in range(1, 180)) + "\n"
@@ -191,6 +207,7 @@ def corpus():
         Case("git-status", "git", "git-status", 2, 0, git_status, must_keep=("Changes not staged",)),
         Case("git-log", "git", "git-log", 2, 0, git_log, must_keep=("deterministic fixture commit",)),
         Case("git-diff-protected", "protected", "git-diff", 5, 0, git_diff, must_keep=("diff --git", "return 2"), exact_policy={"mode": "exact", "reason": "diff is protected"}),
+        Case("oversized-diff-protected", "protected", "git-diff", 5, 0, oversized_diff, must_keep=("@@ -1,7 +1,9 @@ def handler_00(request):", "@@ -881,7 +881,9 @@ def handler_44(request):"), exact_policy={"mode": "exact", "reason": "diff is protected above the threshold only as bounded head/tail"}),
         Case("rg-sparse", "search", "rg-sparse", 1, 0, rg_sparse, must_keep=("needle unique-23",)),
         Case("rg-dense", "search", "rg-dense", 2, 0, rg_dense, must_keep=("needle repeated payload",)),
         Case("rg-io-errors", "search", "rg-io-errors", 4, 2, rg_io, must_keep=("IO error", "No such file or directory")),
@@ -442,6 +459,50 @@ def schema_check(case, candidate):
     return {"valid": not failures, "failures": failures, "expectations": [dict(item) for item in expectations]}
 
 
+def _bounded_shape(raw, candidate):
+    """Report whether a candidate is a head/tail bounded form of one raw text.
+
+    Args:
+        raw (str): Exact reference capture the candidate was derived from.
+        candidate (str): Candidate output under evaluation.
+
+    Returns:
+        bool: True when the candidate is exactly a non-empty verbatim prefix of
+        ``raw``, one tokenpipe omission marker, and a non-empty verbatim suffix
+        of ``raw``; False for any other shape, including an absent marker or
+        text the marker does not split into verbatim ends.
+    """
+    match = BOUND_MARKER_RE.search(candidate)
+    if not match:
+        return False
+    head, tail = candidate[:match.start()], candidate[match.end():]
+    return bool(head) and bool(tail) and raw.startswith(head) and raw.endswith(tail)
+
+
+def _protected_gate(case, raw, candidate):
+    """Apply the protected-content policy to one candidate.
+
+    Args:
+        case (Case): Case whose ``exact_policy`` declares the required mode;
+            only ``{"mode": "exact"}`` is constrained here.
+        raw (str): Exact reference capture, pre-normalization for exact cases.
+        candidate (str): Candidate output under evaluation.
+
+    Returns:
+        bool: True when the candidate satisfies the policy. Unprotected cases
+        always pass. Protected captures estimated below
+        ``TOKENPIPE_MIN_TOKENS_ESTIMATE`` pass only when byte-exact; larger
+        captures also pass when head/tail bounded, matching the runtime's
+        ``bounded-<category>`` replacement.
+    """
+    if case.exact_policy.get("mode") != "exact" or candidate == raw:
+        return True
+    threshold = max(1, int(os.environ.get("TOKENPIPE_MIN_TOKENS_ESTIMATE", "1500")))
+    if tokenpipe.estimate_tokens(raw) < threshold:
+        return False
+    return _bounded_shape(raw, candidate)
+
+
 def _markers_valid(case, candidate):
     return (all(marker in candidate for marker in case.must_keep) and
             all(any(marker in candidate for marker in group) for group in case.alternative_markers))
@@ -459,7 +520,7 @@ def evaluate_candidate(case, raw, candidate, observed_exit, raw_recoverable, sou
     schema = schema_check(case, candidate)
     reasons = []
     gates = {"exit": observed_exit == case.exit_code, "markers": _markers_valid(case, candidate),
-             "json_schema": schema["valid"], "exact_protected": case.exact_policy.get("mode") != "exact" or candidate == (raw if exact_raw is None else exact_raw),
+             "json_schema": schema["valid"], "exact_protected": _protected_gate(case, raw if exact_raw is None else exact_raw, candidate),
              "non_expansion": len(candidate.encode("utf-8", "replace")) <= len(raw.encode("utf-8", "replace")), "raw_recoverable": bool(raw_recoverable)}
     reasons.extend(gate for gate, passed in gates.items() if not passed)
     raw_bytes = len(raw.encode("utf-8", "replace")); candidate_bytes = len(candidate.encode("utf-8", "replace"))

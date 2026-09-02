@@ -159,14 +159,17 @@ class TokenpipeTests(unittest.TestCase):
             self.assertEqual(tokenpipe.plugin_version(), tokenpipe.VERSION)
 
     def test_diff_and_code_passthrough(self):
+        """Diff and code within the shown-character cap are never rewritten."""
         diff = "diff --git a/a b/a\n--- a/a\n+++ b/a\n" + ("+important\n" * 300)
         result = tokenpipe.process(self.payload(diff), "safe")
         self.assertEqual(result["action"], "passthrough")
-        self.assertEqual(result["skip_reason"], "diff-passthrough")
+        self.assertEqual(result["output"], diff)
+        self.assertEqual(result["skip_reason"], "no-savings")
         code = "\n".join(["def function_%d():\n    return %d" % (i, i) for i in range(100)])
         result = tokenpipe.process(self.payload(code), "safe")
         self.assertEqual(result["action"], "passthrough")
-        self.assertEqual(result["skip_reason"], "code-passthrough")
+        self.assertEqual(result["output"], code)
+        self.assertEqual(result["skip_reason"], "no-savings")
 
     def test_private_permissions_and_show_guard(self):
         raw = json.dumps({"items": list(range(100))}, indent=4)
@@ -339,6 +342,7 @@ class TokenpipeTests(unittest.TestCase):
         self.assertIn("__tokenpipe_omitted_items__", output)
 
     def test_native_allowlisted_config_outputs_remain_exact_passthrough(self):
+        """Config output within the shown-character cap stays byte-exact."""
         for index, sample in enumerate((
             "root:\n  child: value\n" * 300,
             "[section]\nkey = value\n" * 300,
@@ -350,7 +354,7 @@ class TokenpipeTests(unittest.TestCase):
             self.assertEqual(status, 0)
             self.assertIn(sample, output)
             self.assertNotIn("raw_ref=", output.splitlines()[0])
-            self.assertEqual(tokenpipe.load_metrics()[-1]["skip_reason"], "config-passthrough")
+            self.assertEqual(tokenpipe.load_metrics()[-1]["skip_reason"], "no-savings")
 
     def test_native_lite_log_path_is_exercised(self):
         rg = self.executable("rg", "print('same log line\\n' * 500, end='')\n")

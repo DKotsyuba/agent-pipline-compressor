@@ -1285,7 +1285,11 @@ def compress(text, category):
     Returns:
         tuple[str, str]: Strategy label (``lite-json``, ``lite-log``,
         ``cca-log``, ``cca-error``, ``cca-plain``, ``search-group``,
-        ``search-fold``, or ``passthrough``) and candidate output. Binary and
+        ``search-fold``, ``bounded-<category>``, or ``passthrough``) and
+        candidate output. ``code``, ``diff`` and ``config`` return their exact
+        content under a ``bounded-<category>`` label: the content itself is
+        never rewritten, and only the caller's :func:`bound_candidate`
+        head/tail bounding may shorten it. Binary and
         unsupported categories return exact passthrough content.
 
     Compression is local and side-effect free; callers remain responsible for
@@ -1293,6 +1297,10 @@ def compress(text, category):
     """
     if category == "binary":
         return "passthrough", text
+    if category in ("code", "diff", "config"):
+        # Protected categories keep every retained byte verbatim; the caller's
+        # bounding decides how much of the head and tail survives.
+        return "bounded-" + category, text
     if category == "json":
         return "lite-json", lite_json(text)
     if category == "search":
@@ -1446,6 +1454,12 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
         dict[str, object]: Compression decision, shown output, recovery path,
         estimates, and bounded diagnostic metadata.
 
+    Output estimated below ``TOKENPIPE_MIN_TOKENS_ESTIMATE`` and any ``binary``
+    output stays byte-exact. Above that threshold ``code``, ``diff`` and
+    ``config`` are bounded to their verbatim head and tail under a
+    ``bounded-<category>`` strategy, subject to the same category gate, raw
+    spooling, and recovery validation as every other replacement.
+
     Compressor, metric, and spool failures fail open to the exact original
     output. With immediate cleanup, replacement is returned only after the raw
     file survives any due cleanup and reads back byte-for-byte. Deferred
@@ -1496,8 +1510,8 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
     try:
         if original_est < threshold:
             skip_reason = "below-threshold"
-        elif category in ("binary", "code", "diff"):
-            skip_reason = category + "-passthrough"
+        elif category == "binary":
+            skip_reason = "binary-passthrough"
         else:
             strategy, candidate = compress(original, category)
             candidate = bound_candidate(candidate)
@@ -2032,8 +2046,13 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
         tuple[str, int]: Model-visible output and normalized child exit status.
 
     Git reads receive a sanitized config/environment that disables hooks,
-    fsmonitor, pagers, external diff, and textconv. Capture/compressor/metric
-    failures preserve execution or fail open without broadening argv authority.
+    fsmonitor, pagers, external diff, and textconv. ``binary`` output and
+    ``code``/``diff``/``config`` output estimated below
+    ``TOKENPIPE_MIN_TOKENS_ESTIMATE`` stay byte-exact with a
+    ``<category>-passthrough`` skip reason; larger protected output is bounded
+    to its verbatim head and tail like any other replacement.
+    Capture/compressor/metric failures preserve execution or fail open without
+    broadening argv authority.
     """
     started = time.time()
     mode = mode or configured_mode()
@@ -2129,13 +2148,18 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
     compressor_error = None
     raw_ref = None
     try:
+        threshold = max(1, int(os.environ.get("TOKENPIPE_MIN_TOKENS_ESTIMATE", "1500")))
         if capture_overflow:
             strategy = "capture-overflow"
             skip_reason = "capture-overflow"
             candidate = bound_candidate(body)
-        elif content_category in ("binary", "code", "diff", "config"):
+        elif content_category == "binary" or (
+            content_category in ("code", "diff", "config") and estimate_tokens(body) < threshold
+        ):
+            # Binary is never transformed; small protected output keeps its
+            # historical exact-passthrough reason instead of being bounded.
             skip_reason = content_category + "-passthrough"
-        elif estimate_tokens(body) < max(1, int(os.environ.get("TOKENPIPE_MIN_TOKENS_ESTIMATE", "1500"))):
+        elif estimate_tokens(body) < threshold:
             skip_reason = "below-threshold"
         else:
             if content_category == "json" and not stderr.strip():
