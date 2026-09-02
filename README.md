@@ -173,6 +173,8 @@ Host hook
   -> emit compressed output + raw_ref (otherwise emit original output)
 ```
 
+Protected categories are bounded, not exempt: `code`, `diff`, and `config` output above `TOKENPIPE_MIN_TOKENS_ESTIMATE` is replaced by its verbatim head and tail around an omission marker (strategy `bounded-code`, `bounded-diff`, `bounded-config`) with the exact original spooled and reachable through `raw_ref`. Output at or below that threshold, and binary output at any size, stays byte-exact and is never spooled.
+
 Compression is strategy-per-category and deterministic: JSON output folds arrays of six or more objects that all share exactly the same key set down to their first two items, a `__tokenpipe_similar_items__` marker with the exact omitted count and sorted key list, and the last item, recursively at any depth, while non-homogeneous arrays keep the head/tail truncation markers.
 Log-classified output collapses repeats: byte-identical neighbours become a `[previous line repeated N more times]` marker, and a line that matches an earlier one after volatile fields (timestamps, UUIDs, long hex ids, durations, byte sizes, percentages, and addresses) are masked for comparison only is dropped in favour of its first, verbatim occurrence, which gains a trailing `[seen N times]` marker — error and summary lines and the last line are always kept, and status codes, exit codes, and small integers are never masked.
 

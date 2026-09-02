@@ -47,6 +47,17 @@ All notable changes to this project are documented here. The format follows
   unchanged, and still require a recoverable `raw_ref` before replacement.
 - Compression lab: dense multi-file `rg`, nested `find`, and short-grep
   fixtures plus `search-group`/`search-fold` stages (lab version 2.1.0).
+### Changed
+
+- `code`, `diff`, and `config` output above `TOKENPIPE_MIN_TOKENS_ESTIMATE` is
+  no longer unconditionally exact passthrough: it is bounded to its verbatim
+  head and tail under the `bounded-code`, `bounded-diff`, and `bounded-config`
+  strategies, with mandatory raw spooling, byte-for-byte recovery validation,
+  and the usual `replace_categories` gate, on both the hook and the native
+  paths. Output at or below the threshold, output already within
+  `TOKENPIPE_MAX_SHOWN_CHARS`, and `binary` output of any size stay byte-exact.
+  The compression lab's protected fixtures follow the same policy and gained an
+  oversized unified-diff fixture.
 
 ### Fixed
 
