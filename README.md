@@ -155,6 +155,8 @@ Replacement is allowed only after raw output is securely spooled; a spool error 
 
 `stats` reads private metrics and reports estimates by mode, command category, strategy, and plugin version. Metrics omit prompts, command arguments, and tool output. They are not provider billing/usage measurements. The `Repeat outputs` line counts calls whose output was byte-identical to the previous output of the same identity and the estimated tokens a repeat notice would have avoided, whether or not `TOKENPIPE_REPEAT_REPLACE` is on.
 
+Token counts come from the character-class estimator named in the `Estimator: class-ratio v1` line of the summary. It splits text into runs of prose, code punctuation, whitespace, digits, hex/base64 identifiers, non-Latin alphabets, CJK, and symbols, and charges each run its own characters-per-token rate, so hashes and ids are no longer under-counted and English prose is no longer over-counted. The caveat: those rates are heuristics calibrated against published OpenAI `o200k`-style measurements, not against the Claude tokenizer or any provider's billing, and a single estimate can still be off by tens of percent on unusual output. Rows written before this release were measured with the previous UTF-8-bytes/3.5 formula and are not rewritten, so a `--since` window that spans the upgrade mixes both. Thresholds such as `TOKENPIPE_MIN_TOKENS_ESTIMATE` keep their numeric defaults, so the size of output they admit shifts with the estimator.
+
 ```bash
 python3 scripts/tokenpipe.py stats
 python3 scripts/tokenpipe.py stats --since 24h

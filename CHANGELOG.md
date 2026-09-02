@@ -49,6 +49,23 @@ All notable changes to this project are documented here. The format follows
   fixtures plus `search-group`/`search-fold` stages (lab version 2.1.0).
 ### Changed
 
+- Token estimates come from character-class ratios instead of UTF-8 bytes /
+  3.5. One pass splits text into runs of prose, code punctuation, whitespace,
+  digits, hex/base64 identifiers, non-Latin alphabets, CJK, and symbols and
+  charges each run its own characters-per-token rate, so hashes and ids are no
+  longer under-counted by roughly 70% and English prose is no longer
+  over-counted. The rates are heuristics calibrated against published OpenAI
+  `o200k`-style measurements, not the Claude tokenizer, and remain estimates
+  rather than provider usage accounting. `stats` names the estimator with an
+  `Estimator: class-ratio v1` line; metric rows already on disk keep the
+  numbers they were written with and are not rewritten. The superseded formula
+  stays available as `estimate_tokens_bytes` for one release, and the
+  compression lab reports `tokens_old`/`tokens_new` per fixture plus a
+  corpus-wide delta line. All thresholds keep their numeric defaults: on the
+  lab corpus the same text now estimates 26.0% higher, so
+  `TOKENPIPE_MIN_TOKENS_ESTIMATE=1500` admits output about a fifth smaller
+  than before.
+
 - `code`, `diff`, and `config` output above `TOKENPIPE_MIN_TOKENS_ESTIMATE` is
   no longer unconditionally exact passthrough: it is bounded to its verbatim
   head and tail under the `bounded-code`, `bounded-diff`, and `bounded-config`
