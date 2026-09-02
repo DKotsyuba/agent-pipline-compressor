@@ -6,6 +6,16 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- `stats` no longer counts native (RTK) metric rows written by other
+  `TOKENPIPE_HOME`s: rows carry a non-reversible `home` tag and the shared
+  runtime metrics file is filtered by it. Legacy rows without the tag are kept.
+- Hook latency on replacements: the raw-spool retention sweep is amortized to
+  once per `TOKENPIPE_CLEANUP_INTERVAL_SECONDS` (default 600) instead of
+  walking the whole spool on every replacement; `latency_ms` now uses a
+  monotonic clock. Byte-for-byte raw recovery validation still runs every time.
+
 ## [0.2.1] - 2026-09-01
 
 ### Added

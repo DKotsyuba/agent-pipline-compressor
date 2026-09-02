@@ -11,6 +11,7 @@ import argparse
 import datetime as _dt
 import errno
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -76,6 +77,21 @@ def _raw_root():
 
 def _metrics_path():
     return os.path.join(_home(), "metrics.jsonl")
+
+
+def _home_id():
+    """Return a short stable identifier for the active ``TOKENPIPE_HOME``.
+
+    Returns:
+        str: The first 12 hexadecimal characters of the SHA-256 digest of the
+        resolved home path. The value is stable for one home and differs
+        between homes, but is not reversible to a filesystem path.
+
+    Metric rows carry this identifier so that rows appended to the shared
+    runtime metrics file can be attributed back to the home that produced
+    them. It is deliberately a digest: no user-local path may enter metrics.
+    """
+    return hashlib.sha256(_home().encode("utf-8", "replace")).hexdigest()[:12]
 
 
 def _runtime_home():
@@ -323,6 +339,79 @@ def spool_raw(text, session_id, tool_call_id, root=None):
         raise OSError(errno.EEXIST, "could not allocate unique raw spool file")
     finally:
         os.close(directory_fd)
+
+
+def _cleanup_stamp_path(root=None):
+    """Return the path of the amortized-cleanup stamp file.
+
+    Args:
+        root (str | None): Spool root; defaults to the user raw-output root.
+
+    Returns:
+        str: Path of the ``.last-cleanup`` marker inside that root. The file
+        is always empty; only its mtime carries information.
+    """
+    return os.path.join(root or _raw_root(), ".last-cleanup")
+
+
+def _cleanup_due(now=None, root=None):
+    """Report whether spool cleanup should run again for this root.
+
+    Args:
+        now (float | None): Unix timestamp used for deterministic tests;
+            defaults to the current wall clock.
+        root (str | None): Spool root; defaults to the user raw-output root.
+
+    Returns:
+        bool: True when the stamp is missing, is not a regular file, is older
+        than ``TOKENPIPE_CLEANUP_INTERVAL_SECONDS`` (default 600, clamped to a
+        minimum of 0 so ``0`` runs cleanup every time), or cannot be read.
+
+    Fail-open by construction: any unreadable stamp, malformed interval, or
+    stat error reports True, which restores the previous behavior of cleaning
+    on every replacement. It never creates or writes a file.
+    """
+    try:
+        interval = max(0, int(os.environ.get("TOKENPIPE_CLEANUP_INTERVAL_SECONDS", "600")))
+        if interval <= 0:
+            return True
+        info = os.lstat(_cleanup_stamp_path(root))
+        if not stat.S_ISREG(info.st_mode):
+            return True
+        now = time.time() if now is None else now
+        return (now - info.st_mtime) >= interval
+    except (OSError, TypeError, ValueError):
+        return True
+
+
+def _mark_cleanup(root=None):
+    """Record that spool cleanup just completed for this root.
+
+    Args:
+        root (str | None): Spool root; defaults to the user raw-output root.
+
+    Returns:
+        None
+
+    Creates or updates the mtime of the private ``.last-cleanup`` stamp
+    without following a symlink at the final component. Every failure is
+    swallowed: a stamp that cannot be written only means the next replacement
+    cleans again, which is the pre-amortization behavior.
+    """
+    try:
+        fd = os.open(
+            _cleanup_stamp_path(root),
+            os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+    except OSError:
+        return
+    try:
+        os.utime(fd, None)
+    except (OSError, NotImplementedError, TypeError, ValueError):
+        pass
+    finally:
+        os.close(fd)
 
 
 def cleanup_spool(now=None, root=None, protected=None):
@@ -727,8 +816,12 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
         payload (dict[str, object]): Bounded hook payload containing output and
             optional lifecycle/category metadata. It is not mutated.
         mode (str | None): Explicit ``audit``, ``safe``, or ``full`` override.
-        cleanup (bool): When true, enforce spool retention immediately. Claude
-            multi-stream callers pass false and finalize all refs together.
+        cleanup (bool): When true, enforce spool retention and validate raw
+            recovery before returning. The retention sweep itself is amortized
+            to at most once per ``TOKENPIPE_CLEANUP_INTERVAL_SECONDS``; the
+            byte-for-byte recovery check still runs on every replacement.
+            Claude multi-stream callers pass false and finalize all refs
+            together.
         record_metric (bool): Append the decision metric immediately. A false
             value defers its bounded metric in the private ``_metric`` result
             field so a multi-stream caller can commit it only after recovery.
@@ -739,11 +832,12 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
 
     Compressor, metric, and spool failures fail open to the exact original
     output. With immediate cleanup, replacement is returned only after the raw
-    file survives cleanup and reads back byte-for-byte. Deferred multi-stream
-    callers must perform that transaction before exposing the result or metric.
+    file survives any due cleanup and reads back byte-for-byte. Deferred
+    multi-stream callers must perform that transaction before exposing the
+    result or metric.
     Metrics never change the decision.
     """
-    started = time.time()
+    started = time.monotonic()
     requested_mode = mode or payload.get("mode") or os.environ.get("TOKENPIPE_MODE") or configured_mode()
     mode = requested_mode if requested_mode in ("audit", "safe", "full") else "audit"
     original = _extract_output(payload)
@@ -790,9 +884,11 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
                 payload.get("session_id"),
                 payload.get("tool_call_id"),
             )
-            if cleanup:
+            if cleanup and _cleanup_due():
                 if not cleanup_spool(protected=(raw_ref,)):
                     raise OSError(errno.ENOSPC, "raw output exceeds configured spool cap")
+                _mark_cleanup()
+            if cleanup:
                 if show_raw(raw_ref) != original:
                     raise OSError(errno.EIO, "raw output failed recovery validation")
         except Exception as exc:  # no recoverable raw means no destructive compression
@@ -828,7 +924,7 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
         "shown_tokens_estimate": shown_est,
         "counterfactual_tokens_estimate": candidate_est,
         "saved_percent": round(saved, 2),
-        "latency_ms": round((time.time() - started) * 1000.0, 3),
+        "latency_ms": round((time.monotonic() - started) * 1000.0, 3),
         "exit_status": payload.get("exit_status") if isinstance(payload.get("exit_status"), int) else None,
         "skip_reason": skip_reason,
         "raw_ref_present": bool(raw_ref),
@@ -1192,6 +1288,36 @@ def _label_streams(stdout, stderr):
 def _metric_base(payload, mode, category, strategy, content_category, original, shown,
                  counterfactual, exit_status, skip_reason, raw_ref, compressor_error,
                  started, native_header_bytes=0, audit_overflow=False, rtk_used=False):
+    """Build one bounded metric row for the native and skip recording paths.
+
+    Args:
+        payload (dict[str, object]): Hook payload read for ``session_id`` and
+            ``tool_name`` only; both are sanitized. It is not mutated.
+        mode (str): Effective ``audit``, ``safe``, or ``full`` mode.
+        category (str): Normalized command category.
+        strategy (str): Compression strategy name, ``passthrough`` when none.
+        content_category (str): Classified content category of the output.
+        original (str): Exact original text, measured but never stored.
+        shown (str): Text actually surfaced to the host, measured only.
+        counterfactual (str): Candidate text used for honest savings estimates.
+        exit_status (int | None): Child exit status, ``None`` when unknown.
+        skip_reason (str | None): Sanitized reason compression was skipped.
+        raw_ref (str | None): Raw spool path; recorded only as a boolean.
+        compressor_error (str | None): Bounded exception type name, not text.
+        started (float): Start timestamp from the caller's clock, used only as
+            a difference to derive ``latency_ms``.
+        native_header_bytes (int): Byte size of the synthesized native header.
+        audit_overflow (bool): True when audit output exceeded the shown bound.
+        rtk_used (bool): True when the external token counter was consulted.
+
+    Returns:
+        dict[str, object]: A JSON-serializable metric row tagged with
+        ``home`` (see :func:`_home_id`) so rows appended to the shared runtime
+        metrics file remain attributable to the home that produced them.
+
+    The row carries sizes, estimates, and categories only: no raw output,
+    command arguments, prompts, or user-local paths ever enter it.
+    """
     now = _dt.datetime.now(_dt.timezone.utc)
     original_est = estimate_tokens(original)
     shown_est = estimate_tokens(shown)
@@ -1199,6 +1325,7 @@ def _metric_base(payload, mode, category, strategy, content_category, original, 
     saved = 0.0 if not original_est else 100.0 * (original_est - counter_est) / original_est
     return {
         "timestamp": now.isoformat(), "day": now.date().isoformat(),
+        "home": _home_id(),
         "session": _safe_component(payload.get("session_id"), "unknown-session"),
         "tool": _safe_component(payload.get("tool_name"), "exec_command"),
         "command_category": category, "strategy": strategy,
@@ -1438,8 +1565,32 @@ def _parse_since(value):
 
 
 def load_metrics(since=None, session=None):
+    """Load metric rows belonging to the active home.
+
+    Args:
+        since (datetime.datetime | None): Timezone-aware lower bound; rows with
+            an earlier timestamp are dropped. ``None`` keeps all ages.
+        session (str | None): Exact sanitized session id filter. ``None`` keeps
+            every session.
+
+    Returns:
+        list[dict[str, object]]: Parsed rows in file order, home file first.
+        Unparsable or untimestamped lines are skipped rather than raising.
+
+    Raises:
+        OSError: A metrics file exists but cannot be read. A missing file is
+        not an error.
+
+    The runtime metrics file is shared by every home on the machine, because
+    the native wrapper falls back to it whenever the home file is not
+    writable. Rows read from it are therefore kept only when their ``home``
+    tag matches this home; legacy rows written before that tag existed are
+    kept so historical stats do not vanish. Rows from the home file itself are
+    never filtered.
+    """
+    home_id = _home_id()
     rows = []
-    for metrics_path in (_metrics_path(), _runtime_metrics_path()):
+    for metrics_path, shared in ((_metrics_path(), False), (_runtime_metrics_path(), True)):
         try:
             handle = open(metrics_path, "r", encoding="utf-8")
         except OSError as exc:
@@ -1452,6 +1603,8 @@ def load_metrics(since=None, session=None):
                     row = json.loads(line)
                     stamp = _dt.datetime.fromisoformat(row["timestamp"].replace("Z", "+00:00"))
                 except (ValueError, KeyError, TypeError):
+                    continue
+                if shared and row.get("home", home_id) != home_id:
                     continue
                 if since and stamp < since:
                     continue
