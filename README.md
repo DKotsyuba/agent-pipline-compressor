@@ -131,6 +131,7 @@ Persist a mode with `python3 scripts/tokenpipe.py mode audit|safe|full`. `TOKENP
 | `TOKENPIPE_CLEANUP_INTERVAL_SECONDS` | `600` | Minimum seconds between raw-spool retention sweeps; `0` sweeps on every replacement. |
 | `TOKENPIPE_HOOK_TIMEOUT_SEC` | `30` | Hook post-processing timeout. |
 | `TOKENPIPE_POST_REPLACE` | `0` | Codex post-output replacement gate: `0`/absent audits only; `1` replaces any eligible content category; a comma-separated category list (e.g. `error,log`) replaces only output the compressor classifies into a listed category, and any other value audits only. The environment variable overrides the persisted `post-replace` setting. |
+| `TOKENPIPE_REPEAT_REPLACE` | `0` | Exact-repeat suppression gate: `0`/absent measures repeats only; `1` lets output byte-identical to the previous output of the same identity be shown as a short `raw_ref` notice, and only in `safe`/`full` mode when the earlier raw copy still reads back byte-for-byte. Persist it with `python3 scripts/tokenpipe.py repeat-replace 1\|off`; the environment variable overrides the persisted setting. |
 | `TOKENPIPE_AUDIT_MAX_BYTES` | `1 MiB` | Largest single Codex audit output copied to the compressor; larger output is recorded as metadata only. |
 | `TOKENPIPE_CLAUDE_MAX_BYTES` | `16 MiB` | Largest Claude text stream considered by its post-tool hook. |
 | `RTK_DB_PATH` | private runtime DB | Optional RTK history location; an explicit value takes precedence. |
@@ -150,7 +151,7 @@ When active, RTK owns filtering. Tokenpipe does not stack its own Lite/CCA trans
 
 Replacement is allowed only after raw output is securely spooled; a spool error leaves the original output unchanged. Raw files are private runtime state (`0700` directories and `0600` files), may contain secrets from commands, and are subject to retention and size caps. Treat any `raw_ref` as sensitive.
 
-`stats` reads private metrics and reports estimates by mode, command category, strategy, and plugin version. Metrics omit prompts, command arguments, and tool output. They are not provider billing/usage measurements.
+`stats` reads private metrics and reports estimates by mode, command category, strategy, and plugin version. Metrics omit prompts, command arguments, and tool output. They are not provider billing/usage measurements. The `Repeat outputs` line counts calls whose output was byte-identical to the previous output of the same identity and the estimated tokens a repeat notice would have avoided, whether or not `TOKENPIPE_REPEAT_REPLACE` is on.
 
 ```bash
 python3 scripts/tokenpipe.py stats
