@@ -19,6 +19,17 @@ All notable changes to this project are documented here. The format follows
   header. The Codex and Claude post-tool headers are now rendered from
   templates owned by `scripts/tokenpipe.py`, so the text shown and the cost
   priced cannot drift apart.
+- Secret guard before raw spooling. Immediately before the raw copy is written,
+  both `process` and the native wrapper scan at most the first 256 KiB of the
+  output for PEM private key blocks, AWS access keys, GitHub tokens,
+  OpenAI/Anthropic-style keys, Slack tokens, JWTs, `Authorization: Bearer`
+  headers, and a credential key word directly assigned a value. A match is a
+  refusal, not a redaction: the exact original output is returned under
+  strategy `passthrough`, no file is written under the raw spool, no
+  repeat-index entry is recorded, and the metric row carries only the new
+  `secret-guard` skip reason. Prose mentioning `password` or `token` without an
+  assigned value does not match, and a credential appearing only after the
+  scanned window is deliberately not detected.
 
 - Homogeneous JSON array folding: object arrays with six or more items that
   share exactly the same key set collapse to their first two items, a

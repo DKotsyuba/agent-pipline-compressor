@@ -30,6 +30,29 @@ import uuid
 VERSION = "0.2.1"
 ANSI_RE = re.compile(r"\x1b(?:[@-_][0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 SECRET_KEY_RE = re.compile(r"(?i)(token|secret|password|authorization|api[_-]?key|cookie)")
+# Bound on how much output the secret guard inspects, in characters.
+SECRET_SCAN_CHARS = 256 * 1024
+# A key word from SECRET_KEY_RE (reused verbatim, plus `passwd`, which no JSON
+# key spells) directly assigned a value of eight or more non-blank characters.
+# The optional quote before the separator is what also matches a JSON member
+# such as `"token": "<value>"`; prose mentioning a key word without assigning
+# a value never matches.
+SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?:passwd|%s)['\"]?\s*[=:]\s*['\"]?[^\s'\"]{8,}"
+    % SECRET_KEY_RE.pattern.replace("(?i)", "", 1),
+    re.IGNORECASE,
+)
+# Credential shapes refused before raw spooling; see :func:`_looks_like_secret`.
+SECRET_RES = (
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),  # PEM private key block
+    re.compile(r"AKIA[0-9A-Z]{16}"),  # AWS access key id
+    re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),  # GitHub token
+    re.compile(r"sk-[A-Za-z0-9_-]{20,}"),  # OpenAI/Anthropic-style API key
+    re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),  # Slack token
+    re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),  # JWT
+    re.compile(r"(?i)authorization\s*:\s*bearer\s+\S{20,}"),  # bearer credential header
+    SECRET_ASSIGNMENT_RE,
+)
 ERROR_RE = re.compile(
     r"(?i)(error|failed|failure|fatal|panic|exception|traceback|assert|timeout|"
     r"segmentation|denied|not found|(?:http(?:/[0-9.]+)?\s+|"
@@ -474,6 +497,34 @@ def _write_all(fd, data):
         if count <= 0:
             raise OSError(errno.EIO, "short write")
         written += count
+
+
+def _looks_like_secret(text):
+    """Report whether output looks like it carries a live credential.
+
+    Args:
+        text (str | None): Candidate raw tool output. It is only matched
+            against :data:`SECRET_RES`; no part of it is logged, stored,
+            returned, or recorded in metrics.
+
+    Returns:
+        bool: True when a credential shape appears in the scanned window,
+        otherwise False. Non-string and empty input is False.
+
+    Security invariant: a True verdict must make the caller skip
+    :func:`spool_raw`, skip replacement, and return the exact original output.
+    This is a refusal, not a redaction: the output itself is never rewritten,
+    so nothing is hidden from the host and nothing lands under the raw spool.
+
+    Cost bound: only the first :data:`SECRET_SCAN_CHARS` characters are
+    scanned, so a credential further into a very large output, or one
+    straddling that boundary, is deliberately not detected. Deterministic and
+    side-effect free; it never raises for ``str`` or ``None`` input.
+    """
+    if not isinstance(text, str) or not text:
+        return False
+    window = text[:SECRET_SCAN_CHARS]
+    return any(pattern.search(window) for pattern in SECRET_RES)
 
 
 def spool_raw(text, session_id, tool_call_id, root=None):
@@ -1705,6 +1756,12 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
     counterfactual still measures the compressed candidate so ``stats`` keeps
     reporting the unrealized potential.
 
+    Output that :func:`_looks_like_secret` flags immediately before spooling is
+    refused rather than redacted: it is returned byte-exact under strategy
+    ``passthrough`` with skip reason ``secret-guard``, no file is written under
+    the raw spool, and no repeat-index entry is recorded for it. Only the skip
+    reason reaches metrics; no matched text does.
+
     Compressor, metric, and spool failures fail open to the exact original
     output. With immediate cleanup, replacement is returned only after the raw
     file survives any due cleanup and reads back byte-for-byte. Deferred
@@ -1805,6 +1862,14 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
         if isinstance(replace_categories, list) and category not in replace_categories:
             replace = False
             skip_reason = "category-gated"
+    secret_guarded = replace and _looks_like_secret(original)
+    if secret_guarded:
+        # Refusal, not redaction: nothing is spooled and nothing is replaced,
+        # so the exact original output still reaches the host.
+        replace = False
+        strategy = "passthrough"
+        candidate = original
+        skip_reason = "secret-guard"
     if replace:
         try:
             raw_ref = spool_raw(
@@ -1836,7 +1901,8 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
             replace = False
             candidate = original
 
-    if repeat_identity and original:
+    if repeat_identity and original and not secret_guarded:
+        # The index stores a raw_ref; guarded output must not enter it.
         _repeat_record(
             repeat_identity,
             raw_ref or (repeat_entry.get("raw_ref") if repeat_entry else None),
@@ -2320,7 +2386,9 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
     ``skip_reason="net-loss"`` and no raw file is written, while the metric
     counterfactual still measures the compressed body.
     Capture/compressor/metric failures preserve execution or fail open without
-    broadening argv authority.
+    broadening argv authority. Output that :func:`_looks_like_secret` flags is
+    never spooled or replaced: it is returned exactly, under skip reason
+    ``secret-guard``.
     """
     started = time.time()
     mode = mode or configured_mode()
@@ -2468,6 +2536,12 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
         "session_id": session_id, "tool_call_id": tool_call_id,
         "tool_name": "exec_command", "command_category": supplied_category,
     }
+    if replace and _looks_like_secret(body):
+        # Same refusal as :func:`process`: no spool, no replacement, exact output.
+        replace = False
+        candidate = body
+        strategy = "rtk-direct" if rtk_used else "passthrough"
+        skip_reason = "secret-guard"
     if replace:
         try:
             runtime_raw = _runtime_raw_root()
