@@ -21,6 +21,11 @@ All notable changes to this project are documented here. The format follows
   stage, so real `rtk-json` captures scored as 1.000 passthrough; any route
   suffixed `-json` now gets the JSON stage set, and the lab's array-count gate
   understands the new fold marker.
+- A compression-lab candidate whose stage raised (such as `json-lite` on a
+  non-JSON `rtk-json` capture) reported only `stage-error` and dropped the
+  gates it had already failed; stage errors are now appended to the gate
+  reasons, so an rtk candidate without raw recovery still reports
+  `raw_recoverable`.
 
 - `stats` no longer counts native (RTK) metric rows written by other
   `TOKENPIPE_HOME`s: rows carry a non-reversible `home` tag and the shared
