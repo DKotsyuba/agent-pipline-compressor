@@ -801,19 +801,106 @@ def lite_json(text):
     return json.dumps(_json_sanitize(parsed), ensure_ascii=False, separators=(",", ":"), sort_keys=False)
 
 
+_LOG_MASK_RULES = (
+    (re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"), "<uuid>"),
+    (re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?"), "<timestamp>"),
+    (re.compile(r"\b\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?\b"), "<time>"),
+    (re.compile(r"\b0x[0-9a-fA-F]+\b"), "<addr>"),
+    (re.compile(r"\b\d+(?:\.\d+)?\s?(?:[KMGTP]i?B|[kmgtp]i?b)\b"), "<size>"),
+    (re.compile(r"\b\d+(?:\.\d+)?(?:ns|µs|us|ms|s|m|h)\b"), "<duration>"),
+    (re.compile(r"\b\d+(?:\.\d+)?%"), "<percent>"),
+    (re.compile(r"\b[0-9a-fA-F]{8,}\b"), "<id>"),
+)
+"""tuple[tuple[re.Pattern, str], ...]: Ordered volatile-field masking rules.
+
+Each pair is a compiled pattern and the placeholder replacing it. Applied in
+order they mask the fields that make otherwise identical log lines differ:
+UUIDs, ISO/RFC timestamps, ``HH:MM:SS(.ms)`` clock and ``H:MM:SS`` duration
+values, memory addresses, byte sizes, unit-suffixed durations, percentages,
+and hex identifiers of eight or more characters. Numbers that carry meaning
+(HTTP status codes, exit codes, counts, plain integers below eight digits)
+match no rule. The rules build comparison keys only; emitted text is never
+masked.
+"""
+
+
+def _log_template_key(line):
+    """Return the masked comparison key identifying one log line template.
+
+    Args:
+        line (str): One ANSI-stripped, right-stripped log line.
+
+    Returns:
+        str: The outer-stripped line with every :data:`_LOG_MASK_RULES` match
+        replaced by its placeholder. Lines differing only in volatile fields
+        share a key; lines differing in a status code, exit code, or small
+        integer do not.
+
+    Pure, deterministic, and side-effect free. The result is never emitted.
+    """
+    key = line.strip()
+    for pattern, placeholder in _LOG_MASK_RULES:
+        key = pattern.sub(placeholder, key)
+    return key
+
+
+def _log_line_protected(line):
+    """Return whether a log line must survive non-adjacent template collapsing.
+
+    Args:
+        line (str): One log line as it would be emitted.
+
+    Returns:
+        bool: True when the line matches :data:`ERROR_RE`,
+        :data:`STRONG_ERROR_RE`, or :data:`SUMMARY_RE`. All three are consulted
+        even though the strong pattern is currently a subset of ``ERROR_RE``,
+        so a later divergence cannot silently drop failure evidence.
+
+    Pure and deterministic. A protected line is never dropped, though its first
+    occurrence may still receive a repeat marker.
+    """
+    return bool(ERROR_RE.search(line) or STRONG_ERROR_RE.search(line) or SUMMARY_RE.search(line))
+
+
 def lite_log(text):
+    """Collapse repetitive log output without discarding failure evidence.
+
+    Args:
+        text (str): Complete decoded log output. ANSI escapes are removed and
+            CRLF/CR normalized to LF before any comparison.
+
+    Returns:
+        str: The stripped transform. Byte-identical adjacent lines collapse to
+        the first line plus ``[previous line repeated N more times]``; blank
+        runs squeeze to a single blank line; and a line whose masked template
+        key (see :func:`_log_template_key`) was already emitted is dropped,
+        with ``[seen N times]`` appended to that first occurrence, where ``N``
+        counts every occurrence of the key. Lines accepted by
+        :func:`_log_line_protected` and the final non-blank input line are
+        always emitted, so they can appear more than once with that marker.
+
+    Masking affects comparison only: every emitted line is verbatim input plus
+    an optional appended marker. The transform is deterministic, keeps no state
+    across calls, and has no side effects. Output can exceed the input when
+    many protected duplicates are kept, so callers compare sizes before
+    replacing anything.
+    """
     text = ANSI_RE.sub("", text).replace("\r\n", "\n").replace("\r", "\n")
     lines = [line.rstrip() for line in text.split("\n")]
     output = []
     previous = None
     repeated = 0
     blanks = 0
+    first_seen = {}
+    occurrences = {}
+    last = max((position for position, item in enumerate(lines) if item.strip()), default=-1)
 
     def flush_repeat():
+        """Emit the pending adjacent-repeat marker for the last emitted line."""
         if repeated:
             output.append("[previous line repeated %d more times]" % repeated)
 
-    for line in lines:
+    for index, line in enumerate(lines):
         if not line.strip():
             blanks += 1
             if blanks > 1:
@@ -825,9 +912,21 @@ def lite_log(text):
             continue
         flush_repeat()
         repeated = 0
+        if line.strip():
+            key = _log_template_key(line)
+            occurrences[key] = occurrences.get(key, 0) + 1
+            if key in first_seen:
+                # Drop the near-repeat, but never evidence or the final line.
+                if index != last and not _log_line_protected(line):
+                    continue
+            else:
+                first_seen[key] = len(output)
         output.append(line)
         previous = line
     flush_repeat()
+    for key, position in first_seen.items():
+        if occurrences[key] > 1:
+            output[position] += " [seen %d times]" % occurrences[key]
     return "\n".join(output).strip()
 
 
