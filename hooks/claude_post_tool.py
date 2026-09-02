@@ -105,23 +105,31 @@ def _recovery_context(streams: Dict[str, Dict[str, Any]]) -> str:
     """Render the recovery context shown with a Claude replacement.
 
     Args:
-        streams: Per-stream compressor results keyed by ``stdout``/``stderr``;
-            every present entry must carry a ``raw_ref`` path. Not mutated.
+        streams: Replaced stream name (``stdout``/``stderr``) to the
+            :func:`tokenpipe.process` result that produced it. Every present
+            entry must carry a ``raw_ref`` path and may carry a
+            ``recovery_preview``, whose shape the compressor owns. Not mutated.
 
     Returns:
         One ``additionalContext`` line naming each stream's recovery reference
-        and the command that restores it. The template is owned by
+        and the command that restores it, followed by one ``show --range``
+        preview per stream whose replacement elided a middle section. Streams
+        that were not bounded add no preview. The template is owned by
         ``scripts/tokenpipe.py`` so this text and the header cost priced by its
         net-win gate cannot drift apart.
     """
     recover = "/usr/bin/python3 %s show" % shlex.quote(str(TOKENPIPE))
     parts = []
+    previews = []
     for stream in ("stdout", "stderr"):
         result = streams.get(stream)
         if not result:
             continue
         parts.append("%s raw_ref=%s" % (stream, result["raw_ref"]))
-    return tokenpipe.claude_recovery_header(parts, recover, CLAUDE_MARKER)
+        preview = result.get("recovery_preview")
+        if preview:
+            previews.append("%s %s" % (stream, preview))
+    return tokenpipe.claude_recovery_header(parts, recover, CLAUDE_MARKER, previews)
 
 
 def adapt(event: Dict[str, Any], active_mode: Optional[str] = None) -> Optional[Dict[str, Any]]:

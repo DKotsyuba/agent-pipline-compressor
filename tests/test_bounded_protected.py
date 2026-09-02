@@ -232,7 +232,7 @@ class BoundedProtectedTests(unittest.TestCase):
         header = output.splitlines()[0]
         self.assertIn("strategy=bounded-diff", header)
         self.assertIn("raw_ref=", header)
-        body = tokenpipe.show_raw(header.split("raw_ref=")[1].strip())
+        body = tokenpipe.show_raw(header.split("raw_ref=")[1].split(";")[0].strip())
         self.assertIn(sample, body)
         self.assert_bounded(body, output[len(header) + 1:])
 

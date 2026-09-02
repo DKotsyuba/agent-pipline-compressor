@@ -145,7 +145,7 @@ class HookSecurityTests(unittest.TestCase):
         response = json.loads(visible.getvalue())
         self.assertEqual(response["decision"], "block")
         self.assertIn("tokenpipe-post-v1 mode=safe", response["reason"])
-        raw_ref = response["reason"].split("raw_ref=", 1)[1].splitlines()[0]
+        raw_ref = response["reason"].split("raw_ref=", 1)[1].splitlines()[0].split(";")[0].strip()
         with open(raw_ref, "r", encoding="utf-8") as handle:
             self.assertEqual(handle.read(), "same line\n" * 400)
 

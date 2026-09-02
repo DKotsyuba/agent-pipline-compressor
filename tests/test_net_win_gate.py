@@ -113,15 +113,17 @@ class NetWinGateTests(unittest.TestCase):
         """Pin the header cost so a decision boundary is exact on any machine.
 
         Args:
-            tokens (int): Header estimate every gate call should observe. The
-                real estimate varies with the private spool path length, which
+            tokens (int): Header estimate every gate call should observe,
+                whether or not the replacement would be bounded. The real
+                estimate varies with the private spool path length, which
                 differs per checkout.
 
         Returns:
             None: The real estimator is restored during test cleanup.
         """
         original = tokenpipe._replacement_overhead_estimate
-        tokenpipe._replacement_overhead_estimate = lambda placeholder=None: tokens
+        tokenpipe._replacement_overhead_estimate = (
+            lambda placeholder=None, bounded=False: tokens)
         self.addCleanup(setattr, tokenpipe, "_replacement_overhead_estimate", original)
 
     def patch_placeholder(self, reference):
@@ -217,6 +219,30 @@ class NetWinGateTests(unittest.TestCase):
         )
         self.assertGreater(tokenpipe._replacement_overhead_estimate(), 0)
 
+    def test_bounded_header_is_priced_with_its_recovery_preview(self):
+        """A bounded replacement is charged for the preview line it ships."""
+        reference = tokenpipe._raw_ref_placeholder()
+        preview = tokenpipe._preview_placeholder(reference)
+        self.assertIn("--range", preview)
+        # Deterministic: the same reference always prices the same line.
+        self.assertEqual(preview, tokenpipe._preview_placeholder(reference))
+        codex = tokenpipe.post_recovery_header("audit", "passthrough", 0, reference, preview)
+        claude = tokenpipe.claude_recovery_header(
+            ["stdout raw_ref=" + reference],
+            "/usr/bin/python3 %s show" % os.path.abspath(tokenpipe.__file__),
+            previews=["stdout " + preview],
+        )
+        self.assertEqual(codex, codex.split("; ")[0] + "; " + preview)
+        self.assertTrue(claude.endswith("; stdout " + preview))
+        self.assertEqual(
+            tokenpipe._replacement_overhead_estimate(bounded=True),
+            max(tokenpipe.estimate_tokens(codex), tokenpipe.estimate_tokens(claude)),
+        )
+        self.assertGreater(
+            tokenpipe._replacement_overhead_estimate(bounded=True),
+            tokenpipe._replacement_overhead_estimate(),
+        )
+
     def test_saving_smaller_than_the_header_is_a_net_loss(self):
         """A saving the header cancels out returns the exact original."""
         sample = marginal_sample()
@@ -301,7 +327,10 @@ class NetWinGateTests(unittest.TestCase):
         self.assertEqual(status, 0)
         header = output.splitlines()[0]
         self.assertIn("raw_ref=", header)
-        self.assertIn(sample, tokenpipe.show_raw(header.split("raw_ref=")[1].strip()))
+        # raw_ref is followed by the ";"-separated recovery preview when the
+        # replacement elided a middle section, so stop the field at the ";".
+        raw_ref = header.split("raw_ref=")[1].split(";")[0].strip()
+        self.assertIn(sample, tokenpipe.show_raw(raw_ref))
         self.assertNotEqual(tokenpipe.load_metrics()[-1]["skip_reason"], "net-loss")
 
     def test_repeat_notice_loses_to_a_smaller_candidate(self):

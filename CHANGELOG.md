@@ -31,6 +31,24 @@ All notable changes to this project are documented here. The format follows
   assigned value does not match, and a credential appearing only after the
   scanned window is deliberately not detected.
 
+- Per-category shown budgets. Bounding now uses one budget per content category
+  (`error`/`code`/`diff` 7000, `log`/`json` 6000, `plain`/`search`/`config`
+  5000 characters) instead of one global number, so every replacement stays
+  under the tightest documented host output cap. `TOKENPIPE_MAX_SHOWN_CHARS`
+  remains the global ceiling every budget is clamped to, and
+  `TOKENPIPE_BUDGET_<CATEGORY>` (for example `TOKENPIPE_BUDGET_ERROR=4000`)
+  overrides one category within `[256, TOKENPIPE_MAX_SHOWN_CHARS]`. Metric rows
+  gain `budget_chars`.
+
+- Recovery preview on the raw-output header. When bounding elides a middle
+  section, the header states how many characters were omitted and the exact
+  `show <raw_ref> --range <start>:<end>` command that prints them back; the new
+  `--range START:END` option of `show` prints exactly those characters of the
+  decoded original and refuses a malformed range with exit status 2. The
+  preview is part of the shared header renderers, so each host hook calls one
+  renderer and assembles no header text of its own, and the net-win gate prices
+  the longer header a bounded replacement actually ships.
+
 - Homogeneous JSON array folding: object arrays with six or more items that
   share exactly the same key set collapse to their first two items, a
   `__tokenpipe_similar_items__` marker carrying the exact omitted count and

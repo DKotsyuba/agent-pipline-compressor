@@ -16,6 +16,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import signal
 import stat
@@ -1493,26 +1494,173 @@ def compress(text, category):
     return "passthrough", text
 
 
-def bound_candidate(text, max_chars=None):
-    """Keep replacement output below the hook's inline spill threshold."""
+# Default shown-output character budget per content category. Every value stays
+# at or below the global default so a replacement fits the tightest documented
+# host cap (Codex truncates tool output at 10 KiB / 256 lines); categories whose
+# elided middle is hardest to reconstruct keep the largest budget.
+SHOWN_BUDGET_CHARS = {
+    "error": 7000, "log": 6000, "plain": 5000, "json": 6000,
+    "search": 5000, "code": 7000, "diff": 7000, "config": 5000,
+}
+BOUND_MARKER_TEMPLATE = "\n...[tokenpipe bounded output; omitted %d chars; use raw_ref]...\n"
+BOUND_MARKER_RE = re.compile(
+    r"\n\.\.\.\[tokenpipe bounded output; omitted \d+ chars; use raw_ref\]\.\.\.\n")
+
+
+def _global_shown_cap():
+    """Return the global ceiling on shown replacement characters.
+
+    Returns:
+        int: ``TOKENPIPE_MAX_SHOWN_CHARS`` clamped to at least 256, or the
+        built-in 7000 default when the variable is unset or unparsable.
+
+    Reads the environment only; an unusable value fails open to the default so
+    bounding never raises out of a compression path.
+    """
+    try:
+        return max(256, int(os.environ.get("TOKENPIPE_MAX_SHOWN_CHARS", "7000")))
+    except (TypeError, ValueError):
+        return 7000
+
+
+def shown_budget(category=None):
+    """Resolve the shown-character budget for one content category.
+
+    Args:
+        category (str | None): Content category from :func:`classify`.
+            ``None`` or an unknown category selects the global cap.
+
+    Returns:
+        int: Character budget in ``[256, _global_shown_cap()]``. The default
+        comes from :data:`SHOWN_BUDGET_CHARS`; ``TOKENPIPE_BUDGET_<CATEGORY>``
+        (uppercased, non-alphanumerics mapped to ``_``) overrides one category
+        and is clamped to 256 at the bottom and the global cap at the top. An
+        unparsable override is ignored in favor of the default.
+
+    Reads the environment only and never raises.
+    """
+    cap = _global_shown_cap()
+    budget = SHOWN_BUDGET_CHARS.get(category)
+    if category is not None:
+        name = re.sub(r"[^A-Z0-9_]", "_", str(category).upper())
+        override = os.environ.get("TOKENPIPE_BUDGET_" + name)
+        if override is not None:
+            try:
+                budget = min(cap, max(256, int(override.strip())))
+            except (TypeError, ValueError):
+                budget = SHOWN_BUDGET_CHARS.get(category)
+    if budget is None:
+        return cap
+    return min(cap, budget)
+
+
+def bound_candidate(text, max_chars=None, category=None):
+    """Keep replacement output below the hook's inline spill threshold.
+
+    Args:
+        text (str): Candidate replacement text; returned unchanged when it
+            already fits.
+        max_chars (int | None): Explicit budget in characters. ``None`` derives
+            the budget from ``category`` through :func:`shown_budget`.
+        category (str | None): Content category used for the per-category
+            budget. Ignored when ``max_chars`` is given, so existing callers
+            keep their exact behavior.
+
+    Returns:
+        str: ``text`` itself, or its verbatim head and tail joined by one
+        ``BOUND_MARKER_TEMPLATE`` marker naming the omitted character count.
+        The result never exceeds the resolved budget.
+
+    Pure and deterministic for equal inputs and environment.
+    """
     if max_chars is None:
-        max_chars = max(256, int(os.environ.get("TOKENPIPE_MAX_SHOWN_CHARS", "7000")))
+        max_chars = shown_budget(category)
     if len(text) <= max_chars:
         return text
-    marker_template = "\n...[tokenpipe bounded output; omitted %d chars; use raw_ref]...\n"
     # The omitted count affects marker width. A short fixed-point loop converges
     # even when the number crosses a decimal digit boundary.
     omitted = max(0, len(text) - max_chars)
     for _ in range(4):
-        marker = marker_template % omitted
+        marker = BOUND_MARKER_TEMPLATE % omitted
         available = max(2, max_chars - len(marker))
         head = max(1, int(available * 0.60))
         tail = max(1, available - head)
         omitted = max(0, len(text) - head - tail)
-    marker = marker_template % omitted
+    marker = BOUND_MARKER_TEMPLATE % omitted
     overflow = max(0, head + len(marker) + tail - max_chars)
     head = max(1, head - overflow)
     return text[:head] + marker + text[-tail:]
+
+
+RECOVERY_PREVIEW_TEMPLATE = (
+    "omitted %d chars; fetch the elided middle with: %s show %s --range %d:%d")
+
+
+def _recovery_command():
+    """Return the invocation prefix that re-runs this script for recovery.
+
+    Returns:
+        str: Shell-quoted ``<interpreter> <script path>`` pair, using
+        ``sys.executable`` (falling back to ``python3`` in a frozen or
+        interpreter-less environment) and this module's absolute path.
+    """
+    return "%s %s" % (
+        shlex.quote(sys.executable or "python3"), shlex.quote(os.path.abspath(__file__)))
+
+
+def _omitted_span(shown, original):
+    """Locate the character span of ``original`` that bounding elided.
+
+    Args:
+        shown (str): Bounded replacement text, expected to hold exactly one
+            :data:`BOUND_MARKER_TEMPLATE` marker between a verbatim head and
+            tail of ``original``.
+        original (str): Exact pre-compression text the raw file preserves.
+
+    Returns:
+        tuple[int, int] | None: Half-open ``[start, end)`` character offsets of
+        the omitted middle in ``original``, or ``None`` when ``shown`` carries
+        no marker or no marker position reproduces ``original``'s head and
+        tail. A marker that merely occurs inside the content is rejected by
+        that verification rather than reported as a span.
+    """
+    for match in BOUND_MARKER_RE.finditer(shown):
+        start = match.start()
+        end = len(original) - (len(shown) - match.end())
+        if 0 <= start < end <= len(original) and shown[:start] == original[:start] \
+                and shown[match.end():] == original[end:]:
+            return start, end
+    return None
+
+
+def recovery_preview(shown, original, raw_ref, command=None):
+    """Describe, in one line, how to fetch the middle that bounding removed.
+
+    Args:
+        shown (str): Replacement text exactly as the model will see it.
+        original (str): Exact original output stored at ``raw_ref``.
+        raw_ref (str | None): Recovery path of the spooled original; a falsy
+            value yields no preview because nothing can be fetched.
+        command (str | None): Invocation prefix placed before ``show``.
+            ``None`` uses :func:`_recovery_command`.
+
+    Returns:
+        str: ``omitted <n> chars; fetch the elided middle with: <command> show
+        <raw_ref> --range <start>:<end>`` where ``<n>`` is the true omitted
+        length and the range is the character span of the omitted middle in the
+        original. Returns ``""`` when the output was not bounded or the span
+        cannot be verified, so callers can append it unconditionally.
+
+    Pure apart from reading ``sys.executable`` and this module's path.
+    """
+    if not raw_ref:
+        return ""
+    span = _omitted_span(shown, original)
+    if span is None:
+        return ""
+    start, end = span
+    return RECOVERY_PREVIEW_TEMPLATE % (
+        end - start, command or _recovery_command(), raw_ref, start, end)
 
 
 def command_category(payload):
@@ -1626,7 +1774,7 @@ CLAUDE_RECOVERY_MARKER = "tokenpipe-claude-v1"
 CLAUDE_RECOVERY_TEMPLATE = "%s compressed %s; recover with: %s <raw_ref>"
 
 
-def post_recovery_header(mode, strategy, exit_status, raw_ref):
+def post_recovery_header(mode, strategy, exit_status, raw_ref, preview=""):
     """Render the Codex PostToolUse recovery header shown with a replacement.
 
     The Codex hook prefixes replaced output with this single line so the reader
@@ -1641,16 +1789,24 @@ def post_recovery_header(mode, strategy, exit_status, raw_ref):
             value renders ``unknown``.
         exit_status (int | None): Child exit status; ``None`` omits the field.
         raw_ref (str): Absolute recovery path of the spooled raw output.
+        preview (str): One-line recovery preview from :func:`recovery_preview`
+            naming the elided middle; ``""`` (the default) adds nothing.
 
     Returns:
-        str: One header line with no trailing newline. Pure function: no I/O
-        and no dependence on process state.
+        str: One header line with no trailing newline. A non-empty ``preview``
+        follows the ``raw_ref`` field after a ``"; "`` separator, the same
+        shape :func:`_native_header` uses. Pure function: no I/O and no
+        dependence on process state.
     """
     exit_field = " exit=%d" % exit_status if isinstance(exit_status, int) else ""
-    return POST_HEADER_TEMPLATE % (mode, strategy or "unknown", exit_field, raw_ref)
+    line = POST_HEADER_TEMPLATE % (mode, strategy or "unknown", exit_field, raw_ref)
+    if preview:
+        line += "; " + preview
+    return line
 
 
-def claude_recovery_header(references, recover_command, marker=CLAUDE_RECOVERY_MARKER):
+def claude_recovery_header(references, recover_command, marker=CLAUDE_RECOVERY_MARKER,
+                           previews=()):
     """Render the Claude ``additionalContext`` recovery line for a replacement.
 
     Shares the ownership rule of :func:`post_recovery_header`: the hook renders
@@ -1664,11 +1820,21 @@ def claude_recovery_header(references, recover_command, marker=CLAUDE_RECOVERY_M
             the raw output, rendered before the ``<raw_ref>`` placeholder.
         marker (str): Host marker opening the line; defaults to
             :data:`CLAUDE_RECOVERY_MARKER`.
+        previews (Iterable[str]): Per-stream recovery previews from
+            :func:`recovery_preview`, each already named by its stream, for
+            example ``"stdout omitted 4200 chars; ..."``. Empty entries are
+            dropped; the default adds nothing.
 
     Returns:
-        str: One context line with no trailing newline. Pure function.
+        str: One context line with no trailing newline. Every non-empty preview
+        follows the recovery command, each after a ``"; "`` separator. Pure
+        function.
     """
-    return CLAUDE_RECOVERY_TEMPLATE % (marker, ", ".join(references), recover_command)
+    line = CLAUDE_RECOVERY_TEMPLATE % (marker, ", ".join(references), recover_command)
+    kept = [preview for preview in previews if preview]
+    if kept:
+        line += "; " + "; ".join(kept)
+    return line
 
 
 def _raw_ref_placeholder(root=None):
@@ -1689,7 +1855,38 @@ def _raw_ref_placeholder(root=None):
     )
 
 
-def _replacement_overhead_estimate(raw_ref_placeholder=None):
+_PREVIEW_PLACEHOLDER_CHARS = max(SHOWN_BUDGET_CHARS.values())
+"""Character count the placeholder recovery preview is priced with (int).
+
+The gate decides before the real omitted span is known, so the placeholder is
+built from the widest per-category budget (:data:`SHOWN_BUDGET_CHARS`) used as
+both the omitted length and the first ``--range`` offset, with the second
+offset at twice that. Deriving it from the budgets keeps the number
+deterministic and as wide as a bounded replacement's own preview normally gets;
+output far larger than one budget can carry offsets with one or two more
+digits, which the estimator charges a fraction of a token for.
+"""
+
+
+def _preview_placeholder(raw_ref):
+    """Return a representative recovery preview line for header pricing.
+
+    Args:
+        raw_ref (str): Recovery path to render, normally the placeholder from
+            :func:`_raw_ref_placeholder`; its length dominates the line.
+
+    Returns:
+        str: A :data:`RECOVERY_PREVIEW_TEMPLATE` line whose numbers come from
+        :data:`_PREVIEW_PLACEHOLDER_CHARS`, so the same input always yields the
+        same text. Reads ``sys.executable`` and this module's path through
+        :func:`_recovery_command`; creates and reads nothing.
+    """
+    return RECOVERY_PREVIEW_TEMPLATE % (
+        _PREVIEW_PLACEHOLDER_CHARS, _recovery_command(), raw_ref,
+        _PREVIEW_PLACEHOLDER_CHARS, 2 * _PREVIEW_PLACEHOLDER_CHARS)
+
+
+def _replacement_overhead_estimate(raw_ref_placeholder=None, bounded=False):
     """Estimate the token cost of the recovery header a host adds to output.
 
     A replacement never ships alone: the Codex hook prepends
@@ -1699,10 +1896,19 @@ def _replacement_overhead_estimate(raw_ref_placeholder=None):
     fields are priced with representative values because the caller decides
     before those are final; the recovery path dominates the length.
 
+    A bounded replacement makes both headers longer: each carries the
+    ``show --range`` preview naming the elided middle. Pricing the header
+    without that line would under-charge exactly the replacements it is longest
+    for, so ``bounded`` adds a deterministic placeholder preview
+    (:func:`_preview_placeholder`).
+
     Args:
         raw_ref_placeholder (str | None): Representative recovery path standing
             in for the not-yet-spooled reference; ``None`` uses
             :func:`_raw_ref_placeholder`.
+        bounded (bool): True when the replacement being priced would elide a
+            middle section and therefore ship a recovery preview. False, the
+            default, prices the bare header.
 
     Returns:
         int: Non-negative ``estimate_tokens`` cost of one recovery header, or
@@ -1712,10 +1918,12 @@ def _replacement_overhead_estimate(raw_ref_placeholder=None):
     """
     try:
         reference = raw_ref_placeholder or _raw_ref_placeholder()
-        codex = post_recovery_header("audit", "passthrough", 0, reference)
+        preview = _preview_placeholder(reference) if bounded else ""
+        codex = post_recovery_header("audit", "passthrough", 0, reference, preview)
         claude = claude_recovery_header(
             ["stdout raw_ref=" + reference],
             "/usr/bin/python3 %s show" % os.path.abspath(__file__),
+            previews=["stdout " + preview] if preview else (),
         )
         return max(estimate_tokens(codex), estimate_tokens(claude))
     except Exception:  # fail open: header pricing must never block output
@@ -1741,17 +1949,23 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
 
     Returns:
         dict[str, object]: Compression decision, shown output, recovery path,
-        estimates, and bounded diagnostic metadata.
+        estimates, and bounded diagnostic metadata. ``recovery_preview`` holds
+        the one-line ``show --range`` sentence from :func:`recovery_preview`,
+        or ``""`` when nothing was elided.
 
     Output estimated below ``TOKENPIPE_MIN_TOKENS_ESTIMATE`` and any ``binary``
     output stays byte-exact. Above that threshold ``code``, ``diff`` and
     ``config`` are bounded to their verbatim head and tail under a
     ``bounded-<category>`` strategy, subject to the same category gate, raw
-    spooling, and recovery validation as every other replacement.
+    spooling, and recovery validation as every other replacement. Every
+    replacement is bounded by its content category's budget (see
+    :func:`shown_budget`), which the metric records as ``budget_chars``.
 
     A replacement also costs the reader the recovery header its host renders
-    with it (:func:`_replacement_overhead_estimate`). When the compressed
-    candidate saves no more than that header, the exact original is returned
+    with it (:func:`_replacement_overhead_estimate`), including the
+    ``show --range`` preview a bounded candidate's header carries. When the
+    compressed candidate saves no more than that header, the exact original is
+    returned
     with ``skip_reason="net-loss"`` and nothing is spooled; the metric
     counterfactual still measures the compressed candidate so ``stats`` keeps
     reporting the unrealized potential.
@@ -1820,13 +2034,18 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
             skip_reason = "binary-passthrough"
         else:
             strategy, candidate = compress(original, category)
-            candidate = bound_candidate(candidate)
+            candidate = bound_candidate(candidate, category=category)
             candidate_est = estimate_tokens(candidate)
+            # A bounded candidate ships a longer header: it carries the
+            # recovery preview naming the elided span, so price that line too.
+            candidate_overhead = (
+                _replacement_overhead_estimate(bounded=True)
+                if BOUND_MARKER_RE.search(candidate) else overhead_est)
             if candidate_est >= original_est:
                 candidate = original
                 strategy = "passthrough"
                 skip_reason = "no-savings"
-            elif candidate_est + overhead_est >= original_est:
+            elif candidate_est + candidate_overhead >= original_est:
                 # Every replacement also costs the reader one recovery header,
                 # so a saving no larger than that header is a net loss.
                 net_loss_candidate = candidate
@@ -1840,10 +2059,11 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
         compressor_error = type(exc).__name__
 
     if repeat_replace and estimate_tokens(repeat_notice) >= estimate_tokens(candidate):
-        # Notice and compressed candidate ship with the same recovery header,
-        # so the smaller body wins the shown output; a tie keeps the candidate,
-        # which carries more of the original. The counterfactual below still
-        # measures the notice.
+        # Both ship with a recovery header, so the smaller body wins the shown
+        # output; a tie keeps the candidate, which carries more of the
+        # original. Comparing bodies alone only ever favors the candidate,
+        # whose header may additionally carry a preview. The counterfactual
+        # below still measures the notice.
         repeat_replace = False
     if repeat_replace:
         # Only the explicit gate lets the notice reach the shown output; the
@@ -1935,9 +2155,8 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
         "skip_reason": skip_reason,
         "raw_ref_present": bool(raw_ref),
         "compressor_error": compressor_error,
-        "audit_overflow": mode == "audit" and len(original) > max(
-            256, int(os.environ.get("TOKENPIPE_MAX_SHOWN_CHARS", "7000"))
-        ),
+        "budget_chars": shown_budget(category),
+        "audit_overflow": mode == "audit" and len(original) > _global_shown_cap(),
         "rtk_used": False,
     }
     if record_metric:
@@ -1954,6 +2173,7 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
         "strategy": strategy,
         "content_category": category,
         "raw_ref": raw_ref,
+        "recovery_preview": recovery_preview(shown, original, raw_ref),
         "original_tokens_estimate": original_est,
         "shown_tokens_estimate": shown_est,
         "counterfactual_tokens_estimate": counterfactual_est,
@@ -2274,7 +2494,23 @@ def set_configured_rtk(path):
     return configured_rtk()
 
 
-def _native_header(category, exit_status, mode, strategy, raw_ref=None):
+def _native_header(category, exit_status, mode, strategy, raw_ref=None, preview=""):
+    """Render the single marker line that precedes native tool output.
+
+    Args:
+        category (str): Coarse command category; sanitized before use.
+        exit_status (int): Child exit status rendered as ``exit=<n>``.
+        mode (str): Effective ``audit``, ``safe``, or ``full`` mode.
+        strategy (str): Compression strategy name, ``passthrough`` when none.
+        raw_ref (str | None): Recovery path; omitted from the line when falsy.
+        preview (str): One-line recovery preview from :func:`recovery_preview`;
+            an empty string (the default) adds nothing.
+
+    Returns:
+        str: Space-separated ``key=value`` fields starting at byte zero with
+        :data:`NATIVE_MARKER`, terminated by exactly one newline, so hooks can
+        recognize already-processed native output.
+    """
     fields = [
         NATIVE_MARKER,
         "category=" + _safe_component(category, "unknown"),
@@ -2284,7 +2520,10 @@ def _native_header(category, exit_status, mode, strategy, raw_ref=None):
     ]
     if raw_ref:
         fields.append("raw_ref=" + raw_ref)
-    return " ".join(fields) + "\n"
+    line = " ".join(fields)
+    if preview:
+        line += "; " + preview
+    return line + "\n"
 
 
 def _label_streams(stdout, stderr):
@@ -2294,7 +2533,7 @@ def _label_streams(stdout, stderr):
 def _metric_base(payload, mode, category, strategy, content_category, original, shown,
                  counterfactual, exit_status, skip_reason, raw_ref, compressor_error,
                  started, native_header_bytes=0, audit_overflow=False, rtk_used=False,
-                 repeat_of_previous=False):
+                 repeat_of_previous=False, budget_chars=0):
     """Build one bounded metric row for the native and skip recording paths.
 
     Args:
@@ -2319,6 +2558,9 @@ def _metric_base(payload, mode, category, strategy, content_category, original, 
         repeat_of_previous (bool): True when this exact output was already
             recorded for the same identity; paths without cross-call repeat
             detection leave it false.
+        budget_chars (int): Shown-character budget that bounded this output
+            (see :func:`shown_budget`); ``0`` when no output was bounded, as on
+            the output-free skip path.
 
     Returns:
         dict[str, object]: A JSON-serializable metric row tagged with
@@ -2352,6 +2594,7 @@ def _metric_base(payload, mode, category, strategy, content_category, original, 
         "exit_status": exit_status, "skip_reason": skip_reason,
         "raw_ref_present": bool(raw_ref), "compressor_error": compressor_error,
         "audit_overflow": bool(audit_overflow),
+        "budget_chars": int(budget_chars),
         "rtk_used": bool(rtk_used),
         "repeat_of_previous": bool(repeat_of_previous),
     }
@@ -2381,8 +2624,9 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
     ``TOKENPIPE_MIN_TOKENS_ESTIMATE`` stay byte-exact with a
     ``<category>-passthrough`` skip reason; larger protected output is bounded
     to its verbatim head and tail like any other replacement. A replacement
-    widens the native header by its recovery reference: when the compressed
-    body saves no more than that widening, the exact body is kept with
+    widens the native header by its recovery reference, and by the recovery
+    preview when the body was bounded: when the compressed body saves no more
+    than that widening, the exact body is kept with
     ``skip_reason="net-loss"`` and no raw file is written, while the metric
     counterfactual still measures the compressed body.
     Capture/compressor/metric failures preserve execution or fail open without
@@ -2489,7 +2733,7 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
         if capture_overflow:
             strategy = "capture-overflow"
             skip_reason = "capture-overflow"
-            candidate = bound_candidate(body)
+            candidate = bound_candidate(body, category=content_category)
         elif content_category == "binary" or (
             content_category in ("code", "diff", "config") and estimate_tokens(body) < threshold
         ):
@@ -2505,15 +2749,18 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
             else:
                 compressed_strategy, candidate = compress(body, content_category)
             strategy = ("rtk-direct+" if rtk_used else "") + compressed_strategy
-            candidate = bound_candidate(candidate)
+            candidate = bound_candidate(candidate, category=content_category)
             candidate_est = estimate_tokens(candidate)
             body_est = estimate_tokens(body)
             passthrough_strategy = "rtk-direct" if rtk_used else "passthrough"
-            # A replacement widens the native header by the recovery reference;
-            # price that difference against the saving before replacing.
+            # A replacement widens the native header by the recovery reference,
+            # plus the recovery preview when the body was bounded; price that
+            # whole difference against the saving before replacing.
+            placeholder_ref = _raw_ref_placeholder(_runtime_raw_root())
             overhead_est = max(0, estimate_tokens(_native_header(
-                supplied_category, exit_status, mode, strategy,
-                _raw_ref_placeholder(_runtime_raw_root()),
+                supplied_category, exit_status, mode, strategy, placeholder_ref,
+                _preview_placeholder(placeholder_ref)
+                if BOUND_MARKER_RE.search(candidate) else "",
             )) - estimate_tokens(_native_header(
                 supplied_category, exit_status, mode, passthrough_strategy, None,
             )))
@@ -2562,7 +2809,9 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
             skip_reason = "raw-spool-error"
             compressor_error = "raw-spool-" + type(exc).__name__
     shown_body = candidate if replace else body
-    shown_header = _native_header(supplied_category, exit_status, mode, strategy, raw_ref)
+    shown_header = _native_header(
+        supplied_category, exit_status, mode, strategy, raw_ref,
+        recovery_preview(shown_body, body, raw_ref))
     shown = shown_header + shown_body
     original_header = _native_header(supplied_category, exit_status, mode, "passthrough", None)
     original_native = original_header + body
@@ -2575,8 +2824,8 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
         payload, mode, supplied_category, strategy, content_category,
         original_native, shown, counter_native, exit_status, skip_reason, raw_ref,
         compressor_error, started, len(shown_header.encode("utf-8", "replace")),
-        mode == "audit" and len(shown) > max(256, int(os.environ.get("TOKENPIPE_MAX_SHOWN_CHARS", "7000"))),
-        rtk_used,
+        mode == "audit" and len(shown) > _global_shown_cap(),
+        rtk_used, budget_chars=shown_budget(content_category),
     )
     try:
         _append_metric(metric)
@@ -2788,6 +3037,31 @@ def show_raw(path):
         os.close(fd)
 
 
+def _parse_char_range(value):
+    """Parse a ``START:END`` character range from the ``show`` command line.
+
+    Args:
+        value (str): Range text such as ``"3120:7320"``. Surrounding blanks are
+            ignored; both bounds are required decimal integers.
+
+    Returns:
+        tuple[int, int]: Half-open ``[start, end)`` character offsets.
+
+    Raises:
+        ValueError: The text is not exactly two decimal integers separated by
+            one colon, ``start`` is negative, or ``end`` is not greater than
+            ``start``. Offsets beyond the end of the output are accepted and
+            clamp to it, exactly as a Python slice does.
+    """
+    parts = str(value).strip().split(":")
+    if len(parts) != 2 or not all(part.strip().isdigit() for part in parts):
+        raise ValueError("--range must be START:END with two character offsets")
+    start, end = int(parts[0]), int(parts[1])
+    if end <= start:
+        raise ValueError("--range END must be greater than START")
+    return start, end
+
+
 def main(argv=None):
     """Run one command-line invocation of the local compressor.
 
@@ -2797,7 +3071,8 @@ def main(argv=None):
 
     Returns:
         int: Process exit status. ``0`` on success, ``2`` for an unusable
-        recovery reference or settings value, and the child status for ``exec``.
+        recovery reference, malformed ``show --range``, or settings value, and
+        the child status for ``exec``.
 
     Side effects depend on the subcommand: ``post`` may spool raw output and
     append metrics, ``mode``/``post-replace``/``repeat-replace``/``rtk`` rewrite
@@ -2816,6 +3091,9 @@ def main(argv=None):
     stats.add_argument("--session")
     show = commands.add_parser("show", help="print a recoverable raw output")
     show.add_argument("raw_ref")
+    show.add_argument(
+        "--range", dest="char_range", metavar="START:END",
+        help="print only characters [START, END) of the decoded raw output")
     mode_cmd = commands.add_parser("mode", help="print or persist audit/safe/full mode")
     mode_cmd.add_argument("value", nargs="?", choices=("audit", "safe", "full"))
     replace_cmd = commands.add_parser(
@@ -2890,7 +3168,11 @@ def main(argv=None):
         return 0
     if args.command == "show":
         try:
-            sys.stdout.write(show_raw(args.raw_ref))
+            text = show_raw(args.raw_ref)
+            if args.char_range is not None:
+                start, end = _parse_char_range(args.char_range)
+                text = text[start:end]
+            sys.stdout.write(text)
         except (OSError, ValueError) as exc:
             print("tokenpipe: %s" % exc, file=sys.stderr)
             return 2

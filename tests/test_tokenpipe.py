@@ -344,8 +344,8 @@ class TokenpipeTests(unittest.TestCase):
     def test_native_allowlisted_config_outputs_remain_exact_passthrough(self):
         """Config output within the shown-character cap stays byte-exact."""
         for index, sample in enumerate((
-            "root:\n  child: value\n" * 300,
-            "[section]\nkey = value\n" * 300,
+            "root:\n  child: value\n" * 200,
+            "[section]\nkey = value\n" * 200,
         )):
             rg = self.executable("rg", "print(%r, end='')\n" % sample)
             output, status = tokenpipe.execute_native(
