@@ -11,10 +11,12 @@ import argparse
 import datetime as _dt
 import errno
 import fcntl
+import hashlib
 import json
 import math
 import os
 import re
+import shlex
 import shutil
 import signal
 import stat
@@ -29,6 +31,29 @@ import uuid
 VERSION = "0.2.1"
 ANSI_RE = re.compile(r"\x1b(?:[@-_][0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 SECRET_KEY_RE = re.compile(r"(?i)(token|secret|password|authorization|api[_-]?key|cookie)")
+# Bound on how much output the secret guard inspects, in characters.
+SECRET_SCAN_CHARS = 256 * 1024
+# A key word from SECRET_KEY_RE (reused verbatim, plus `passwd`, which no JSON
+# key spells) directly assigned a value of eight or more non-blank characters.
+# The optional quote before the separator is what also matches a JSON member
+# such as `"token": "<value>"`; prose mentioning a key word without assigning
+# a value never matches.
+SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?:passwd|%s)['\"]?\s*[=:]\s*['\"]?[^\s'\"]{8,}"
+    % SECRET_KEY_RE.pattern.replace("(?i)", "", 1),
+    re.IGNORECASE,
+)
+# Credential shapes refused before raw spooling; see :func:`_looks_like_secret`.
+SECRET_RES = (
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),  # PEM private key block
+    re.compile(r"AKIA[0-9A-Z]{16}"),  # AWS access key id
+    re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),  # GitHub token
+    re.compile(r"sk-[A-Za-z0-9_-]{20,}"),  # OpenAI/Anthropic-style API key
+    re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),  # Slack token
+    re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),  # JWT
+    re.compile(r"(?i)authorization\s*:\s*bearer\s+\S{20,}"),  # bearer credential header
+    SECRET_ASSIGNMENT_RE,
+)
 ERROR_RE = re.compile(
     r"(?i)(error|failed|failure|fatal|panic|exception|traceback|assert|timeout|"
     r"segmentation|denied|not found|(?:http(?:/[0-9.]+)?\s+|"
@@ -53,6 +78,23 @@ CONFIG_RE = re.compile(
     r"(?m)(^\s*\[[A-Za-z0-9_.-]+\]\s*$|^\s*[A-Za-z_][A-Za-z0-9_.-]*\s*=\s*\S+|"
     r"^\s*[A-Za-z_][A-Za-z0-9_.-]*:\s+\S+)"
 )
+# Search-result shapes: `path:line:text` (ripgrep, `grep -n`), `path:text`
+# (`grep` without `-n`), `path-line-text` (grep context), and bare path
+# listings (`find`, `git ls-files`). A path never contains whitespace or a
+# colon and must carry a directory separator (an extension dot is enough only
+# for the numbered forms), so `tool: message`, `key: value`, and timestamped
+# log lines are never read as search results.
+_SEARCH_PATH = r"[^\s:]*?[./][^\s:]*?"
+_SEARCH_DIR_PATH = r"[^\s:]*?/[^\s:]*?"
+MATCH_LINE_RE = re.compile(r"^(%s):(\d+):" % _SEARCH_PATH)
+PLAIN_MATCH_RE = re.compile(r"^(%s):" % _SEARCH_DIR_PATH)
+CONTEXT_LINE_RE = re.compile(r"^(%s)-(\d+)-" % _SEARCH_PATH)
+PATH_LINE_RE = re.compile(r"^(%s)$" % _SEARCH_DIR_PATH)
+# Shape detection samples the leading non-empty lines only; below the minimum
+# line count, search output is left exactly as produced.
+_SEARCH_SAMPLE_LINES = 200
+_SEARCH_MIN_LINES = 12
+_SEARCH_SHAPE_RATIO = 0.8
 
 
 def plugin_version():
@@ -76,6 +118,21 @@ def _raw_root():
 
 def _metrics_path():
     return os.path.join(_home(), "metrics.jsonl")
+
+
+def _home_id():
+    """Return a short stable identifier for the active ``TOKENPIPE_HOME``.
+
+    Returns:
+        str: The first 12 hexadecimal characters of the SHA-256 digest of the
+        resolved home path. The value is stable for one home and differs
+        between homes, but is not reversible to a filesystem path.
+
+    Metric rows carry this identifier so that rows appended to the shared
+    runtime metrics file can be attributed back to the home that produced
+    them. It is deliberately a digest: no user-local path may enter metrics.
+    """
+    return hashlib.sha256(_home().encode("utf-8", "replace")).hexdigest()[:12]
 
 
 def _runtime_home():
@@ -176,11 +233,134 @@ def _mkdir_private(path):
     os.close(directory_fd)
 
 
-def estimate_tokens(text):
-    """Return a clearly approximate o200k-like token count.
+TOKEN_CLASS_RATIOS = {
+    "hexid": 1.8,
+    "cjk": 1.0,
+    "prose": 4.0,
+    "letters": 2.0,
+    "digits": 2.5,
+    "space": 4.0,
+    "punct": 1.5,
+    "symbol": 1.0,
+}
+"""Characters per estimated token, keyed by character class (str -> float).
 
-    UTF-8 byte length / 3.5 is intentionally conservative for mixed source code,
-    JSON, and English logs. It is not provider usage accounting.
+A single bytes-per-token average hides a threefold spread between classes: a
+subword vocabulary merges English words into few long tokens, keeps punctuation
+and operators as roughly one token each, and splits hashes, identifiers, and
+non-Latin scripts into very short pieces. Charging each class separately stops
+hex/base64 identifiers from being under-counted by about 70% and stops prose
+from being over-counted. The per-class idea follows the ``tokenx`` project
+(MIT); the hex/base64 class is an addition here and no code was copied.
+
+The values are heuristics calibrated against published OpenAI ``o200k``-style
+measurements, not against the Claude tokenizer, and are never provider usage
+accounting.
+
+Keys:
+    hexid (float): Hex, base64, and mixed alphanumeric runs of eight or more
+        characters, including one absorbed leading space.
+    cjk (float): CJK ideographs, kana, Hangul, and fullwidth forms.
+    prose (float): ASCII letter words, including one absorbed leading space,
+        because a subword vocabulary merges ``" word"`` into one token.
+    letters (float): Non-ASCII alphabetic scripts such as Cyrillic or Greek,
+        including one absorbed leading space.
+    digits (float): Digit runs, which split into short groups.
+    space (float): Characters of a whitespace run; a run holding a line break
+        or other non-space whitespace costs one whole token for the run plus
+        this rate for each further character.
+    punct (float): ASCII punctuation and operators.
+    symbol (float): Emoji and other symbols, counted in UTF-16 code units so a
+        non-BMP character costs two.
+"""
+
+TOKEN_CLASS_RE = re.compile(
+    r"(?P<hexid>[ ]?(?:(?=[0-9A-Za-z]*[0-9])(?=[0-9A-Za-z]*[A-Za-z])[0-9A-Za-z]{8,}"
+    r"|(?=[0-9A-Fa-f]*[A-Fa-f])[0-9A-Fa-f]{8,}))"
+    r"|(?P<cjk>[\u2e80-\u303f\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff"
+    r"\uac00-\ud7af\uf900-\ufaff\uff00-\uffef]+)"
+    r"|(?P<prose>[ ]?[A-Za-z]+)"
+    r"|(?P<letters>[ ]?[^\W\d_]+)"
+    r"|(?P<digits>[0-9]+)"
+    r"|(?P<space>\s+)"
+    r"|(?P<punct>[!-/:-@\[-`{-~]+)"
+    r"|(?P<symbol>.)",
+    re.DOTALL,
+)
+"""Ordered alternation that splits text into one run per ``TOKEN_CLASS_RATIOS``
+class (``re.Pattern``).
+
+Every alternative consumes at least one character and the trailing ``symbol``
+alternative matches anything left, so ``finditer`` partitions the input exactly
+once and the estimator stays linear in the input length. Order is significant:
+identifier runs are tried before words and digits so a hash is not read as
+prose, and ``cjk`` is tried before ``letters`` because both accept ideographs.
+The group name of a match (``Match.lastgroup``) is the class name.
+"""
+
+_TOKEN_CLASS_COST = dict((name, 1.0 / ratio) for name, ratio in TOKEN_CLASS_RATIOS.items())
+"""Estimated tokens per character, keyed by character class (str -> float).
+
+The inverse of ``TOKEN_CLASS_RATIOS``, precomputed once so the estimator's inner
+loop is one dictionary lookup and one multiplication per run.
+"""
+
+
+def estimate_tokens(text):
+    """Return a clearly approximate token count from character-class ratios.
+
+    One left-to-right pass over ``TOKEN_CLASS_RE`` splits the text into runs of
+    a single character class and charges each run at its ``TOKEN_CLASS_RATIOS``
+    rate. A whitespace run holding a line break or other non-space whitespace
+    also costs one whole token for the run itself; a run of plain spaces does
+    not, because a lone space is already absorbed into the following word run.
+    A non-BMP symbol is charged as its two UTF-16 code units.
+
+    Args:
+        text (str | None): Text to estimate. ``None``, ``""``, and any other
+            falsy value are accepted.
+
+    Returns:
+        int: Estimated token count. ``0`` for empty input, otherwise at least
+        ``1``. The result never decreases when text is appended.
+
+    Note:
+        This is a local estimate for measurement only, not provider usage
+        accounting. ``estimate_tokens_bytes`` keeps the previous UTF-8-byte
+        formula for one release.
+    """
+    if not text:
+        return 0
+    total = 0.0
+    space_cost = _TOKEN_CLASS_COST["space"]
+    for match in TOKEN_CLASS_RE.finditer(text):
+        name = match.lastgroup
+        length = match.end() - match.start()
+        if name == "space":
+            if match.group().strip(" "):
+                total += 1.0 + (length - 1) * space_cost
+            else:
+                total += length * space_cost
+        elif name == "symbol":
+            total += 2.0 if ord(match.group()) > 0xFFFF else 1.0
+        else:
+            total += length * _TOKEN_CLASS_COST[name]
+    return max(1, int(math.ceil(total)))
+
+
+def estimate_tokens_bytes(text):
+    """Return the previous UTF-8-byte token estimate, kept for one release.
+
+    Retained so the compression lab can report the shift introduced by the
+    character-class estimator. The runtime itself no longer calls it.
+
+    Args:
+        text (str | None): Text to estimate. ``None``, ``""``, and any other
+            falsy value are accepted.
+
+    Returns:
+        int: ``ceil(utf8_bytes / 3.5)``. ``0`` for empty input, otherwise at
+        least ``1``.
     """
     if not text:
         return 0
@@ -235,6 +415,51 @@ def set_post_replace(value):
     _write_settings(settings)
 
 
+def configured_repeat_replace():
+    """Report whether exact-repeat notices may replace shown output.
+
+    Returns:
+        bool: True only when ``TOKENPIPE_REPEAT_REPLACE`` is exactly ``1``, or
+        the variable is unset and the persisted ``repeat_replace`` setting is
+        ``1``. Every other value, an absent setting, and an unreadable or
+        malformed settings file all read as disabled.
+
+    Reads the environment and the private settings file; it never writes.
+    The gate alone never replaces output: the mode must also be ``safe`` or
+    ``full`` and the earlier raw copy must still read back byte-for-byte.
+    """
+    value = os.environ.get("TOKENPIPE_REPEAT_REPLACE")
+    if value is None:
+        value = configured_settings().get("repeat_replace")
+    return str(value).strip() == "1"
+
+
+def set_repeat_replace(value):
+    """Persist or clear the exact-repeat replacement gate in private settings.
+
+    Args:
+        value (str | None): ``"1"`` enables replacement; ``"off"``, ``"0"``,
+            ``""``, and ``None`` remove the setting. Any other string is stored
+            verbatim and therefore reads back as disabled.
+
+    Returns:
+        None
+
+    Raises:
+        OSError: The private settings file cannot be written.
+        ValueError: The settings directory is not private and user-owned.
+
+    Rewrites ``config.json`` atomically with mode ``0600``; no other state is
+    touched. ``TOKENPIPE_REPEAT_REPLACE`` still overrides the stored value.
+    """
+    settings = configured_settings()
+    if value in ("off", "0", "", None):
+        settings.pop("repeat_replace", None)
+    else:
+        settings["repeat_replace"] = value
+    _write_settings(settings)
+
+
 def _safe_component(value, fallback):
     value = str(value or fallback)
     value = re.sub(r"[^A-Za-z0-9_.-]", "_", value)[:96]
@@ -273,6 +498,34 @@ def _write_all(fd, data):
         if count <= 0:
             raise OSError(errno.EIO, "short write")
         written += count
+
+
+def _looks_like_secret(text):
+    """Report whether output looks like it carries a live credential.
+
+    Args:
+        text (str | None): Candidate raw tool output. It is only matched
+            against :data:`SECRET_RES`; no part of it is logged, stored,
+            returned, or recorded in metrics.
+
+    Returns:
+        bool: True when a credential shape appears in the scanned window,
+        otherwise False. Non-string and empty input is False.
+
+    Security invariant: a True verdict must make the caller skip
+    :func:`spool_raw`, skip replacement, and return the exact original output.
+    This is a refusal, not a redaction: the output itself is never rewritten,
+    so nothing is hidden from the host and nothing lands under the raw spool.
+
+    Cost bound: only the first :data:`SECRET_SCAN_CHARS` characters are
+    scanned, so a credential further into a very large output, or one
+    straddling that boundary, is deliberately not detected. Deterministic and
+    side-effect free; it never raises for ``str`` or ``None`` input.
+    """
+    if not isinstance(text, str) or not text:
+        return False
+    window = text[:SECRET_SCAN_CHARS]
+    return any(pattern.search(window) for pattern in SECRET_RES)
 
 
 def spool_raw(text, session_id, tool_call_id, root=None):
@@ -323,6 +576,79 @@ def spool_raw(text, session_id, tool_call_id, root=None):
         raise OSError(errno.EEXIST, "could not allocate unique raw spool file")
     finally:
         os.close(directory_fd)
+
+
+def _cleanup_stamp_path(root=None):
+    """Return the path of the amortized-cleanup stamp file.
+
+    Args:
+        root (str | None): Spool root; defaults to the user raw-output root.
+
+    Returns:
+        str: Path of the ``.last-cleanup`` marker inside that root. The file
+        is always empty; only its mtime carries information.
+    """
+    return os.path.join(root or _raw_root(), ".last-cleanup")
+
+
+def _cleanup_due(now=None, root=None):
+    """Report whether spool cleanup should run again for this root.
+
+    Args:
+        now (float | None): Unix timestamp used for deterministic tests;
+            defaults to the current wall clock.
+        root (str | None): Spool root; defaults to the user raw-output root.
+
+    Returns:
+        bool: True when the stamp is missing, is not a regular file, is older
+        than ``TOKENPIPE_CLEANUP_INTERVAL_SECONDS`` (default 600, clamped to a
+        minimum of 0 so ``0`` runs cleanup every time), or cannot be read.
+
+    Fail-open by construction: any unreadable stamp, malformed interval, or
+    stat error reports True, which restores the previous behavior of cleaning
+    on every replacement. It never creates or writes a file.
+    """
+    try:
+        interval = max(0, int(os.environ.get("TOKENPIPE_CLEANUP_INTERVAL_SECONDS", "600")))
+        if interval <= 0:
+            return True
+        info = os.lstat(_cleanup_stamp_path(root))
+        if not stat.S_ISREG(info.st_mode):
+            return True
+        now = time.time() if now is None else now
+        return (now - info.st_mtime) >= interval
+    except (OSError, TypeError, ValueError):
+        return True
+
+
+def _mark_cleanup(root=None):
+    """Record that spool cleanup just completed for this root.
+
+    Args:
+        root (str | None): Spool root; defaults to the user raw-output root.
+
+    Returns:
+        None
+
+    Creates or updates the mtime of the private ``.last-cleanup`` stamp
+    without following a symlink at the final component. Every failure is
+    swallowed: a stamp that cannot be written only means the next replacement
+    cleans again, which is the pre-amortization behavior.
+    """
+    try:
+        fd = os.open(
+            _cleanup_stamp_path(root),
+            os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+    except OSError:
+        return
+    try:
+        os.utime(fd, None)
+    except (OSError, NotImplementedError, TypeError, ValueError):
+        pass
+    finally:
+        os.close(fd)
 
 
 def cleanup_spool(now=None, root=None, protected=None):
@@ -395,7 +721,237 @@ def cleanup_spool(now=None, root=None, protected=None):
     return total <= max_bytes
 
 
+def _similar_object_keys(value):
+    """Return the shared key set of a homogeneous object array.
+
+    Args:
+        value (list): Parsed JSON array to inspect.
+
+    Returns:
+        list[str] or None: Sorted shared key names when ``value`` holds at
+        least six dictionaries that all expose exactly the same key set;
+        ``None`` for shorter arrays or any non-homogeneous content.
+    """
+    if len(value) < 6 or not isinstance(value[0], dict):
+        return None
+    keys = set(value[0])
+    for item in value:
+        if not isinstance(item, dict) or set(item) != keys:
+            return None
+    return sorted(keys)
+
+
+# Bounds for the private cross-call repeat index. The index only ever holds
+# digests, byte lengths, timestamps, and recovery paths, so these caps bound
+# state growth rather than protecting content.
+REPEAT_INDEX_MAX_ENTRIES = 512
+REPEAT_INDEX_MAX_BYTES = 1024 * 1024
+REPEAT_NOTICE_TEMPLATE = "[tokenpipe] identical to previous output (%d bytes); raw_ref=%s"
+
+
+def _repeat_index_path():
+    """Return the path of the private cross-call repeat index.
+
+    Returns:
+        str: ``repeat-index.json`` inside the active ``TOKENPIPE_HOME``, beside
+        the raw spool. The file may not exist yet.
+    """
+    return os.path.join(_home(), "repeat-index.json")
+
+
+def _repeat_ttl():
+    """Return the repeat-index retention window in seconds.
+
+    Returns:
+        int: ``TOKENPIPE_RAW_TTL_SECONDS`` clamped to a minimum of 0, so index
+        entries never outlive the raw spool they point at. ``0`` disables
+        expiry. A malformed value falls back to the seven-day default.
+    """
+    try:
+        return max(0, int(os.environ.get("TOKENPIPE_RAW_TTL_SECONDS", str(7 * 86400))))
+    except (TypeError, ValueError):
+        return 7 * 86400
+
+
+def _repeat_identity(payload, text):
+    """Derive the opaque identity of one tool output for repeat detection.
+
+    Args:
+        payload (dict[str, object]): Bounded hook payload, read for
+            ``command_category``/``command``, ``tool_name``, and ``session_id``
+            only. It is not mutated.
+        text (str): Exact tool output; hashed, never stored.
+
+    Returns:
+        str: A 64-character hexadecimal SHA-256 digest over the normalized
+        command category, tool name, session id, and the SHA-256 digest of the
+        output bytes. The value is irreversible: no command line, argument,
+        path, or output text can be recovered from it.
+
+    Pure: it performs no I/O and has no side effects.
+    """
+    digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+    parts = (
+        command_category(payload),
+        str(payload.get("tool_name") or ""),
+        str(payload.get("session_id") or ""),
+        digest,
+    )
+    return hashlib.sha256("\x00".join(parts).encode("utf-8", "replace")).hexdigest()
+
+
+def _load_repeat_index():
+    """Read the bounded repeat index, failing safely to an empty mapping.
+
+    Returns:
+        dict[str, object]: Parsed index contents, or ``{}`` when the file is
+        missing, larger than ``REPEAT_INDEX_MAX_BYTES``, unreadable, or not a
+        JSON object. Entry values are not validated here.
+
+    Never raises: a corrupt index only disables repeat suppression.
+    """
+    try:
+        with open(_repeat_index_path(), "r", encoding="utf-8") as handle:
+            if os.fstat(handle.fileno()).st_size > REPEAT_INDEX_MAX_BYTES:
+                return {}
+            value = json.load(handle)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _repeat_lookup(identity, now=None):
+    """Return the live index entry recorded for one identity.
+
+    Args:
+        identity (str): Digest produced by :func:`_repeat_identity`.
+        now (float | None): Unix timestamp for deterministic TTL checks;
+            defaults to the current wall clock.
+
+    Returns:
+        dict[str, object] | None: The stored entry with ``raw_ref`` (str or
+        None), ``bytes`` (int), and ``timestamp`` (float epoch seconds), or
+        ``None`` when no entry exists, the entry is malformed, or it is older
+        than :func:`_repeat_ttl`.
+
+    Read-only and never raises; stale entries are ignored here and reclaimed by
+    the next :func:`_repeat_record`.
+    """
+    entry = _load_repeat_index().get(identity)
+    if not isinstance(entry, dict):
+        return None
+    stamp = entry.get("timestamp")
+    if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
+        return None
+    ttl = _repeat_ttl()
+    now = time.time() if now is None else now
+    if ttl and now - stamp > ttl:
+        return None
+    return entry
+
+
+def _repeat_record(identity, raw_ref, byte_length, now=None):
+    """Record one identity in the private repeat index and prune stale entries.
+
+    Args:
+        identity (str): Digest produced by :func:`_repeat_identity`.
+        raw_ref (str | None): Recovery path of the spooled copy of this output,
+            or ``None`` when nothing was spooled.
+        byte_length (int): UTF-8 byte length of the output, stored for the
+            notice text only.
+        now (float | None): Unix timestamp for deterministic tests; defaults to
+            the current wall clock.
+
+    Returns:
+        None
+
+    Rewrites the whole index atomically as a ``0600`` file inside a ``0700``
+    home, dropping entries past :func:`_repeat_ttl` and keeping only the
+    ``REPEAT_INDEX_MAX_ENTRIES`` newest. No command line, argument, or raw
+    output text is written. Every failure is swallowed: an unwritable index
+    only means the next identical output is not recognized. Concurrent writers
+    are last-writer-wins under the atomic rename, so a racing entry may be
+    dropped; that also only costs one missed repeat.
+    """
+    now = time.time() if now is None else now
+    ttl = _repeat_ttl()
+    try:
+        kept = {
+            key: item for key, item in _load_repeat_index().items()
+            if isinstance(item, dict) and not isinstance(item.get("timestamp"), bool)
+            and isinstance(item.get("timestamp"), (int, float))
+            and not (ttl and now - item["timestamp"] > ttl)
+        }
+        kept[identity] = {
+            "raw_ref": raw_ref if isinstance(raw_ref, str) and raw_ref else None,
+            "bytes": int(byte_length),
+            "timestamp": float(now),
+        }
+        if len(kept) > REPEAT_INDEX_MAX_ENTRIES:
+            newest = sorted(kept.items(), key=lambda item: item[1]["timestamp"], reverse=True)
+            kept = dict(newest[:REPEAT_INDEX_MAX_ENTRIES])
+        _atomic_private_write(
+            _repeat_index_path(), (json.dumps(kept, sort_keys=True) + "\n").encode("utf-8"))
+    except Exception:
+        # The index is an optimization; it must never affect tool output.
+        return
+
+
+def _repeat_recoverable(entry, text):
+    """Report whether an index entry still recovers the exact same output.
+
+    Args:
+        entry (dict[str, object] | None): Entry from :func:`_repeat_lookup`.
+        text (str): Exact current output to compare against.
+
+    Returns:
+        bool: True only when the recorded ``raw_ref`` is inside a private spool
+        root, still readable, and byte-for-byte equal to ``text``. Any missing
+        path, containment refusal, or read error returns False so the caller
+        fails open to normal processing.
+    """
+    raw_ref = entry.get("raw_ref") if isinstance(entry, dict) else None
+    if not isinstance(raw_ref, str) or not raw_ref:
+        return False
+    try:
+        return show_raw(raw_ref) == text
+    except (OSError, ValueError):
+        return False
+
+
+def _repeat_notice(byte_length, raw_ref):
+    """Render the short notice that stands in for a repeated output.
+
+    Args:
+        byte_length (int): UTF-8 byte length of the suppressed output.
+        raw_ref (str | None): Recovery path shown to the reader; ``None``
+            renders as an empty reference and is used for estimates only.
+
+    Returns:
+        str: ``[tokenpipe] identical to previous output (N bytes);
+        raw_ref=<path>`` with no trailing newline. Deterministic for equal
+        inputs.
+    """
+    return REPEAT_NOTICE_TEMPLATE % (int(byte_length), raw_ref or "")
+
+
 def _json_sanitize(value, depth=0):
+    """Recursively reduce a parsed JSON value to a bounded model-facing form.
+
+    Args:
+        value (object): Parsed JSON value of any type.
+        depth (int): Current nesting depth; levels beyond 12 are elided.
+
+    Returns:
+        object: JSON-serializable counterpart of ``value``. Dicts keep at most
+        40 keys plus an ``__tokenpipe_omitted_keys__`` count; homogeneous
+        object arrays of six or more items collapse to the first two items,
+        one ``__tokenpipe_similar_items__`` marker, and the last item; other
+        lists longer than 30 items keep 20 head items, an
+        ``__tokenpipe_omitted_items__`` marker, and 5 tail items; strings over
+        1200 characters keep a 900-character head and 150-character tail.
+        Scalars are returned unchanged.
+    """
     if depth > 12:
         return "[depth elided]"
     if isinstance(value, dict):
@@ -413,6 +969,13 @@ def _json_sanitize(value, depth=0):
             result["__tokenpipe_omitted_keys__"] = len(items) - len(chosen)
         return result
     if isinstance(value, list):
+        similar_keys = _similar_object_keys(value)
+        if similar_keys is not None:
+            return (
+                [_json_sanitize(x, depth + 1) for x in value[:2]]
+                + [{"__tokenpipe_similar_items__": len(value) - 3, "keys": similar_keys}]
+                + [_json_sanitize(value[-1], depth + 1)]
+            )
         if len(value) <= 30:
             return [_json_sanitize(x, depth + 1) for x in value]
         return (
@@ -430,19 +993,106 @@ def lite_json(text):
     return json.dumps(_json_sanitize(parsed), ensure_ascii=False, separators=(",", ":"), sort_keys=False)
 
 
+_LOG_MASK_RULES = (
+    (re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"), "<uuid>"),
+    (re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?"), "<timestamp>"),
+    (re.compile(r"\b\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?\b"), "<time>"),
+    (re.compile(r"\b0x[0-9a-fA-F]+\b"), "<addr>"),
+    (re.compile(r"\b\d+(?:\.\d+)?\s?(?:[KMGTP]i?B|[kmgtp]i?b)\b"), "<size>"),
+    (re.compile(r"\b\d+(?:\.\d+)?(?:ns|µs|us|ms|s|m|h)\b"), "<duration>"),
+    (re.compile(r"\b\d+(?:\.\d+)?%"), "<percent>"),
+    (re.compile(r"\b[0-9a-fA-F]{8,}\b"), "<id>"),
+)
+"""tuple[tuple[re.Pattern, str], ...]: Ordered volatile-field masking rules.
+
+Each pair is a compiled pattern and the placeholder replacing it. Applied in
+order they mask the fields that make otherwise identical log lines differ:
+UUIDs, ISO/RFC timestamps, ``HH:MM:SS(.ms)`` clock and ``H:MM:SS`` duration
+values, memory addresses, byte sizes, unit-suffixed durations, percentages,
+and hex identifiers of eight or more characters. Numbers that carry meaning
+(HTTP status codes, exit codes, counts, plain integers below eight digits)
+match no rule. The rules build comparison keys only; emitted text is never
+masked.
+"""
+
+
+def _log_template_key(line):
+    """Return the masked comparison key identifying one log line template.
+
+    Args:
+        line (str): One ANSI-stripped, right-stripped log line.
+
+    Returns:
+        str: The outer-stripped line with every :data:`_LOG_MASK_RULES` match
+        replaced by its placeholder. Lines differing only in volatile fields
+        share a key; lines differing in a status code, exit code, or small
+        integer do not.
+
+    Pure, deterministic, and side-effect free. The result is never emitted.
+    """
+    key = line.strip()
+    for pattern, placeholder in _LOG_MASK_RULES:
+        key = pattern.sub(placeholder, key)
+    return key
+
+
+def _log_line_protected(line):
+    """Return whether a log line must survive non-adjacent template collapsing.
+
+    Args:
+        line (str): One log line as it would be emitted.
+
+    Returns:
+        bool: True when the line matches :data:`ERROR_RE`,
+        :data:`STRONG_ERROR_RE`, or :data:`SUMMARY_RE`. All three are consulted
+        even though the strong pattern is currently a subset of ``ERROR_RE``,
+        so a later divergence cannot silently drop failure evidence.
+
+    Pure and deterministic. A protected line is never dropped, though its first
+    occurrence may still receive a repeat marker.
+    """
+    return bool(ERROR_RE.search(line) or STRONG_ERROR_RE.search(line) or SUMMARY_RE.search(line))
+
+
 def lite_log(text):
+    """Collapse repetitive log output without discarding failure evidence.
+
+    Args:
+        text (str): Complete decoded log output. ANSI escapes are removed and
+            CRLF/CR normalized to LF before any comparison.
+
+    Returns:
+        str: The stripped transform. Byte-identical adjacent lines collapse to
+        the first line plus ``[previous line repeated N more times]``; blank
+        runs squeeze to a single blank line; and a line whose masked template
+        key (see :func:`_log_template_key`) was already emitted is dropped,
+        with ``[seen N times]`` appended to that first occurrence, where ``N``
+        counts every occurrence of the key. Lines accepted by
+        :func:`_log_line_protected` and the final non-blank input line are
+        always emitted, so they can appear more than once with that marker.
+
+    Masking affects comparison only: every emitted line is verbatim input plus
+    an optional appended marker. The transform is deterministic, keeps no state
+    across calls, and has no side effects. Output can exceed the input when
+    many protected duplicates are kept, so callers compare sizes before
+    replacing anything.
+    """
     text = ANSI_RE.sub("", text).replace("\r\n", "\n").replace("\r", "\n")
     lines = [line.rstrip() for line in text.split("\n")]
     output = []
     previous = None
     repeated = 0
     blanks = 0
+    first_seen = {}
+    occurrences = {}
+    last = max((position for position, item in enumerate(lines) if item.strip()), default=-1)
 
     def flush_repeat():
+        """Emit the pending adjacent-repeat marker for the last emitted line."""
         if repeated:
             output.append("[previous line repeated %d more times]" % repeated)
 
-    for line in lines:
+    for index, line in enumerate(lines):
         if not line.strip():
             blanks += 1
             if blanks > 1:
@@ -454,9 +1104,21 @@ def lite_log(text):
             continue
         flush_repeat()
         repeated = 0
+        if line.strip():
+            key = _log_template_key(line)
+            occurrences[key] = occurrences.get(key, 0) + 1
+            if key in first_seen:
+                # Drop the near-repeat, but never evidence or the final line.
+                if index != last and not _log_line_protected(line):
+                    continue
+            else:
+                first_seen[key] = len(output)
         output.append(line)
         previous = line
     flush_repeat()
+    for key, position in first_seen.items():
+        if occurrences[key] > 1:
+            output[position] += " [seen %d times]" % occurrences[key]
     return "\n".join(output).strip()
 
 
@@ -538,6 +1200,210 @@ def _is_binary_text(text):
     return controls > max(8, len(visible) // 20)
 
 
+def _match_path(line):
+    """Return the file path of one search-result line, or None.
+
+    Args:
+        line (str): One decoded output line without its trailing newline.
+
+    Returns:
+        str | None: The path component of a ``path:line:text`` (ripgrep or
+        ``grep -n``), ``path:text`` (``grep`` without ``-n``), or
+        ``path-line-text`` (grep context) line; None when the line carries no
+        such shape.
+
+    Pure and side-effect free.
+    """
+    for pattern in (MATCH_LINE_RE, PLAIN_MATCH_RE, CONTEXT_LINE_RE):
+        found = pattern.match(line)
+        if found:
+            return found.group(1)
+    return None
+
+
+def _is_match_lines(text):
+    """Report whether output is dense per-file search-match output.
+
+    Args:
+        text (str): Complete decoded output.
+
+    Returns:
+        bool: True when the sampled leading non-empty lines number at least
+        ``_SEARCH_MIN_LINES`` and at least ``_SEARCH_SHAPE_RATIO`` of them
+        carry a match shape; False for shorter or mixed output.
+
+    Deterministic, side-effect free, and bounded by ``_SEARCH_SAMPLE_LINES``.
+    """
+    sample = [line for line in text.splitlines() if line.strip()][:_SEARCH_SAMPLE_LINES]
+    if len(sample) < _SEARCH_MIN_LINES:
+        return False
+    matched = sum(1 for line in sample if _match_path(line) is not None)
+    return matched >= _SEARCH_SHAPE_RATIO * len(sample)
+
+
+def _is_path_lines(text):
+    """Report whether output is a flat listing of one path per line.
+
+    Args:
+        text (str): Complete decoded output.
+
+    Returns:
+        bool: True when the sampled leading non-empty lines number at least
+        ``_SEARCH_MIN_LINES`` and at least ``_SEARCH_SHAPE_RATIO`` of them are
+        whitespace-free paths that contain a directory separator and no colon.
+
+    Deterministic, side-effect free, and bounded by ``_SEARCH_SAMPLE_LINES``.
+    """
+    sample = [line for line in text.splitlines() if line.strip()][:_SEARCH_SAMPLE_LINES]
+    if len(sample) < _SEARCH_MIN_LINES:
+        return False
+    matched = sum(1 for line in sample if PATH_LINE_RE.match(line))
+    return matched >= _SEARCH_SHAPE_RATIO * len(sample)
+
+
+def _bounded_sample(items, head, tail, marker):
+    """Reduce ordered entries to their first and last members with a marker.
+
+    Args:
+        items (list[str]): Ordered rendered lines.
+        head (int): Count of leading entries kept verbatim.
+        tail (int): Count of trailing entries kept verbatim.
+        marker (str): A ``%d`` template formatted with the omitted count.
+
+    Returns:
+        list[str]: A copy of ``items`` when it holds at most ``head + tail``
+        entries, otherwise the head entries, one formatted marker, and the
+        tail entries.
+
+    Pure; the argument list is never mutated.
+    """
+    if len(items) <= head + tail:
+        return list(items)
+    return list(items[:head]) + [marker % (len(items) - head - tail)] + list(items[len(items) - tail:])
+
+
+def _keep_edges(lines, rendered):
+    """Keep the first and last original lines present in a structural fold.
+
+    Args:
+        lines (list[str]): Non-empty original lines in input order.
+        rendered (list[str]): Rendered replacement lines; mutated in place.
+
+    Returns:
+        list[str]: The same ``rendered`` list object, with the first original
+        line prepended and the last one appended when either is absent.
+
+    Membership is an exact string comparison, so an edge line that a sample
+    already renders is never duplicated.
+    """
+    if lines and lines[0] not in rendered:
+        rendered.insert(0, lines[0])
+    if lines and lines[-1] not in rendered:
+        rendered.append(lines[-1])
+    return rendered
+
+
+def group_matches(text, per_file=3, max_files=20):
+    """Group dense search matches by file with bounded per-file samples.
+
+    Args:
+        text (str): Decoded search output, normally one that satisfies
+            :func:`_is_match_lines`.
+        per_file (int): Matches kept verbatim at each end of a file group.
+        max_files (int): Files rendered in full before the remainder is
+            summarized by a single marker line.
+
+    Returns:
+        str: Per file, the path with its match count, its first and last
+        ``per_file`` matches verbatim, and a ``... N more matches in this
+        file`` marker; files keep first-seen order. A ``... M more files (N
+        matches)`` marker closes the capped remainder, and lines without a
+        match shape follow, bounded the same way. The first and last original
+        lines are always present verbatim. The exact input is returned when
+        the output holds fewer than ``_SEARCH_MIN_LINES`` non-empty lines, or
+        when grouping would not shorten it.
+
+    Deterministic and side-effect free. Omitted matches remain recoverable
+    only from the spooled raw output.
+    """
+    lines = [line for line in text.splitlines() if line.strip()]
+    if len(lines) < _SEARCH_MIN_LINES:
+        return text
+    groups = {}
+    other = []
+    for line in lines:
+        path = _match_path(line)
+        if path is None:
+            other.append(line)
+        else:
+            groups.setdefault(path, []).append(line)
+    rendered = []
+    for path in list(groups)[:max_files]:
+        rendered.append("%s (%d matches)" % (path, len(groups[path])))
+        rendered.extend(_bounded_sample(groups[path], per_file, per_file,
+                                        "... %d more matches in this file"))
+    hidden = list(groups)[max_files:]
+    if hidden:
+        rendered.append("... %d more files (%d matches)" % (
+            len(hidden), sum(len(groups[path]) for path in hidden)))
+    if other:
+        rendered.extend(_bounded_sample(other, per_file, per_file,
+                                        "... %d more unmatched lines"))
+    candidate = "\n".join(_keep_edges(lines, rendered))
+    return candidate if len(candidate) < len(text) else text
+
+
+def fold_paths(text, head=3, tail=2, depth=3):
+    """Fold a flat path listing into per-directory samples.
+
+    Args:
+        text (str): Decoded listing, normally one that satisfies
+            :func:`_is_path_lines`.
+        head (int): Entries kept verbatim at the start of each directory.
+        tail (int): Entries kept verbatim at the end of each directory.
+        depth (int): Directory levels rendered below the listing's common
+            directory prefix; anything deeper collapses into a single
+            ``dir/… (N entries)`` line.
+
+    Returns:
+        str: Per directory, its path with an entry count followed by the head
+        and tail entry names and a ``... N more entries`` marker, in first-seen
+        order. The first and last original lines stay verbatim. The exact
+        input is returned when the listing holds fewer than
+        ``_SEARCH_MIN_LINES`` non-empty lines, or when folding would not
+        shorten it.
+
+    Deterministic and side-effect free. Omitted entries remain recoverable
+    only from the spooled raw output.
+    """
+    lines = [line for line in text.splitlines() if line.strip()]
+    if len(lines) < _SEARCH_MIN_LINES:
+        return text
+    entries = []
+    common = (lines[0].rpartition("/")[0] or ".").split("/")
+    for line in lines:
+        directory, _, name = line.rpartition("/")
+        parts = (directory or ".").split("/")
+        entries.append((parts, name or line))
+        shared = 0
+        while shared < min(len(common), len(parts)) and common[shared] == parts[shared]:
+            shared += 1
+        common = common[:shared]
+    groups = {}
+    for parts, name in entries:
+        collapsed = len(parts) > len(common) + depth
+        groups.setdefault(("/".join(parts[:len(common) + depth]), collapsed), []).append(name)
+    rendered = []
+    for (directory, collapsed), names in groups.items():
+        if collapsed:
+            rendered.append("%s/… (%d entries)" % (directory, len(names)))
+            continue
+        rendered.append("%s/ (%d entries)" % (directory, len(names)))
+        rendered.extend(_bounded_sample(names, head, tail, "... %d more entries"))
+    candidate = "\n".join(_keep_edges(lines, rendered))
+    return candidate if len(candidate) < len(text) else text
+
+
 def classify(text):
     """Classify decoded tool output for deterministic compression policy.
 
@@ -545,9 +1411,11 @@ def classify(text):
         text (str): Complete decoded stream or combined stream body.
 
     Returns:
-        str: One of ``binary``, ``diff``, ``code``, ``json``, ``config``,
-        ``error``, ``log``, or ``plain``. Binary detection runs first so later
-        format heuristics can never authorize destructive transformation.
+        str: One of ``binary``, ``diff``, ``code``, ``json``, ``search``,
+        ``config``, ``error``, ``log``, or ``plain``. Binary detection runs
+        first so later format heuristics can never authorize destructive
+        transformation; search shapes outrank the error heuristics so matches
+        that merely mention a failure stay search output.
     """
     if _is_binary_text(text):
         return "binary"
@@ -562,6 +1430,10 @@ def classify(text):
             return "json"
         except (ValueError, TypeError):
             pass
+    # Search results are recognized before any error heuristic: a grep hit that
+    # merely contains the word "error" is still search-shaped output.
+    if _is_match_lines(text) or _is_path_lines(text):
+        return "search"
     # Strong runtime failures outrank config-like `tool: message` lines such as
     # ripgrep's repeated `rg: path: IO error ...` stderr.
     if STRONG_ERROR_RE.search(text):
@@ -586,7 +1458,13 @@ def compress(text, category):
         category (str): Result from :func:`classify`.
 
     Returns:
-        tuple[str, str]: Strategy label and candidate output. Binary and
+        tuple[str, str]: Strategy label (``lite-json``, ``lite-log``,
+        ``cca-log``, ``cca-error``, ``cca-plain``, ``search-group``,
+        ``search-fold``, ``bounded-<category>``, or ``passthrough``) and
+        candidate output. ``code``, ``diff`` and ``config`` return their exact
+        content under a ``bounded-<category>`` label: the content itself is
+        never rewritten, and only the caller's :func:`bound_candidate`
+        head/tail bounding may shorten it. Binary and
         unsupported categories return exact passthrough content.
 
     Compression is local and side-effect free; callers remain responsible for
@@ -594,8 +1472,18 @@ def compress(text, category):
     """
     if category == "binary":
         return "passthrough", text
+    if category in ("code", "diff", "config"):
+        # Protected categories keep every retained byte verbatim; the caller's
+        # bounding decides how much of the head and tail survives.
+        return "bounded-" + category, text
     if category == "json":
         return "lite-json", lite_json(text)
+    if category == "search":
+        if _is_match_lines(text):
+            return "search-group", group_matches(text)
+        if _is_path_lines(text):
+            return "search-fold", fold_paths(text)
+        return "passthrough", text
     if category == "log":
         lite = lite_log(text)
         if len(lite) > 8000:
@@ -608,26 +1496,173 @@ def compress(text, category):
     return "passthrough", text
 
 
-def bound_candidate(text, max_chars=None):
-    """Keep replacement output below the hook's inline spill threshold."""
+# Default shown-output character budget per content category. Every value stays
+# at or below the global default so a replacement fits the tightest documented
+# host cap (Codex truncates tool output at 10 KiB / 256 lines); categories whose
+# elided middle is hardest to reconstruct keep the largest budget.
+SHOWN_BUDGET_CHARS = {
+    "error": 7000, "log": 6000, "plain": 5000, "json": 6000,
+    "search": 5000, "code": 7000, "diff": 7000, "config": 5000,
+}
+BOUND_MARKER_TEMPLATE = "\n...[tokenpipe bounded output; omitted %d chars; use raw_ref]...\n"
+BOUND_MARKER_RE = re.compile(
+    r"\n\.\.\.\[tokenpipe bounded output; omitted \d+ chars; use raw_ref\]\.\.\.\n")
+
+
+def _global_shown_cap():
+    """Return the global ceiling on shown replacement characters.
+
+    Returns:
+        int: ``TOKENPIPE_MAX_SHOWN_CHARS`` clamped to at least 256, or the
+        built-in 7000 default when the variable is unset or unparsable.
+
+    Reads the environment only; an unusable value fails open to the default so
+    bounding never raises out of a compression path.
+    """
+    try:
+        return max(256, int(os.environ.get("TOKENPIPE_MAX_SHOWN_CHARS", "7000")))
+    except (TypeError, ValueError):
+        return 7000
+
+
+def shown_budget(category=None):
+    """Resolve the shown-character budget for one content category.
+
+    Args:
+        category (str | None): Content category from :func:`classify`.
+            ``None`` or an unknown category selects the global cap.
+
+    Returns:
+        int: Character budget in ``[256, _global_shown_cap()]``. The default
+        comes from :data:`SHOWN_BUDGET_CHARS`; ``TOKENPIPE_BUDGET_<CATEGORY>``
+        (uppercased, non-alphanumerics mapped to ``_``) overrides one category
+        and is clamped to 256 at the bottom and the global cap at the top. An
+        unparsable override is ignored in favor of the default.
+
+    Reads the environment only and never raises.
+    """
+    cap = _global_shown_cap()
+    budget = SHOWN_BUDGET_CHARS.get(category)
+    if category is not None:
+        name = re.sub(r"[^A-Z0-9_]", "_", str(category).upper())
+        override = os.environ.get("TOKENPIPE_BUDGET_" + name)
+        if override is not None:
+            try:
+                budget = min(cap, max(256, int(override.strip())))
+            except (TypeError, ValueError):
+                budget = SHOWN_BUDGET_CHARS.get(category)
+    if budget is None:
+        return cap
+    return min(cap, budget)
+
+
+def bound_candidate(text, max_chars=None, category=None):
+    """Keep replacement output below the hook's inline spill threshold.
+
+    Args:
+        text (str): Candidate replacement text; returned unchanged when it
+            already fits.
+        max_chars (int | None): Explicit budget in characters. ``None`` derives
+            the budget from ``category`` through :func:`shown_budget`.
+        category (str | None): Content category used for the per-category
+            budget. Ignored when ``max_chars`` is given, so existing callers
+            keep their exact behavior.
+
+    Returns:
+        str: ``text`` itself, or its verbatim head and tail joined by one
+        ``BOUND_MARKER_TEMPLATE`` marker naming the omitted character count.
+        The result never exceeds the resolved budget.
+
+    Pure and deterministic for equal inputs and environment.
+    """
     if max_chars is None:
-        max_chars = max(256, int(os.environ.get("TOKENPIPE_MAX_SHOWN_CHARS", "7000")))
+        max_chars = shown_budget(category)
     if len(text) <= max_chars:
         return text
-    marker_template = "\n...[tokenpipe bounded output; omitted %d chars; use raw_ref]...\n"
     # The omitted count affects marker width. A short fixed-point loop converges
     # even when the number crosses a decimal digit boundary.
     omitted = max(0, len(text) - max_chars)
     for _ in range(4):
-        marker = marker_template % omitted
+        marker = BOUND_MARKER_TEMPLATE % omitted
         available = max(2, max_chars - len(marker))
         head = max(1, int(available * 0.60))
         tail = max(1, available - head)
         omitted = max(0, len(text) - head - tail)
-    marker = marker_template % omitted
+    marker = BOUND_MARKER_TEMPLATE % omitted
     overflow = max(0, head + len(marker) + tail - max_chars)
     head = max(1, head - overflow)
     return text[:head] + marker + text[-tail:]
+
+
+RECOVERY_PREVIEW_TEMPLATE = (
+    "omitted %d chars; fetch the elided middle with: %s show %s --range %d:%d")
+
+
+def _recovery_command():
+    """Return the invocation prefix that re-runs this script for recovery.
+
+    Returns:
+        str: Shell-quoted ``<interpreter> <script path>`` pair, using
+        ``sys.executable`` (falling back to ``python3`` in a frozen or
+        interpreter-less environment) and this module's absolute path.
+    """
+    return "%s %s" % (
+        shlex.quote(sys.executable or "python3"), shlex.quote(os.path.abspath(__file__)))
+
+
+def _omitted_span(shown, original):
+    """Locate the character span of ``original`` that bounding elided.
+
+    Args:
+        shown (str): Bounded replacement text, expected to hold exactly one
+            :data:`BOUND_MARKER_TEMPLATE` marker between a verbatim head and
+            tail of ``original``.
+        original (str): Exact pre-compression text the raw file preserves.
+
+    Returns:
+        tuple[int, int] | None: Half-open ``[start, end)`` character offsets of
+        the omitted middle in ``original``, or ``None`` when ``shown`` carries
+        no marker or no marker position reproduces ``original``'s head and
+        tail. A marker that merely occurs inside the content is rejected by
+        that verification rather than reported as a span.
+    """
+    for match in BOUND_MARKER_RE.finditer(shown):
+        start = match.start()
+        end = len(original) - (len(shown) - match.end())
+        if 0 <= start < end <= len(original) and shown[:start] == original[:start] \
+                and shown[match.end():] == original[end:]:
+            return start, end
+    return None
+
+
+def recovery_preview(shown, original, raw_ref, command=None):
+    """Describe, in one line, how to fetch the middle that bounding removed.
+
+    Args:
+        shown (str): Replacement text exactly as the model will see it.
+        original (str): Exact original output stored at ``raw_ref``.
+        raw_ref (str | None): Recovery path of the spooled original; a falsy
+            value yields no preview because nothing can be fetched.
+        command (str | None): Invocation prefix placed before ``show``.
+            ``None`` uses :func:`_recovery_command`.
+
+    Returns:
+        str: ``omitted <n> chars; fetch the elided middle with: <command> show
+        <raw_ref> --range <start>:<end>`` where ``<n>`` is the true omitted
+        length and the range is the character span of the omitted middle in the
+        original. Returns ``""`` when the output was not bounded or the span
+        cannot be verified, so callers can append it unconditionally.
+
+    Pure apart from reading ``sys.executable`` and this module's path.
+    """
+    if not raw_ref:
+        return ""
+    span = _omitted_span(shown, original)
+    if span is None:
+        return ""
+    start, end = span
+    return RECOVERY_PREVIEW_TEMPLATE % (
+        end - start, command or _recovery_command(), raw_ref, start, end)
 
 
 def command_category(payload):
@@ -681,6 +1716,13 @@ def _append_metric(metric, path=None):
     Parent and final symlinks are refused with no chmod, append, or truncation.
     Rotation and append occur under one advisory lock. Callers intentionally
     suppress failures because metrics must never affect tool output.
+
+    The creating ``os.open`` is retried up to three more times with a few
+    milliseconds of backoff on ``FileNotFoundError``: on macOS/APFS concurrent
+    ``openat(dir_fd, name, O_CREAT | O_APPEND)`` calls into one directory
+    intermittently fail with ``ENOENT`` even though the directory exists. The
+    bound keeps a genuinely missing directory failing fast instead of looping,
+    and every other ``OSError`` still propagates unchanged.
     """
     path = path or _metrics_path()
     parent = os.path.dirname(path)
@@ -692,7 +1734,14 @@ def _append_metric(metric, path=None):
     max_bytes = max(4096, int(os.environ.get("TOKENPIPE_METRICS_MAX_BYTES", str(8 * 1024 * 1024))))
     flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     try:
-        fd = os.open(name, flags, 0o600, dir_fd=parent_fd)
+        for delay in (0.002, 0.005, 0.010):
+            try:
+                fd = os.open(name, flags, 0o600, dir_fd=parent_fd)
+                break
+            except FileNotFoundError:
+                time.sleep(delay)
+        else:
+            fd = os.open(name, flags, 0o600, dir_fd=parent_fd)
         try:
             info = os.fstat(fd)
             if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
@@ -722,6 +1771,167 @@ def _append_metric(metric, path=None):
         os.close(parent_fd)
 
 
+POST_HEADER_TEMPLATE = "tokenpipe-post-v1 mode=%s strategy=%s%s raw_ref=%s"
+CLAUDE_RECOVERY_MARKER = "tokenpipe-claude-v1"
+CLAUDE_RECOVERY_TEMPLATE = "%s compressed %s; recover with: %s <raw_ref>"
+
+
+def post_recovery_header(mode, strategy, exit_status, raw_ref, preview=""):
+    """Render the Codex PostToolUse recovery header shown with a replacement.
+
+    The Codex hook prefixes replaced output with this single line so the reader
+    can always recover the exact original. The template lives here, not in the
+    hook, so :func:`_replacement_overhead_estimate` prices exactly the text the
+    host renders and the two can never drift apart.
+
+    Args:
+        mode (str): Active ``audit``, ``safe``, or ``full`` mode, rendered
+            verbatim.
+        strategy (str | None): Compression strategy name; ``None`` or an empty
+            value renders ``unknown``.
+        exit_status (int | None): Child exit status; ``None`` omits the field.
+        raw_ref (str): Absolute recovery path of the spooled raw output.
+        preview (str): One-line recovery preview from :func:`recovery_preview`
+            naming the elided middle; ``""`` (the default) adds nothing.
+
+    Returns:
+        str: One header line with no trailing newline. A non-empty ``preview``
+        follows the ``raw_ref`` field after a ``"; "`` separator, the same
+        shape :func:`_native_header` uses. Pure function: no I/O and no
+        dependence on process state.
+    """
+    exit_field = " exit=%d" % exit_status if isinstance(exit_status, int) else ""
+    line = POST_HEADER_TEMPLATE % (mode, strategy or "unknown", exit_field, raw_ref)
+    if preview:
+        line += "; " + preview
+    return line
+
+
+def claude_recovery_header(references, recover_command, marker=CLAUDE_RECOVERY_MARKER,
+                           previews=()):
+    """Render the Claude ``additionalContext`` recovery line for a replacement.
+
+    Shares the ownership rule of :func:`post_recovery_header`: the hook renders
+    this exact text, so replacement cost is priced against the same template.
+
+    Args:
+        references (Iterable[str]): Per-stream recovery fragments already
+            formatted by the caller, for example ``"stdout raw_ref=/path"``.
+            Joined with ``", "`` in the given order.
+        recover_command (str): Shell-quoted command the reader runs to restore
+            the raw output, rendered before the ``<raw_ref>`` placeholder.
+        marker (str): Host marker opening the line; defaults to
+            :data:`CLAUDE_RECOVERY_MARKER`.
+        previews (Iterable[str]): Per-stream recovery previews from
+            :func:`recovery_preview`, each already named by its stream, for
+            example ``"stdout omitted 4200 chars; ..."``. Empty entries are
+            dropped; the default adds nothing.
+
+    Returns:
+        str: One context line with no trailing newline. Every non-empty preview
+        follows the recovery command, each after a ``"; "`` separator. Pure
+        function.
+    """
+    line = CLAUDE_RECOVERY_TEMPLATE % (marker, ", ".join(references), recover_command)
+    kept = [preview for preview in previews if preview]
+    if kept:
+        line += "; " + "; ".join(kept)
+    return line
+
+
+def _raw_ref_placeholder(root=None):
+    """Return a recovery path shaped like the one :func:`spool_raw` will create.
+
+    The net-win gate runs before any raw file exists, so header cost is priced
+    against a path of representative length instead of the real reference.
+
+    Args:
+        root (str | None): Spool root to price against; ``None`` uses the
+            configured private spool root.
+
+    Returns:
+        str: Absolute placeholder path. No file is created or read.
+    """
+    return os.path.join(
+        root or _raw_root(), "unknown-session", "call-000000000000-000000000000.log"
+    )
+
+
+_PREVIEW_PLACEHOLDER_CHARS = max(SHOWN_BUDGET_CHARS.values())
+"""Character count the placeholder recovery preview is priced with (int).
+
+The gate decides before the real omitted span is known, so the placeholder is
+built from the widest per-category budget (:data:`SHOWN_BUDGET_CHARS`) used as
+both the omitted length and the first ``--range`` offset, with the second
+offset at twice that. Deriving it from the budgets keeps the number
+deterministic and as wide as a bounded replacement's own preview normally gets;
+output far larger than one budget can carry offsets with one or two more
+digits, which the estimator charges a fraction of a token for.
+"""
+
+
+def _preview_placeholder(raw_ref):
+    """Return a representative recovery preview line for header pricing.
+
+    Args:
+        raw_ref (str): Recovery path to render, normally the placeholder from
+            :func:`_raw_ref_placeholder`; its length dominates the line.
+
+    Returns:
+        str: A :data:`RECOVERY_PREVIEW_TEMPLATE` line whose numbers come from
+        :data:`_PREVIEW_PLACEHOLDER_CHARS`, so the same input always yields the
+        same text. Reads ``sys.executable`` and this module's path through
+        :func:`_recovery_command`; creates and reads nothing.
+    """
+    return RECOVERY_PREVIEW_TEMPLATE % (
+        _PREVIEW_PLACEHOLDER_CHARS, _recovery_command(), raw_ref,
+        _PREVIEW_PLACEHOLDER_CHARS, 2 * _PREVIEW_PLACEHOLDER_CHARS)
+
+
+def _replacement_overhead_estimate(raw_ref_placeholder=None, bounded=False):
+    """Estimate the token cost of the recovery header a host adds to output.
+
+    A replacement never ships alone: the Codex hook prepends
+    :func:`post_recovery_header` and the Claude hook adds
+    :func:`claude_recovery_header`. The larger of the two is used so a
+    replacement judged a win is a win on either host. Mode, strategy, and exit
+    fields are priced with representative values because the caller decides
+    before those are final; the recovery path dominates the length.
+
+    A bounded replacement makes both headers longer: each carries the
+    ``show --range`` preview naming the elided middle. Pricing the header
+    without that line would under-charge exactly the replacements it is longest
+    for, so ``bounded`` adds a deterministic placeholder preview
+    (:func:`_preview_placeholder`).
+
+    Args:
+        raw_ref_placeholder (str | None): Representative recovery path standing
+            in for the not-yet-spooled reference; ``None`` uses
+            :func:`_raw_ref_placeholder`.
+        bounded (bool): True when the replacement being priced would elide a
+            middle section and therefore ship a recovery preview. False, the
+            default, prices the bare header.
+
+    Returns:
+        int: Non-negative ``estimate_tokens`` cost of one recovery header, or
+        ``0`` if the estimate cannot be rendered, which disables the gate
+        instead of changing the decision. Pure function apart from reading the
+        configured spool root.
+    """
+    try:
+        reference = raw_ref_placeholder or _raw_ref_placeholder()
+        preview = _preview_placeholder(reference) if bounded else ""
+        codex = post_recovery_header("audit", "passthrough", 0, reference, preview)
+        claude = claude_recovery_header(
+            ["stdout raw_ref=" + reference],
+            "/usr/bin/python3 %s show" % os.path.abspath(__file__),
+            previews=["stdout " + preview] if preview else (),
+        )
+        return max(estimate_tokens(codex), estimate_tokens(claude))
+    except Exception:  # fail open: header pricing must never block output
+        return 0
+
+
 def process(payload, mode=None, cleanup=True, record_metric=True):
     """Process one tool-output payload with recoverable fail-open semantics.
 
@@ -729,54 +1939,143 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
         payload (dict[str, object]): Bounded hook payload containing output and
             optional lifecycle/category metadata. It is not mutated.
         mode (str | None): Explicit ``audit``, ``safe``, or ``full`` override.
-        cleanup (bool): When true, enforce spool retention immediately. Claude
-            multi-stream callers pass false and finalize all refs together.
+        cleanup (bool): When true, enforce spool retention and validate raw
+            recovery before returning. The retention sweep itself is amortized
+            to at most once per ``TOKENPIPE_CLEANUP_INTERVAL_SECONDS``; the
+            byte-for-byte recovery check still runs on every replacement.
+            Claude multi-stream callers pass false and finalize all refs
+            together.
         record_metric (bool): Append the decision metric immediately. A false
             value defers its bounded metric in the private ``_metric`` result
             field so a multi-stream caller can commit it only after recovery.
 
     Returns:
         dict[str, object]: Compression decision, shown output, recovery path,
-        estimates, and bounded diagnostic metadata.
+        estimates, and bounded diagnostic metadata. ``recovery_preview`` holds
+        the one-line ``show --range`` sentence from :func:`recovery_preview`,
+        or ``""`` when nothing was elided.
+
+    Output estimated below ``TOKENPIPE_MIN_TOKENS_ESTIMATE`` and any ``binary``
+    output stays byte-exact. Above that threshold ``code``, ``diff`` and
+    ``config`` are bounded to their verbatim head and tail under a
+    ``bounded-<category>`` strategy, subject to the same category gate, raw
+    spooling, and recovery validation as every other replacement. Every
+    replacement is bounded by its content category's budget (see
+    :func:`shown_budget`), which the metric records as ``budget_chars``.
+
+    A replacement also costs the reader the recovery header its host renders
+    with it (:func:`_replacement_overhead_estimate`), including the
+    ``show --range`` preview a bounded candidate's header carries. When the
+    compressed candidate saves no more than that header, the exact original is
+    returned
+    with ``skip_reason="net-loss"`` and nothing is spooled; the metric
+    counterfactual still measures the compressed candidate so ``stats`` keeps
+    reporting the unrealized potential.
+
+    Output that :func:`_looks_like_secret` flags immediately before spooling is
+    refused rather than redacted: it is returned byte-exact under strategy
+    ``passthrough`` with skip reason ``secret-guard``, no file is written under
+    the raw spool, and no repeat-index entry is recorded for it. Only the skip
+    reason reaches metrics; no matched text does.
 
     Compressor, metric, and spool failures fail open to the exact original
     output. With immediate cleanup, replacement is returned only after the raw
-    file survives cleanup and reads back byte-for-byte. Deferred multi-stream
-    callers must perform that transaction before exposing the result or metric.
+    file survives any due cleanup and reads back byte-for-byte. Deferred
+    multi-stream callers must perform that transaction before exposing the
+    result or metric.
     Metrics never change the decision.
+
+    Output byte-identical to the previous output of the same identity (see
+    :func:`_repeat_identity`) is reported as ``repeat_of_previous`` in every
+    mode, and its counterfactual estimate then measures a short notice instead
+    of the compressed candidate. The notice becomes the shown output only when
+    :func:`configured_repeat_replace` is on, the mode is ``safe`` or ``full``,
+    the earlier raw copy still reads back byte-for-byte, and the notice is
+    smaller than that compressed candidate, which carries the same recovery
+    header cost; otherwise the candidate is shown. The strategy is
+    then ``repeat-notice`` and this call's own output is spooled as usual.
+    Otherwise the call is compressed exactly as before. Any repeat-index
+    failure falls back to normal processing. Side effect: the private repeat
+    index under ``TOKENPIPE_HOME`` is refreshed for every non-empty output.
     """
-    started = time.time()
+    started = time.monotonic()
     requested_mode = mode or payload.get("mode") or os.environ.get("TOKENPIPE_MODE") or configured_mode()
     mode = requested_mode if requested_mode in ("audit", "safe", "full") else "audit"
     original = _extract_output(payload)
     original_est = estimate_tokens(original)
+    original_bytes = len(original.encode("utf-8", "replace"))
     threshold = max(1, int(os.environ.get("TOKENPIPE_MIN_TOKENS_ESTIMATE", "1500")))
+    overhead_est = _replacement_overhead_estimate()
     category = classify(original)
     strategy = "passthrough"
     candidate = original
+    net_loss_candidate = None
     skip_reason = None
     compressor_error = None
     raw_ref = None
 
     try:
+        repeat_identity = _repeat_identity(payload, original)
+        repeat_entry = _repeat_lookup(repeat_identity)
+    except Exception:  # fail open: a broken repeat index must not change output
+        repeat_identity, repeat_entry = None, None
+    repeat_of_previous = repeat_entry is not None
+    repeat_notice = (
+        _repeat_notice(original_bytes, repeat_entry.get("raw_ref")) if repeat_of_previous else None)
+    if repeat_notice is not None and estimate_tokens(repeat_notice) + overhead_est >= original_est:
+        repeat_notice = None
+    repeat_replace = bool(
+        repeat_notice is not None and mode in ("safe", "full")
+        and configured_repeat_replace() and _repeat_recoverable(repeat_entry, original)
+    )
+
+    try:
         if original_est < threshold:
             skip_reason = "below-threshold"
-        elif category in ("binary", "code", "diff"):
-            skip_reason = category + "-passthrough"
+        elif category == "binary":
+            skip_reason = "binary-passthrough"
         else:
             strategy, candidate = compress(original, category)
-            candidate = bound_candidate(candidate)
-            if estimate_tokens(candidate) >= original_est:
+            candidate = bound_candidate(candidate, category=category)
+            candidate_est = estimate_tokens(candidate)
+            # A bounded candidate ships a longer header: it carries the
+            # recovery preview naming the elided span, so price that line too.
+            candidate_overhead = (
+                _replacement_overhead_estimate(bounded=True)
+                if BOUND_MARKER_RE.search(candidate) else overhead_est)
+            if candidate_est >= original_est:
                 candidate = original
                 strategy = "passthrough"
                 skip_reason = "no-savings"
+            elif candidate_est + candidate_overhead >= original_est:
+                # Every replacement also costs the reader one recovery header,
+                # so a saving no larger than that header is a net loss.
+                net_loss_candidate = candidate
+                candidate = original
+                strategy = "passthrough"
+                skip_reason = "net-loss"
     except Exception as exc:  # fail open: tool output must survive compressor faults
         candidate = original
         strategy = "passthrough"
         skip_reason = "compressor-error"
         compressor_error = type(exc).__name__
 
-    candidate_est = estimate_tokens(candidate)
+    if repeat_replace and estimate_tokens(repeat_notice) >= estimate_tokens(candidate):
+        # Both ship with a recovery header, so the smaller body wins the shown
+        # output; a tie keeps the candidate, which carries more of the
+        # original. Comparing bodies alone only ever favors the candidate,
+        # whose header may additionally carry a preview. The counterfactual
+        # below still measures the notice.
+        repeat_replace = False
+    if repeat_replace:
+        # Only the explicit gate lets the notice reach the shown output; the
+        # measurement below runs in every mode.
+        strategy = "repeat-notice"
+        candidate = repeat_notice
+        skip_reason = None
+    counterfactual = repeat_notice if repeat_notice is not None else (
+        candidate if net_loss_candidate is None else net_loss_candidate)
+    counterfactual_est = estimate_tokens(counterfactual)
     replace = mode != "audit" and candidate != original
     if replace and mode in ("safe", "full"):
         # A caller-provided allowlist restricts which content categories may be
@@ -785,6 +2084,14 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
         if isinstance(replace_categories, list) and category not in replace_categories:
             replace = False
             skip_reason = "category-gated"
+    secret_guarded = replace and _looks_like_secret(original)
+    if secret_guarded:
+        # Refusal, not redaction: nothing is spooled and nothing is replaced,
+        # so the exact original output still reaches the host.
+        replace = False
+        strategy = "passthrough"
+        candidate = original
+        skip_reason = "secret-guard"
     if replace:
         try:
             raw_ref = spool_raw(
@@ -792,11 +2099,18 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
                 payload.get("session_id"),
                 payload.get("tool_call_id"),
             )
-            if cleanup:
+            if cleanup and _cleanup_due():
                 if not cleanup_spool(protected=(raw_ref,)):
                     raise OSError(errno.ENOSPC, "raw output exceeds configured spool cap")
+                _mark_cleanup()
+            if cleanup:
                 if show_raw(raw_ref) != original:
                     raise OSError(errno.EIO, "raw output failed recovery validation")
+            if repeat_replace:
+                # Point the notice at this call's own spooled copy.
+                candidate = _repeat_notice(original_bytes, raw_ref)
+                counterfactual = candidate
+                counterfactual_est = estimate_tokens(candidate)
         except Exception as exc:  # no recoverable raw means no destructive compression
             if raw_ref:
                 try:
@@ -809,9 +2123,16 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
             replace = False
             candidate = original
 
+    if repeat_identity and original and not secret_guarded:
+        # The index stores a raw_ref; guarded output must not enter it.
+        _repeat_record(
+            repeat_identity,
+            raw_ref or (repeat_entry.get("raw_ref") if repeat_entry else None),
+            original_bytes,
+        )
     shown = candidate if replace else original
     shown_est = estimate_tokens(shown)
-    saved = 0.0 if not original_est else 100.0 * (original_est - candidate_est) / original_est
+    saved = 0.0 if not original_est else 100.0 * (original_est - counterfactual_est) / original_est
     now = _dt.datetime.now(_dt.timezone.utc)
     metric = {
         "timestamp": now.isoformat(),
@@ -823,21 +2144,21 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
         "content_category": category,
         "plugin_version": plugin_version(),
         "mode": mode,
-        "original_bytes": len(original.encode("utf-8", "replace")),
+        "original_bytes": original_bytes,
         "shown_bytes": len(shown.encode("utf-8", "replace")),
-        "counterfactual_bytes": len(candidate.encode("utf-8", "replace")),
+        "counterfactual_bytes": len(counterfactual.encode("utf-8", "replace")),
+        "repeat_of_previous": repeat_of_previous,
         "original_tokens_estimate": original_est,
         "shown_tokens_estimate": shown_est,
-        "counterfactual_tokens_estimate": candidate_est,
+        "counterfactual_tokens_estimate": counterfactual_est,
         "saved_percent": round(saved, 2),
-        "latency_ms": round((time.time() - started) * 1000.0, 3),
+        "latency_ms": round((time.monotonic() - started) * 1000.0, 3),
         "exit_status": payload.get("exit_status") if isinstance(payload.get("exit_status"), int) else None,
         "skip_reason": skip_reason,
         "raw_ref_present": bool(raw_ref),
         "compressor_error": compressor_error,
-        "audit_overflow": mode == "audit" and len(original) > max(
-            256, int(os.environ.get("TOKENPIPE_MAX_SHOWN_CHARS", "7000"))
-        ),
+        "budget_chars": shown_budget(category),
+        "audit_overflow": mode == "audit" and len(original) > _global_shown_cap(),
         "rtk_used": False,
     }
     if record_metric:
@@ -854,9 +2175,10 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
         "strategy": strategy,
         "content_category": category,
         "raw_ref": raw_ref,
+        "recovery_preview": recovery_preview(shown, original, raw_ref),
         "original_tokens_estimate": original_est,
         "shown_tokens_estimate": shown_est,
-        "counterfactual_tokens_estimate": candidate_est,
+        "counterfactual_tokens_estimate": counterfactual_est,
         "saved_percent": round(saved, 2),
         "skip_reason": skip_reason,
         "compressor_error": compressor_error,
@@ -1500,7 +2822,23 @@ def set_configured_rtk(path):
     return configured_rtk()
 
 
-def _native_header(category, exit_status, mode, strategy, raw_ref=None):
+def _native_header(category, exit_status, mode, strategy, raw_ref=None, preview=""):
+    """Render the single marker line that precedes native tool output.
+
+    Args:
+        category (str): Coarse command category; sanitized before use.
+        exit_status (int): Child exit status rendered as ``exit=<n>``.
+        mode (str): Effective ``audit``, ``safe``, or ``full`` mode.
+        strategy (str): Compression strategy name, ``passthrough`` when none.
+        raw_ref (str | None): Recovery path; omitted from the line when falsy.
+        preview (str): One-line recovery preview from :func:`recovery_preview`;
+            an empty string (the default) adds nothing.
+
+    Returns:
+        str: Space-separated ``key=value`` fields starting at byte zero with
+        :data:`NATIVE_MARKER`, terminated by exactly one newline, so hooks can
+        recognize already-processed native output.
+    """
     fields = [
         NATIVE_MARKER,
         "category=" + _safe_component(category, "unknown"),
@@ -1510,7 +2848,10 @@ def _native_header(category, exit_status, mode, strategy, raw_ref=None):
     ]
     if raw_ref:
         fields.append("raw_ref=" + raw_ref)
-    return " ".join(fields) + "\n"
+    line = " ".join(fields)
+    if preview:
+        line += "; " + preview
+    return line + "\n"
 
 
 def _label_streams(stdout, stderr):
@@ -1520,34 +2861,48 @@ def _label_streams(stdout, stderr):
 def _metric_base(payload, mode, category, strategy, content_category, original, shown,
                  counterfactual, exit_status, skip_reason, raw_ref, compressor_error,
                  started, native_header_bytes=0, audit_overflow=False, rtk_used=False,
-                 command_head=None, rtk_head_substituted=False):
-    """Build one private metric record shared by post-hook and native paths.
+                 command_head=None, rtk_head_substituted=False,
+                 repeat_of_previous=False, budget_chars=0):
+    """Build one bounded metric row shared by the post-hook, native, and skip paths.
 
     Args:
-        payload (dict): Hook payload; only sanitized ``session_id`` and
-            ``tool_name`` are read from it.
-        mode (str): Effective mode (``audit``, ``safe``, ``full``).
-        category (str): Coarse command category.
-        strategy (str): Final rendering strategy label.
-        content_category (str): Classified output content kind.
-        original (str): Model-visible text without tokenpipe.
-        shown (str): Text actually returned to the model.
-        counterfactual (str): Text tokenpipe would show if replacement applied.
-        exit_status (int | None): Child exit status when known.
-        skip_reason (str | None): Why replacement did not happen, if it did not.
-        raw_ref (str | None): Recovery reference; only its presence is recorded.
-        compressor_error (str | None): Exception class name, if any.
-        started (float): ``time.time()`` at call start, for latency.
-        native_header_bytes (int): Size of the native header, ``0`` for post-hook rows.
-        audit_overflow (bool): Whether audit output exceeded the shown cap.
+        payload (dict[str, object]): Hook payload read for ``session_id`` and
+            ``tool_name`` only; both are sanitized. It is not mutated.
+        mode (str): Effective ``audit``, ``safe``, or ``full`` mode.
+        category (str): Normalized command category.
+        strategy (str): Compression strategy name, ``passthrough`` when none.
+        content_category (str): Classified content category of the output.
+        original (str): Exact original text, measured but never stored.
+        shown (str): Text actually surfaced to the host, measured only.
+        counterfactual (str): Candidate text used for honest savings estimates.
+        exit_status (int | None): Child exit status, ``None`` when unknown.
+        skip_reason (str | None): Sanitized reason compression was skipped.
+        raw_ref (str | None): Raw spool path; recorded only as a boolean.
+        compressor_error (str | None): Bounded exception type name, not text.
+        started (float): Start timestamp from the caller's clock, used only as
+            a difference to derive ``latency_ms``.
+        native_header_bytes (int): Byte size of the synthesized native header,
+            ``0`` for post-hook rows.
+        audit_overflow (bool): True when audit output exceeded the shown bound.
         rtk_used (bool): Whether RTK executed the child.
         command_head (str | None): Allow-listed label from :func:`command_head`
             for native wrapper calls; the key is omitted when ``None``.
         rtk_head_substituted (bool): Whether RTK replaced an untrusted
             interpreter head (``python -m pytest``) so argv[0] never ran.
+        repeat_of_previous (bool): True when this exact output was already
+            recorded for the same identity; paths without cross-call repeat
+            detection leave it false.
+        budget_chars (int): Shown-character budget that bounded this output
+            (see :func:`shown_budget`); ``0`` when no output was bounded, as on
+            the output-free skip path.
 
     Returns:
-        dict: JSON-serialisable metric row without arguments, paths, or output.
+        dict[str, object]: A JSON-serializable metric row tagged with
+        ``home`` (see :func:`_home_id`) so rows appended to the shared runtime
+        metrics file remain attributable to the home that produced them.
+
+    The row carries sizes, estimates, and categories only: no raw output,
+    command arguments, prompts, or user-local paths ever enter it.
     """
     now = _dt.datetime.now(_dt.timezone.utc)
     original_est = estimate_tokens(original)
@@ -1556,6 +2911,7 @@ def _metric_base(payload, mode, category, strategy, content_category, original, 
     saved = 0.0 if not original_est else 100.0 * (original_est - counter_est) / original_est
     metric = {
         "timestamp": now.isoformat(), "day": now.date().isoformat(),
+        "home": _home_id(),
         "session": _safe_component(payload.get("session_id"), "unknown-session"),
         "tool": _safe_component(payload.get("tool_name"), "exec_command"),
         "command_category": category, "strategy": strategy,
@@ -1572,8 +2928,10 @@ def _metric_base(payload, mode, category, strategy, content_category, original, 
         "exit_status": exit_status, "skip_reason": skip_reason,
         "raw_ref_present": bool(raw_ref), "compressor_error": compressor_error,
         "audit_overflow": bool(audit_overflow),
+        "budget_chars": int(budget_chars),
         "rtk_used": bool(rtk_used),
         "rtk_head_substituted": bool(rtk_head_substituted),
+        "repeat_of_previous": bool(repeat_of_previous),
     }
     if command_head is not None:
         metric["command_head"] = command_head
@@ -1599,8 +2957,20 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
         tuple[str, int]: Model-visible output and normalized child exit status.
 
     Git reads receive a sanitized config/environment that disables hooks,
-    fsmonitor, pagers, external diff, and textconv. Capture/compressor/metric
-    failures preserve execution or fail open without broadening argv authority.
+    fsmonitor, pagers, external diff, and textconv. ``binary`` output and
+    ``code``/``diff``/``config`` output estimated below
+    ``TOKENPIPE_MIN_TOKENS_ESTIMATE`` stay byte-exact with a
+    ``<category>-passthrough`` skip reason; larger protected output is bounded
+    to its verbatim head and tail like any other replacement. A replacement
+    widens the native header by its recovery reference, and by the recovery
+    preview when the body was bounded: when the compressed body saves no more
+    than that widening, the exact body is kept with
+    ``skip_reason="net-loss"`` and no raw file is written, while the metric
+    counterfactual still measures the compressed body.
+    Capture/compressor/metric failures preserve execution or fail open without
+    broadening argv authority. Output that :func:`_looks_like_secret` flags is
+    never spooled or replaced: it is returned exactly, under skip reason
+    ``secret-guard``.
     When RTK is enabled but the command's :func:`command_head` is listed in the
     ``rtk_skip`` setting, the command runs natively with strategy
     ``passthrough`` and ``skip_reason`` ``rtk-skipped`` (unless another skip
@@ -1737,17 +3107,23 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
     content_category = classify(stdout + "\n" + stderr)
     strategy = "rtk-direct" if rtk_used else "passthrough"
     candidate = body
+    net_loss_candidate = None
     skip_reason = None
     compressor_error = None
     raw_ref = None
     try:
+        threshold = max(1, int(os.environ.get("TOKENPIPE_MIN_TOKENS_ESTIMATE", "1500")))
         if capture_overflow:
             strategy = "capture-overflow"
             skip_reason = "capture-overflow"
-            candidate = bound_candidate(body)
-        elif content_category in ("binary", "code", "diff", "config"):
+            candidate = bound_candidate(body, category=content_category)
+        elif content_category == "binary" or (
+            content_category in ("code", "diff", "config") and estimate_tokens(body) < threshold
+        ):
+            # Binary is never transformed; small protected output keeps its
+            # historical exact-passthrough reason instead of being bounded.
             skip_reason = content_category + "-passthrough"
-        elif estimate_tokens(body) < max(1, int(os.environ.get("TOKENPIPE_MIN_TOKENS_ESTIMATE", "1500"))):
+        elif estimate_tokens(body) < threshold:
             skip_reason = "below-threshold"
         else:
             if content_category == "json" and not stderr.strip():
@@ -1756,11 +3132,30 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
             else:
                 compressed_strategy, candidate = compress(body, content_category)
             strategy = ("rtk-direct+" if rtk_used else "") + compressed_strategy
-            candidate = bound_candidate(candidate)
-            if estimate_tokens(candidate) >= estimate_tokens(body):
+            candidate = bound_candidate(candidate, category=content_category)
+            candidate_est = estimate_tokens(candidate)
+            body_est = estimate_tokens(body)
+            passthrough_strategy = "rtk-direct" if rtk_used else "passthrough"
+            # A replacement widens the native header by the recovery reference,
+            # plus the recovery preview when the body was bounded; price that
+            # whole difference against the saving before replacing.
+            placeholder_ref = _raw_ref_placeholder(_runtime_raw_root())
+            overhead_est = max(0, estimate_tokens(_native_header(
+                supplied_category, exit_status, mode, strategy, placeholder_ref,
+                _preview_placeholder(placeholder_ref)
+                if BOUND_MARKER_RE.search(candidate) else "",
+            )) - estimate_tokens(_native_header(
+                supplied_category, exit_status, mode, passthrough_strategy, None,
+            )))
+            if candidate_est >= body_est:
                 candidate = body
-                strategy = "rtk-direct" if rtk_used else "passthrough"
+                strategy = passthrough_strategy
                 skip_reason = "no-savings"
+            elif candidate_est + overhead_est >= body_est:
+                net_loss_candidate = candidate
+                candidate = body
+                strategy = passthrough_strategy
+                skip_reason = "net-loss"
     except Exception as exc:
         candidate = body
         strategy = "rtk-direct" if rtk_used else "passthrough"
@@ -1775,6 +3170,12 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
         "session_id": session_id, "tool_call_id": tool_call_id,
         "tool_name": "exec_command", "command_category": supplied_category,
     }
+    if replace and _looks_like_secret(body):
+        # Same refusal as :func:`process`: no spool, no replacement, exact output.
+        replace = False
+        candidate = body
+        strategy = "rtk-direct" if rtk_used else "passthrough"
+        skip_reason = "secret-guard"
     if replace:
         try:
             runtime_raw = _runtime_raw_root()
@@ -1795,19 +3196,25 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
             skip_reason = "raw-spool-error"
             compressor_error = "raw-spool-" + type(exc).__name__
     shown_body = candidate if replace else body
-    shown_header = _native_header(supplied_category, exit_status, mode, strategy, raw_ref)
+    shown_header = _native_header(
+        supplied_category, exit_status, mode, strategy, raw_ref,
+        recovery_preview(shown_body, body, raw_ref))
     shown = shown_header + shown_body
     original_header = _native_header(supplied_category, exit_status, mode, "passthrough", None)
     original_native = original_header + body
-    counter_header = _native_header(supplied_category, exit_status, mode, strategy, "available-on-compression" if candidate != body else None)
-    counter_native = counter_header + candidate
+    # A net-loss decision keeps the compressed body as the counterfactual so
+    # `stats` still reports the saving that the header cost cancelled out.
+    counterfactual_body = candidate if net_loss_candidate is None else net_loss_candidate
+    counter_header = _native_header(supplied_category, exit_status, mode, strategy, "available-on-compression" if counterfactual_body != body else None)
+    counter_native = counter_header + counterfactual_body
     metric = _metric_base(
         payload, mode, supplied_category, strategy, content_category,
         original_native, shown, counter_native, exit_status, skip_reason, raw_ref,
         compressor_error, started, len(shown_header.encode("utf-8", "replace")),
-        mode == "audit" and len(shown) > max(256, int(os.environ.get("TOKENPIPE_MAX_SHOWN_CHARS", "7000"))),
+        mode == "audit" and len(shown) > _global_shown_cap(),
         rtk_used, head_label,
         rtk_head_substituted=rtk_head_substituted,
+        budget_chars=shown_budget(content_category),
     )
     try:
         _append_metric(metric)
@@ -1849,8 +3256,32 @@ def _parse_since(value):
 
 
 def load_metrics(since=None, session=None):
+    """Load metric rows belonging to the active home.
+
+    Args:
+        since (datetime.datetime | None): Timezone-aware lower bound; rows with
+            an earlier timestamp are dropped. ``None`` keeps all ages.
+        session (str | None): Exact sanitized session id filter. ``None`` keeps
+            every session.
+
+    Returns:
+        list[dict[str, object]]: Parsed rows in file order, home file first.
+        Unparsable or untimestamped lines are skipped rather than raising.
+
+    Raises:
+        OSError: A metrics file exists but cannot be read. A missing file is
+        not an error.
+
+    The runtime metrics file is shared by every home on the machine, because
+    the native wrapper falls back to it whenever the home file is not
+    writable. Rows read from it are therefore kept only when their ``home``
+    tag matches this home; legacy rows written before that tag existed are
+    kept so historical stats do not vanish. Rows from the home file itself are
+    never filtered.
+    """
+    home_id = _home_id()
     rows = []
-    for metrics_path in (_metrics_path(), _runtime_metrics_path()):
+    for metrics_path, shared in ((_metrics_path(), False), (_runtime_metrics_path(), True)):
         try:
             handle = open(metrics_path, "r", encoding="utf-8")
         except OSError as exc:
@@ -1864,6 +3295,8 @@ def load_metrics(since=None, session=None):
                     stamp = _dt.datetime.fromisoformat(row["timestamp"].replace("Z", "+00:00"))
                 except (ValueError, KeyError, TypeError):
                     continue
+                if shared and row.get("home", home_id) != home_id:
+                    continue
                 if since and stamp < since:
                     continue
                 if session and row.get("session") != session:
@@ -1873,16 +3306,24 @@ def load_metrics(since=None, session=None):
 
 
 def aggregate(rows):
-    """Aggregate metric rows into totals and per-dimension groups.
+    """Summarize metric rows into per-dimension groups and overall estimates.
 
     Args:
-        rows (list[dict]): Metric records as returned by :func:`load_metrics`.
+        rows (list[dict[str, object]]): Metric rows from :func:`load_metrics`.
+            Missing or malformed numeric fields count as zero, so partially
+            written rows never raise. The rows are not mutated.
 
     Returns:
-        dict: Report with estimate totals, native/RTK coverage counters, and
-        ``groups`` keyed by dimension. The ``command_head`` dimension is present
-        only when at least one row carries that field; other dimensions bucket
-        missing values under ``none``.
+        dict[str, object]: Call counts, native/RTK coverage and saved
+        percentages, token estimates, the ``repeat_calls`` count with the
+        ``repeat_saved_tokens_estimate`` those repeats would avoid, and a
+        ``groups`` mapping of dimension to per-key counters. The
+        ``command_head`` dimension is present only when at least one row
+        carries that field; other dimensions bucket missing values under
+        ``none``.
+
+    Pure: no I/O and no side effects. Every token figure is an estimate, never
+    provider usage accounting.
     """
     groups = {
         "day": {}, "session": {}, "command_category": {}, "command_head": {},
@@ -1922,6 +3363,7 @@ def aggregate(rows):
     ]
     native_original = sum(int(row.get("original_tokens_estimate") or 0) for row in native_rows)
     native_shown = sum(int(row.get("shown_tokens_estimate") or 0) for row in native_rows)
+    repeat_rows = [row for row in rows if row.get("repeat_of_previous")]
     return {
         "token_counts_are_estimates": True,
         "calls": len(rows),
@@ -1940,6 +3382,12 @@ def aggregate(rows):
         "counterfactual_tokens_estimate": counterfactual,
         "actual_saved_percent_estimate": round(100.0 * (original - shown) / original, 2) if original else 0.0,
         "counterfactual_saved_percent_estimate": round(100.0 * (original - counterfactual) / original, 2) if original else 0.0,
+        "repeat_calls": len(repeat_rows),
+        "repeat_saved_tokens_estimate": max(0, sum(
+            int(row.get("original_tokens_estimate") or 0)
+            - int(row.get("counterfactual_tokens_estimate") or 0)
+            for row in repeat_rows
+        )),
         "groups": groups,
     }
 
@@ -1986,15 +3434,48 @@ def show_raw(path):
         os.close(fd)
 
 
-def main(argv=None):
-    """Run the tokenpipe CLI.
+def _parse_char_range(value):
+    """Parse a ``START:END`` character range from the ``show`` command line.
 
     Args:
-        argv (list[str] | None): Command-line arguments without the program
-            name; ``None`` reads :data:`sys.argv`.
+        value (str): Range text such as ``"3120:7320"``. Surrounding blanks are
+            ignored; both bounds are required decimal integers.
 
     Returns:
-        int: Process exit status; ``exec`` forwards the child's status.
+        tuple[int, int]: Half-open ``[start, end)`` character offsets.
+
+    Raises:
+        ValueError: The text is not exactly two decimal integers separated by
+            one colon, ``start`` is negative, or ``end`` is not greater than
+            ``start``. Offsets beyond the end of the output are accepted and
+            clamp to it, exactly as a Python slice does.
+    """
+    parts = str(value).strip().split(":")
+    if len(parts) != 2 or not all(part.strip().isdigit() for part in parts):
+        raise ValueError("--range must be START:END with two character offsets")
+    start, end = int(parts[0]), int(parts[1])
+    if end <= start:
+        raise ValueError("--range END must be greater than START")
+    return start, end
+
+
+def main(argv=None):
+    """Run one command-line invocation of the local compressor.
+
+    Args:
+        argv (list[str] | None): Argument vector without the program name;
+            ``None`` reads ``sys.argv``.
+
+    Returns:
+        int: Process exit status. ``0`` on success, ``2`` for an unusable
+        recovery reference, malformed ``show --range``, or settings value, and
+        the child status for ``exec``.
+
+    Side effects depend on the subcommand: ``post`` may spool raw output and
+    append metrics, ``mode``/``post-replace``/``repeat-replace``/``rtk`` rewrite
+    private settings, ``exec`` runs the given argv without a shell, and
+    ``stats``/``show`` only read private state. Payload and settings failures
+    are reported as data, not raised.
     """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", action="version", version=VERSION)
@@ -2007,11 +3488,17 @@ def main(argv=None):
     stats.add_argument("--session")
     show = commands.add_parser("show", help="print a recoverable raw output")
     show.add_argument("raw_ref")
+    show.add_argument(
+        "--range", dest="char_range", metavar="START:END",
+        help="print only characters [START, END) of the decoded raw output")
     mode_cmd = commands.add_parser("mode", help="print or persist audit/safe/full mode")
     mode_cmd.add_argument("value", nargs="?", choices=("audit", "safe", "full"))
     replace_cmd = commands.add_parser(
         "post-replace", help="print or persist the post-replacement gate (1, category list, or off)")
     replace_cmd.add_argument("value", nargs="?")
+    repeat_cmd = commands.add_parser(
+        "repeat-replace", help="print or persist the exact-repeat replacement gate (1 or off)")
+    repeat_cmd.add_argument("value", nargs="?")
     rtk_cmd = commands.add_parser("rtk", help="show, enable, or disable trusted RTK integration")
     rtk_cmd.add_argument("value", nargs="?", help="absolute RTK executable path, or 'off'")
     rtk_cmd.add_argument(
@@ -2050,7 +3537,8 @@ def main(argv=None):
             json.dump(report, sys.stdout, ensure_ascii=False, indent=2, sort_keys=True)
             sys.stdout.write("\n")
         else:
-            print("Token counts are estimates (UTF-8 bytes / 3.5), not provider usage.")
+            print("Token counts are estimates from character-class ratios, not provider usage.")
+            print("Estimator: class-ratio v1")
             print("Calls: %d" % report["calls"])
             print("Audit-only calls: %d" % report["audit_calls"])
             print("Native calls: %d (%.2f%% of calls, %.2f%% of estimated tokens)" % (
@@ -2064,6 +3552,8 @@ def main(argv=None):
             print("Shown: %d est. tokens" % report["shown_tokens_estimate"])
             print("Tokenpipe-owned saved: %.2f%%" % report["actual_saved_percent_estimate"])
             print("Counterfactual saved: %.2f%%" % report["counterfactual_saved_percent_estimate"])
+            print("Repeat outputs: %d calls, %d est. tokens avoidable" % (
+                report["repeat_calls"], report["repeat_saved_tokens_estimate"]))
             if report["rtk_owned_calls"]:
                 print("RTK savings are external to these estimates; verify them with `rtk gain`.")
             for dimension in (
@@ -2080,7 +3570,11 @@ def main(argv=None):
         return 0
     if args.command == "show":
         try:
-            sys.stdout.write(show_raw(args.raw_ref))
+            text = show_raw(args.raw_ref)
+            if args.char_range is not None:
+                start, end = _parse_char_range(args.char_range)
+                text = text[start:end]
+            sys.stdout.write(text)
         except (OSError, ValueError) as exc:
             print("tokenpipe: %s" % exc, file=sys.stderr)
             return 2
@@ -2094,6 +3588,11 @@ def main(argv=None):
         if args.value is not None:
             set_post_replace(args.value.strip())
         print(configured_post_replace() or "off")
+        return 0
+    if args.command == "repeat-replace":
+        if args.value is not None:
+            set_repeat_replace(args.value.strip())
+        print("1" if configured_repeat_replace() else "off")
         return 0
     if args.command == "rtk":
         try:

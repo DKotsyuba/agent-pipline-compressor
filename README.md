@@ -127,13 +127,16 @@ Persist a mode with `python3 scripts/tokenpipe.py mode audit|safe|full`. `TOKENP
 | `TOKENPIPE_HOME` | `~/.codex/tokenpipe` | Private settings, raw-output and metrics root. |
 | `TOKENPIPE_RUNTIME_HOME` | system temp `codex-tokenpipe-<uid>` | Private runtime output used by the native wrapper. |
 | `TOKENPIPE_MIN_TOKENS_ESTIMATE` | `1500` | Minimum estimated input size before compression is considered. |
-| `TOKENPIPE_MAX_SHOWN_CHARS` | `7000` | Bound for shown compressed text. |
+| `TOKENPIPE_MAX_SHOWN_CHARS` | `7000` | Global ceiling for shown compressed text; every per-category budget is clamped to it. |
+| `TOKENPIPE_BUDGET_<CATEGORY>` | `error`/`code`/`diff` `7000`, `log`/`json` `6000`, `plain`/`search`/`config` `5000` | Shown-character budget for one content category, e.g. `TOKENPIPE_BUDGET_ERROR=4000`. Clamped to `[256, TOKENPIPE_MAX_SHOWN_CHARS]`; an unparsable value keeps the default. |
 | `TOKENPIPE_CAPTURE_MAX_BYTES` | `64 MiB` | Native child-output capture limit. |
 | `TOKENPIPE_RAW_TTL_SECONDS` | `7 days` | Raw-output retention target. |
 | `TOKENPIPE_RAW_MAX_BYTES` | `256 MiB` | Raw-output storage cap. |
 | `TOKENPIPE_METRICS_MAX_BYTES` | `8 MiB` | Metrics-file rotation cap. |
+| `TOKENPIPE_CLEANUP_INTERVAL_SECONDS` | `600` | Minimum seconds between raw-spool retention sweeps; `0` sweeps on every replacement. |
 | `TOKENPIPE_HOOK_TIMEOUT_SEC` | `30` | Hook post-processing timeout. |
 | `TOKENPIPE_POST_REPLACE` | `0` | Codex post-output replacement gate: `0`/absent audits only; `1` replaces any eligible content category; a comma-separated category list (e.g. `error,log`) replaces only output the compressor classifies into a listed category, and any other value audits only. The environment variable overrides the persisted `post-replace` setting. |
+| `TOKENPIPE_REPEAT_REPLACE` | `0` | Exact-repeat suppression gate: `0`/absent measures repeats only; `1` lets output byte-identical to the previous output of the same identity be shown as a short `raw_ref` notice, and only in `safe`/`full` mode when the earlier raw copy still reads back byte-for-byte. Persist it with `python3 scripts/tokenpipe.py repeat-replace 1\|off`; the environment variable overrides the persisted setting. |
 | `TOKENPIPE_AUDIT_MAX_BYTES` | `1 MiB` | Largest single Codex audit output copied to the compressor; larger output is recorded as metadata only. |
 | `TOKENPIPE_CLAUDE_MAX_BYTES` | `16 MiB` | Largest Claude text stream considered by its post-tool hook. |
 | `RTK_DB_PATH` | private runtime DB | Optional RTK history location; an explicit value takes precedence. |
@@ -164,11 +167,27 @@ For `python -m pytest`, the rewritten head becomes `rtk` so Tokenpipe no longer 
 
 ## Recovery, statistics, and privacy
 
+Search-shaped output is compressed structurally: the `search-group` strategy prints each matching file once with its match count and the first and last matches verbatim, and the `search-fold` strategy prints each directory once with its entry count and the first and last entries. Both mark every omission, keep the original first and last lines, leave short or sparse results untouched, and rely on `show <raw_ref>` for the complete result.
+
+Replacement must also pay for itself. A replacement ships with the recovery header the host renders above it, so the estimated saving is compared against the compressed output *plus* that header; when the saving does not exceed it, the exact original output is returned with `skip_reason=net-loss` and nothing is spooled. The metric row still records the compressed candidate as the counterfactual, so `stats` keeps reporting the potential the header cost cancelled out. The native wrapper applies the same rule to the recovery field its own header would gain.
+
+When bounding elides a middle section, the recovery header states how many characters were omitted and the exact command that prints them back, so no separate lookup is needed:
+
+```bash
+python3 scripts/tokenpipe.py show <raw_ref> --range <start>:<end>
+```
+
+`--range` takes character offsets into the decoded original as a half-open `START:END` span, prints exactly those characters, and rejects a malformed range with exit status `2`. Without `--range`, `show` prints the whole original. The preview follows the `raw_ref` field of the same header, after a `;`, and the net-win gate above prices that longer line so a bounded replacement is never judged a win on a header cost it does not pay.
+
 Replacement is allowed only after raw output is securely spooled; a spool error leaves the original output unchanged. Raw files are private runtime state (`0700` directories and `0600` files), may contain secrets from commands, and are subject to retention and size caps. Treat any `raw_ref` as sensitive.
 
-`stats` reads private metrics and reports estimates by mode, command category, command head, strategy, and plugin version. Metrics omit prompts, command arguments, and tool output. They are not provider billing/usage measurements.
+Output that looks like a credential is refused before anything is stored. Immediately before spooling, both the hook path and the native wrapper scan at most the first 256 KiB of the output for PEM private key blocks, AWS access keys, GitHub tokens, OpenAI/Anthropic-style keys, Slack tokens, JWTs, `Authorization: Bearer` headers, and a key word such as `password`, `secret`, `api_key`, or `token` directly assigned a value (prose that merely mentions those words does not match). On a match the output is returned byte-identical: this is a refusal, not a redaction, so nothing is rewritten, no raw file is written, no repeat-index entry is recorded, and the metric row carries only the skip reason `secret-guard` — never any matched text. The scan bound is deliberate: a credential appearing only after the first 256 KiB of a very large output is not detected, and output already spooled by earlier runs is unaffected.
+
+`stats` reads private metrics and reports estimates by mode, command category, command head, strategy, and plugin version. Metrics omit prompts, command arguments, and tool output. They are not provider billing/usage measurements. The `Repeat outputs` line counts calls whose output was byte-identical to the previous output of the same identity and the estimated tokens a repeat notice would have avoided, whether or not `TOKENPIPE_REPEAT_REPLACE` is on.
 
 Native wrapper metrics also record `command_head`: the allow-listed executable name plus, where applicable, its allow-listed subcommand (`git status`, `gh pr list`, `docker ps`, `pytest` for every pytest spelling). It is derived from the same fixed lists the wrapper uses to authorize a command and never contains arguments, paths, or flag values. Post-hook metrics do not carry it; `stats` prints the `command_head:` section (and `--json` includes the group) only when at least one record has the field, so you can see which commands RTK actually helps.
+
+Token counts come from the character-class estimator named in the `Estimator: class-ratio v1` line of the summary. It splits text into runs of prose, code punctuation, whitespace, digits, hex/base64 identifiers, non-Latin alphabets, CJK, and symbols, and charges each run its own characters-per-token rate, so hashes and ids are no longer under-counted and English prose is no longer over-counted. The caveat: those rates are heuristics calibrated against published OpenAI `o200k`-style measurements, not against the Claude tokenizer or any provider's billing, and a single estimate can still be off by tens of percent on unusual output. Rows written before this release were measured with the previous UTF-8-bytes/3.5 formula and are not rewritten, so a `--since` window that spans the upgrade mixes both. Thresholds such as `TOKENPIPE_MIN_TOKENS_ESTIMATE` keep their numeric defaults, so the size of output they admit shifts with the estimator.
 
 ```bash
 python3 scripts/tokenpipe.py stats
@@ -187,6 +206,11 @@ Host hook
   -> spool original successfully
   -> emit compressed output + raw_ref (otherwise emit original output)
 ```
+
+Protected categories are bounded, not exempt: `code`, `diff`, and `config` output above `TOKENPIPE_MIN_TOKENS_ESTIMATE` is replaced by its verbatim head and tail around an omission marker (strategy `bounded-code`, `bounded-diff`, `bounded-config`) with the exact original spooled and reachable through `raw_ref`. Output at or below that threshold, and binary output at any size, stays byte-exact and is never spooled.
+
+Compression is strategy-per-category and deterministic: JSON output folds arrays of six or more objects that all share exactly the same key set down to their first two items, a `__tokenpipe_similar_items__` marker with the exact omitted count and sorted key list, and the last item, recursively at any depth, while non-homogeneous arrays keep the head/tail truncation markers.
+Log-classified output collapses repeats: byte-identical neighbours become a `[previous line repeated N more times]` marker, and a line that matches an earlier one after volatile fields (timestamps, UUIDs, long hex ids, durations, byte sizes, percentages, and addresses) are masked for comparison only is dropped in favour of its first, verbatim occurrence, which gains a trailing `[seen N times]` marker — error and summary lines and the last line are always kept, and status codes, exit codes, and small integers are never masked.
 
 Key files:
 

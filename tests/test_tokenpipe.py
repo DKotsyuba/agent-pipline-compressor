@@ -170,14 +170,17 @@ class TokenpipeTests(unittest.TestCase):
             self.assertEqual(tokenpipe.plugin_version(), tokenpipe.VERSION)
 
     def test_diff_and_code_passthrough(self):
+        """Diff and code within the shown-character cap are never rewritten."""
         diff = "diff --git a/a b/a\n--- a/a\n+++ b/a\n" + ("+important\n" * 300)
         result = tokenpipe.process(self.payload(diff), "safe")
         self.assertEqual(result["action"], "passthrough")
-        self.assertEqual(result["skip_reason"], "diff-passthrough")
+        self.assertEqual(result["output"], diff)
+        self.assertEqual(result["skip_reason"], "no-savings")
         code = "\n".join(["def function_%d():\n    return %d" % (i, i) for i in range(100)])
         result = tokenpipe.process(self.payload(code), "safe")
         self.assertEqual(result["action"], "passthrough")
-        self.assertEqual(result["skip_reason"], "code-passthrough")
+        self.assertEqual(result["output"], code)
+        self.assertEqual(result["skip_reason"], "no-savings")
 
     def test_private_permissions_and_show_guard(self):
         raw = json.dumps({"items": list(range(100))}, indent=4)
@@ -389,9 +392,10 @@ class TokenpipeTests(unittest.TestCase):
         self.assertIn("__tokenpipe_omitted_items__", output)
 
     def test_native_allowlisted_config_outputs_remain_exact_passthrough(self):
+        """Config output within the shown-character cap stays byte-exact."""
         for index, sample in enumerate((
-            "root:\n  child: value\n" * 300,
-            "[section]\nkey = value\n" * 300,
+            "root:\n  child: value\n" * 200,
+            "[section]\nkey = value\n" * 200,
         )):
             rg = self.executable("rg", "print(%r, end='')\n" % sample)
             output, status = tokenpipe.execute_native(
@@ -400,7 +404,7 @@ class TokenpipeTests(unittest.TestCase):
             self.assertEqual(status, 0)
             self.assertIn(sample, output)
             self.assertNotIn("raw_ref=", output.splitlines()[0])
-            self.assertEqual(tokenpipe.load_metrics()[-1]["skip_reason"], "config-passthrough")
+            self.assertEqual(tokenpipe.load_metrics()[-1]["skip_reason"], "no-savings")
 
     def test_native_lite_log_path_is_exercised(self):
         rg = self.executable("rg", "print('same log line\\n' * 500, end='')\n")
@@ -667,6 +671,48 @@ class TokenpipeTests(unittest.TestCase):
         rows = tokenpipe.load_metrics()
         self.assertEqual(len(rows), count)
 
+    def test_metric_append_retries_transient_create_enoent(self):
+        """One ENOENT from the concurrent-create race must still write the row."""
+        original_open = tokenpipe.os.open
+        calls = {"count": 0}
+
+        def enoent_once(path, flags, mode=0o777, *, dir_fd=None):
+            """Fail the first metrics create with ENOENT, then delegate."""
+            if dir_fd is not None and path == "metrics.jsonl" and calls["count"] == 0:
+                calls["count"] += 1
+                raise FileNotFoundError(tokenpipe.errno.ENOENT, "transient", path)
+            return original_open(path, flags, mode, dir_fd=dir_fd)
+
+        tokenpipe.os.open = enoent_once
+        try:
+            tokenpipe._append_metric({"skip_reason": "retry-probe"})
+        finally:
+            tokenpipe.os.open = original_open
+        self.assertEqual(calls["count"], 1)
+        with open(tokenpipe._metrics_path(), "r", encoding="utf-8") as handle:
+            rows = handle.read().splitlines()
+        self.assertEqual([json.loads(row) for row in rows], [{"skip_reason": "retry-probe"}])
+
+    def test_metric_append_persistent_enoent_surfaces_and_skip_fails_open(self):
+        """A never-appearing metrics file fails fast while the CLI still exits 0."""
+        original_open = tokenpipe.os.open
+
+        def always_enoent(path, flags, mode=0o777, *, dir_fd=None):
+            """Emulate a metrics file that never becomes creatable."""
+            if dir_fd is not None and path == "metrics.jsonl":
+                raise FileNotFoundError(tokenpipe.errno.ENOENT, "persistent", path)
+            return original_open(path, flags, mode, dir_fd=dir_fd)
+
+        tokenpipe.os.open = always_enoent
+        try:
+            with self.assertRaises(FileNotFoundError):
+                tokenpipe.record_skip("search", "persistent-enoent", "audit", "s", "c")
+            self.assertEqual(tokenpipe.main(
+                ["skip", "--category", "search", "--reason", "persistent-enoent"]
+            ), 0)
+        finally:
+            tokenpipe.os.open = original_open
+
     def test_skip_records_audit_overflow_without_content(self):
         tokenpipe.record_skip("search", "audit-output-overflow", "audit", "s", "c")
         metric = tokenpipe.load_metrics()[-1]
@@ -758,7 +804,11 @@ class TokenpipeTests(unittest.TestCase):
             metric = tokenpipe.load_metrics()[-1]
             self.assertTrue(metric["rtk_used"])
             report = tokenpipe.aggregate([metric])
-            self.assertEqual(report["groups"]["strategy"]["rtk-direct"]["rtk_calls"], 1)
+            # The rtk route owns the call whether or not the deterministic
+            # compressor then finds a saving and appends its own strategy.
+            strategies = [key for key in report["groups"]["strategy"] if key.startswith("rtk-direct")]
+            self.assertEqual(len(strategies), 1)
+            self.assertEqual(report["groups"]["strategy"][strategies[0]]["rtk_calls"], 1)
             self.assertEqual(report["native_calls"], 1)
             self.assertEqual(report["rtk_owned_calls"], 1)
             self.assertEqual(report["native_call_coverage_percent_estimate"], 100.0)
@@ -1050,6 +1100,67 @@ class TokenpipeTests(unittest.TestCase):
         finally:
             tokenpipe.set_configured_rtk_skip("")
             tokenpipe.set_configured_rtk(None)
+
+    def test_shared_runtime_metrics_are_scoped_to_their_home(self):
+        """Native rows in the shared runtime file must not leak between homes."""
+        os.environ["TOKENPIPE_RUNTIME_HOME"] = os.path.join(self.temp.name, "shared-runtime")
+        os.makedirs(tokenpipe._runtime_home(), mode=0o700, exist_ok=True)
+        home_a = os.path.join(self.temp.name, "home-a")
+        home_b = os.path.join(self.temp.name, "home-b")
+
+        def native_row(home, session):
+            os.environ["TOKENPIPE_HOME"] = home
+            return tokenpipe._metric_base(
+                {"session_id": session, "tool_name": "exec_command"},
+                "safe", "test", "passthrough", "log", "out", "out", "out",
+                0, None, None, None, time.time(),
+            )
+
+        row_a = native_row(home_a, "from-a")
+        row_b = native_row(home_b, "from-b")
+        self.assertNotEqual(row_a["home"], row_b["home"])
+        self.assertNotIn(home_a, json.dumps(row_a))
+        legacy = dict(row_a, session="legacy")
+        legacy.pop("home")
+        with open(tokenpipe._runtime_metrics_path(), "w", encoding="utf-8") as handle:
+            for row in (row_a, row_b, legacy):
+                handle.write(json.dumps(row) + "\n")
+
+        os.environ["TOKENPIPE_HOME"] = home_a
+        self.assertEqual([row["session"] for row in tokenpipe.load_metrics()],
+                         ["from-a", "legacy"])
+        os.environ["TOKENPIPE_HOME"] = home_b
+        self.assertEqual([row["session"] for row in tokenpipe.load_metrics()],
+                         ["from-b", "legacy"])
+
+    def test_spool_cleanup_is_amortized_between_replacements(self):
+        """A fresh stamp suppresses the spool sweep; a stale one runs it again."""
+        os.environ["TOKENPIPE_CLEANUP_INTERVAL_SECONDS"] = "600"
+        raw = "repeat\n" * 200
+        calls = []
+        original = tokenpipe.cleanup_spool
+
+        def counting(*args, **kwargs):
+            calls.append(1)
+            return original(*args, **kwargs)
+
+        tokenpipe.cleanup_spool = counting
+        try:
+            self.assertEqual(tokenpipe.process(self.payload(raw), "safe")["action"], "replace")
+            self.assertEqual(len(calls), 1)
+            stamp = tokenpipe._cleanup_stamp_path()
+            self.assertTrue(os.path.exists(stamp))
+            second = tokenpipe.process(self.payload(raw, tool_call_id="second"), "safe")
+            self.assertEqual(second["action"], "replace")
+            self.assertEqual(len(calls), 1)
+            stale = time.time() - 3600
+            os.utime(stamp, (stale, stale))
+            third = tokenpipe.process(self.payload(raw, tool_call_id="third"), "safe")
+            self.assertEqual(third["action"], "replace")
+            self.assertEqual(len(calls), 2)
+            self.assertGreater(os.path.getmtime(stamp), stale)
+        finally:
+            tokenpipe.cleanup_spool = original
 
 
 if __name__ == "__main__":

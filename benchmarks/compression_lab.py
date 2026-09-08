@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Deterministic local-stage and real-command compression benchmark."""
+"""Deterministic local-stage and real-command compression benchmark.
+
+Protected-content policy (changed): protected fixtures are no longer required
+to stay byte-exact at every size. A protected candidate whose raw capture is
+estimated at or below ``TOKENPIPE_MIN_TOKENS_ESTIMATE`` must still be exact; a
+larger one may also be head/tail bounded, meaning its verbatim head and tail
+around the tokenpipe omission marker. Exact output remains valid above the
+threshold because the runtime deliberately falls back to it whenever raw
+spooling or recovery fails, and the separate ``raw_recoverable`` gate is what
+requires a recoverable original behind any bounded candidate.
+"""
 
 from __future__ import print_function
 
@@ -23,12 +33,15 @@ SPEC = importlib.util.spec_from_file_location("tokenpipe", TOKENPIPE_PATH)
 tokenpipe = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(tokenpipe)
 
-LAB_VERSION = "2.0.0"
+LAB_VERSION = "2.1.0"
 MAX_SELECTION_LATENCY_MS = 250.0
-STAGES = ("ansi", "json-lite", "log-lite", "cca", "bound")
+STAGES = ("ansi", "json-lite", "log-lite", "search-group", "search-fold", "cca", "bound")
 PARTIAL_ORDER = (("ansi", "json-lite"), ("ansi", "log-lite"), ("ansi", "cca"),
                  ("ansi", "bound"), ("json-lite", "bound"), ("log-lite", "cca"),
-                 ("log-lite", "bound"), ("cca", "bound"))
+                 ("log-lite", "bound"), ("cca", "bound"),
+                 ("ansi", "search-group"), ("search-group", "cca"), ("search-group", "bound"),
+                 ("ansi", "search-fold"), ("search-fold", "cca"), ("search-fold", "bound"))
+BOUND_MARKER_RE = re.compile(r"\n\.\.\.\[tokenpipe bounded output; omitted \d+ chars; use raw_ref\]\.\.\.\n")
 NORMALIZATION_RULES = (
     "ANSI escape sequences are removed",
     "CRLF and bare CR are normalized to LF",
@@ -98,6 +111,55 @@ def _repeat(line, count):
     return line * count
 
 
+def _varying_log(rounds=31):
+    """Render a log that repeats ten templates but never a byte-identical line.
+
+    Args:
+        rounds (int): Number of passes over the templates. Each pass emits ten
+            lines plus, every tenth pass, one ERROR line.
+
+    Returns:
+        str: Newline-terminated log text with monotonically increasing ISO
+        timestamps and varying hex ids, uuids, durations, byte sizes, and
+        percentages, so adjacent-repeat collapsing alone can save nothing.
+        Three ERROR lines are included and must survive any transform.
+    """
+    lines = []
+    for index in range(rounds):
+        stamp = "2026-01-01T00:%02d:%02dZ" % (index // 60, index % 60)
+        lines.append("%s INFO worker heartbeat interval 5s" % stamp)
+        lines.append("%s INFO fetched object %012x in %dms" % (stamp, index * 7919, 3 + index % 40))
+        lines.append("%s INFO cache hit ratio %d.%d%%" % (stamp, 90 + index % 9, index % 10))
+        lines.append("%s DEBUG mapped segment 0x%08x size %d.%dMB" % (stamp, index * 4096, 1 + index % 7, index % 10))
+        lines.append("%s INFO job 550e8400-e29b-41d4-a716-4466554400%02d accepted" % (stamp, index % 100))
+        lines.append("%s DEBUG flushed buffer %dKiB in %d.%ds" % (stamp, 4 + index % 60, index % 3, index % 10))
+        lines.append("%s INFO peer handshake %016x established" % (stamp, index * 104729))
+        lines.append("%s DEBUG gc pause %dms heap %d.%dMB" % (stamp, index % 25, 100 + index % 40, index % 10))
+        lines.append("%s INFO replicated shard %010x to node-3 in %dms" % (stamp, index * 31337, 5 + index % 20))
+        lines.append("%s DEBUG queue depth 4 backlog %dms" % (stamp, index % 90))
+        if index % 10 == 9:
+            lines.append("%s ERROR upload rejected by node-3 status=503" % stamp)
+    return "\n".join(lines) + "\n"
+
+
+def _varying_log_streams(rounds=31):
+    """Split :func:`_varying_log` across both captured streams.
+
+    Args:
+        rounds (int): Number of passes over the templates, as for
+            :func:`_varying_log`.
+
+    Returns:
+        tuple[str, str]: Stdout text carrying the INFO lines and stderr text
+        carrying the DEBUG and ERROR lines, so a fixture built from them
+        exercises the stderr capture path instead of declaring ``stderr=""``.
+    """
+    out, err = [], []
+    for line in _varying_log(rounds).splitlines():
+        (err if (" DEBUG " in line or " ERROR " in line) else out).append(line)
+    return "\n".join(out) + "\n", "\n".join(err) + "\n"
+
+
 def corpus():
     """Synthetic text corpus; no executable command cases are in this list."""
     pytest_pass = "============================= test session starts =============================\ncollected 3 items\n\ntests/test_math.py ...                                             [100%]\n\n3 passed in 0.01s\n"
@@ -107,6 +169,11 @@ def corpus():
     git_status = "On branch main\nChanges not staged for commit:\n  modified: scripts/tokenpipe.py\n  modified: tests/test_tokenpipe.py\nno changes added to commit\n"
     git_log = "\n".join("commit %040d\nAuthor: Lab User <lab@example.invalid>\nDate:   2026-01-%02d 00:00:00 +0000\n\n    deterministic fixture commit %03d" % (i, (i % 28) + 1, i) for i in range(1, 90)) + "\n"
     git_diff = "diff --git a/example.py b/example.py\nindex 1111111..2222222 100644\n--- a/example.py\n+++ b/example.py\n@@ -1,3 +1,43 @@\n def value():\n-    return 1\n+    return 2\n" + _repeat("+    # protected diff detail %03d\n" % 0, 40)
+    # Oversized protected diff: above the replacement threshold, so the policy
+    # expects head/tail bounding that keeps the first and last hunk headers.
+    oversized_diff = "diff --git a/service.py b/service.py\nindex 5555555..6666666 100644\n--- a/service.py\n+++ b/service.py\n" + "".join(
+        "@@ -%d,7 +%d,9 @@ def handler_%02d(request):\n     context before %02d\n-    return legacy_dispatch(request, %02d)\n+    validated = validate_payload(request, %02d)\n+    return modern_dispatch(validated, %02d)\n     context after %02d\n"
+        % (i * 20 + 1, i * 20 + 1, i, i, i, i, i, i) for i in range(45))
     rg_sparse = "\n".join("src/module%02d.py:%d:needle unique-%02d" % (i, i * 7, i) for i in range(1, 24)) + "\n"
     rg_dense = "\n".join("src/generated.py:%d:needle repeated payload" % i for i in range(1, 700)) + "\n"
     rg_io = "\n".join("rg: /missing-%03d: IO error for operation: No such file or directory" % i for i in range(1, 180)) + "\n"
@@ -116,10 +183,22 @@ def corpus():
     mixed_log = _repeat("INFO worker started\n", 100) + "WARN retrying request id=42\n" + _repeat("INFO worker finished\n", 90) + "ERROR request failed status=503\nTraceback: timeout\n"
     nested_json = json.dumps({"status": "ok", "items": [{"id": i, "meta": {"active": True, "labels": ["lab", "fixture"]}} for i in range(80)], "page": {"number": 1, "next": None}}, indent=2, sort_keys=True)
     error_json = json.dumps({"status": "failed", "error": {"type": "AssertionError", "message": "expected total", "trace": ["setup", "assert", "teardown"]}, "keys": ["status", "error"]}, indent=2, sort_keys=True)
+    inventory_json = json.dumps({"schema": "inventory/v1", "hosts": [
+        {"host": "node-%03d" % i, "region": "us-east-%d" % (i % 3), "uptime_s": i * 60,
+         "checks": [{"name": name, "ok": (i + j) % 5 != 0, "value": (i * 7 + j * 3) % 97}
+                    for j, name in enumerate(("disk", "memory", "cpu", "load", "io", "net", "gpu"))]}
+        for i in range(48)]}, indent=2, sort_keys=True)
     ansi_progress = "\x1b[2K\rprogress 10%\x1b[2K\rprogress 50%\x1b[2K\rprogress 100%\ncompleted successfully\n"
     protected_code = "\n".join("def protected_%03d(value):\n    return value + %d" % (i, i) for i in range(20)) + "\n"
     protected_config = "[service]\nname = lab\nmode = protected\n" + "\n".join("option_%02d = value_%02d" % (i, i) for i in range(20)) + "\n"
     adversarial = _repeat("ordinary diagnostic line\n", 35) + "\nAPI_KEY=LAB_ONLY_SECRET\npassword=LAB_ONLY_PASSWORD\n\n" + _repeat("ordinary tail line\n", 35) + "adversarial failure marker\n"
+    varying_log = _varying_log()
+    varying_stdout, varying_stderr = _varying_log_streams()
+    pytest_stderr_stdout = "============================= test session starts =============================\ncollected 2 items\n\ntests/test_io.py .F                                                [100%]\n=================================== FAILURES ===================================\nFAILED tests/test_io.py::test_write - OSError: disk quota exceeded\n=========================== short test summary info ============================\n1 failed, 1 passed in 0.03s\n"
+    pytest_stderr_stderr = _repeat("WARNING: ssl module is compiled with an unsupported LibreSSL build\n", 30) + "Traceback (most recent call last):\n  File \"tests/test_io.py\", line 8, in test_write\nOSError: disk quota exceeded\n"
+    rg_multifile = "\n".join("src/pkg%02d/module%02d.py:%d:needle %02d-%03d" % (i // 4, i, j * 3 + 1, i, j) for i in range(24) for j in range(100)) + "\n"
+    grep_small = "\n".join("src/app/main.py:%d:needle small %d" % (i * 4 + 1, i) for i in range(9)) + "\n"
+    find_nested = "\n".join("./src/pkg%d/sub%d/leaf%d/deep%d/module%02d.py" % (a, b, a, b, k) for a in range(5) for b in range(4) for k in range(15)) + "\n"
     return [
         Case("pytest-pass", "tests", "pytest", 3, 0, pytest_pass, must_keep=("3 passed",)),
         Case("pytest-fail", "tests", "pytest", 4, 1, pytest_fail, must_keep=("FAILED", "1 failed", "AssertionError")),
@@ -128,6 +207,7 @@ def corpus():
         Case("git-status", "git", "git-status", 2, 0, git_status, must_keep=("Changes not staged",)),
         Case("git-log", "git", "git-log", 2, 0, git_log, must_keep=("deterministic fixture commit",)),
         Case("git-diff-protected", "protected", "git-diff", 5, 0, git_diff, must_keep=("diff --git", "return 2"), exact_policy={"mode": "exact", "reason": "diff is protected"}),
+        Case("oversized-diff-protected", "protected", "git-diff", 5, 0, oversized_diff, must_keep=("@@ -1,7 +1,9 @@ def handler_00(request):", "@@ -881,7 +881,9 @@ def handler_44(request):"), exact_policy={"mode": "exact", "reason": "diff is protected above the threshold only as bounded head/tail"}),
         Case("rg-sparse", "search", "rg-sparse", 1, 0, rg_sparse, must_keep=("needle unique-23",)),
         Case("rg-dense", "search", "rg-dense", 2, 0, rg_dense, must_keep=("needle repeated payload",)),
         Case("rg-io-errors", "search", "rg-io-errors", 4, 2, rg_io, must_keep=("IO error", "No such file or directory")),
@@ -144,10 +224,21 @@ def corpus():
             {"path": ("status",), "type": "string", "value": "failed"}, {"path": ("error",), "type": "object"},
             {"path": ("error", "type"), "type": "string", "value": "AssertionError"}, {"path": ("error", "trace"), "type": "array", "count": 3},
         )),
+        Case("inventory-json", "json", "json", 3, 0, inventory_json, must_keep=("inventory/v1",), json_keys=("hosts", "schema"), json_expectations=(
+            {"path": ("schema",), "type": "string", "value": "inventory/v1"}, {"path": ("hosts",), "type": "array", "count": 48},
+            {"path": ("hosts", 0, "host"), "type": "string", "value": "node-000"}, {"path": ("hosts", 0, "region"), "type": "string", "value": "us-east-0"},
+            {"path": ("hosts", 0, "checks"), "type": "array", "count": 7}, {"path": ("hosts", 0, "checks", 0, "name"), "type": "string", "value": "disk"},
+        )),
         Case("ansi-progress", "logs", "log", 1, 0, ansi_progress, must_keep=("completed successfully",)), Case("small-output", "plain", "small", 1, 0, "ok\n"),
         Case("protected-code", "protected", "code", 5, 0, protected_code, must_keep=("def protected_019",), exact_policy={"mode": "exact", "reason": "source code is protected"}),
         Case("protected-config", "protected", "config", 5, 0, protected_config, must_keep=("mode = protected",), exact_policy={"mode": "exact", "reason": "configuration is protected"}),
         Case("adversarial-secret-like", "adversarial", "plain", 5, 0, adversarial, must_keep=("adversarial failure marker",), secret_like=("API_KEY=LAB_ONLY_SECRET", "password=LAB_ONLY_PASSWORD")),
+        Case("varying-timestamp-log", "logs", "log", 4, 0, varying_log, must_keep=("worker heartbeat", "ERROR upload rejected", "status=503")),
+        Case("varying-timestamp-log-stderr", "logs", "log", 4, 1, varying_stdout, stderr=varying_stderr, must_keep=("worker heartbeat", "ERROR upload rejected", "gc pause")),
+        Case("pytest-fail-stderr", "tests", "pytest", 4, 1, pytest_stderr_stdout, stderr=pytest_stderr_stderr, must_keep=("FAILED", "1 failed", "disk quota exceeded", "WARNING")),
+        Case("rg-multifile", "search", "rg-multifile", 2, 0, rg_multifile, must_keep=("needle 00-000", "src/pkg02/module11.py", "needle 23-099")),
+        Case("grep-small", "search", "grep-small", 3, 0, grep_small, must_keep=("needle small 8",), exact_policy={"mode": "exact", "reason": "search output below the grouping threshold stays verbatim"}),
+        Case("find-nested", "filesystem", "find-nested", 2, 0, find_nested, must_keep=("./src/pkg0/sub0/leaf0/deep0/module00.py", "./src/pkg2/sub2/leaf2", "./src/pkg4/sub3/leaf4/deep3/module14.py")),
     ]
 
 
@@ -160,10 +251,26 @@ def canonical_hash(value):
 
 
 def _applicable_stages(case):
-    if case.route == "json":
+    """Return the local stages a case's route is allowed to evaluate.
+
+    Args:
+        case (Case or CommandCase): Case whose ``route`` string selects the
+            applicable stage set.
+
+    Returns:
+        tuple[str]: Stage names forming a sub-order of ``STAGES``. JSON routes
+        (``json`` and any route suffixed ``-json``, such as ``rtk-json``) get
+        ``json-lite``; textual log routes get ``log-lite``; protected
+        diff/code/config routes keep only non-destructive stages.
+    """
+    if case.route == "json" or case.route.endswith("-json"):
         return ("ansi", "json-lite", "bound")
     if case.route in ("log", "rg-io-errors", "git-log", "pytest", "unittest", "generic-test", "rtk-log"):
         return ("ansi", "log-lite", "cca", "bound")
+    if case.route in ("rg-sparse", "rg-dense", "rg-multifile", "grep-small"):
+        return ("ansi", "search-group", "cca", "bound")
+    if case.route in ("ls", "find", "find-nested"):
+        return ("ansi", "search-fold", "cca", "bound")
     if case.route in ("git-diff", "code", "config"):
         return ("ansi", "cca", "bound")
     return ("ansi", "cca", "bound")
@@ -229,12 +336,30 @@ def _rtk_path(explicit=None, allow=True):
 
 
 def _stage_apply(text, stage):
+    """Apply one named deterministic stage to captured output.
+
+    Args:
+        text (str): Candidate text produced by the preceding stages.
+        stage (str): Stage identifier drawn from :data:`STAGES`.
+
+    Returns:
+        str: The transformed text. Both structural search stages reuse the
+        compressor's own shape detection, so output that is not search shaped
+        is returned unchanged.
+
+    Raises:
+        ValueError: The stage name is not a known stage.
+    """
     if stage == "ansi":
         return tokenpipe.ANSI_RE.sub("", text).replace("\r\n", "\n").replace("\r", "\n")
     if stage == "json-lite":
         return tokenpipe.lite_json(text)
     if stage == "log-lite":
         return tokenpipe.lite_log(text)
+    if stage == "search-group":
+        return tokenpipe.group_matches(text) if tokenpipe._is_match_lines(text) else text
+    if stage == "search-fold":
+        return tokenpipe.fold_paths(text) if tokenpipe._is_path_lines(text) else text
     if stage == "cca":
         return tokenpipe.cca_rank(text, target_chars=1400)
     if stage == "bound":
@@ -270,10 +395,43 @@ def _json_type(value):
     return "unknown"
 
 
+def _marker_omitted_count(item):
+    """Return the omitted-item count a tokenpipe fold marker declares.
+
+    Args:
+        item (object): Candidate JSON value of any type.
+
+    Returns:
+        int or None: The declared omitted count when ``item`` is exactly a
+        ``__tokenpipe_omitted_items__`` or ``__tokenpipe_similar_items__``
+        marker object; ``None`` when ``item`` is ordinary array content.
+    """
+    if not isinstance(item, dict):
+        return None
+    if set(item) == {"__tokenpipe_omitted_items__"} and isinstance(item["__tokenpipe_omitted_items__"], int):
+        return item["__tokenpipe_omitted_items__"]
+    if set(item) == {"__tokenpipe_similar_items__", "keys"} and isinstance(item["__tokenpipe_similar_items__"], int):
+        return item["__tokenpipe_similar_items__"]
+    return None
+
+
 def _effective_array_count(value):
+    """Count the items a sanitized JSON array represents.
+
+    Args:
+        value (object): Candidate JSON value of any type.
+
+    Returns:
+        int or None: Effective item count with fold markers expanded to their
+        declared omitted counts; ``None`` when ``value`` is not a list.
+    """
     if not isinstance(value, list):
         return None
-    return sum(item.get("__tokenpipe_omitted_items__", 0) if isinstance(item, dict) and set(item) == {"__tokenpipe_omitted_items__"} and isinstance(item.get("__tokenpipe_omitted_items__"), int) else 1 for item in value)
+    total = 0
+    for item in value:
+        omitted = _marker_omitted_count(item)
+        total += omitted if omitted is not None else 1
+    return total
 
 
 def schema_check(case, candidate):
@@ -301,6 +459,50 @@ def schema_check(case, candidate):
     return {"valid": not failures, "failures": failures, "expectations": [dict(item) for item in expectations]}
 
 
+def _bounded_shape(raw, candidate):
+    """Report whether a candidate is a head/tail bounded form of one raw text.
+
+    Args:
+        raw (str): Exact reference capture the candidate was derived from.
+        candidate (str): Candidate output under evaluation.
+
+    Returns:
+        bool: True when the candidate is exactly a non-empty verbatim prefix of
+        ``raw``, one tokenpipe omission marker, and a non-empty verbatim suffix
+        of ``raw``; False for any other shape, including an absent marker or
+        text the marker does not split into verbatim ends.
+    """
+    match = BOUND_MARKER_RE.search(candidate)
+    if not match:
+        return False
+    head, tail = candidate[:match.start()], candidate[match.end():]
+    return bool(head) and bool(tail) and raw.startswith(head) and raw.endswith(tail)
+
+
+def _protected_gate(case, raw, candidate):
+    """Apply the protected-content policy to one candidate.
+
+    Args:
+        case (Case): Case whose ``exact_policy`` declares the required mode;
+            only ``{"mode": "exact"}`` is constrained here.
+        raw (str): Exact reference capture, pre-normalization for exact cases.
+        candidate (str): Candidate output under evaluation.
+
+    Returns:
+        bool: True when the candidate satisfies the policy. Unprotected cases
+        always pass. Protected captures estimated below
+        ``TOKENPIPE_MIN_TOKENS_ESTIMATE`` pass only when byte-exact; larger
+        captures also pass when head/tail bounded, matching the runtime's
+        ``bounded-<category>`` replacement.
+    """
+    if case.exact_policy.get("mode") != "exact" or candidate == raw:
+        return True
+    threshold = max(1, int(os.environ.get("TOKENPIPE_MIN_TOKENS_ESTIMATE", "1500")))
+    if tokenpipe.estimate_tokens(raw) < threshold:
+        return False
+    return _bounded_shape(raw, candidate)
+
+
 def _markers_valid(case, candidate):
     return (all(marker in candidate for marker in case.must_keep) and
             all(any(marker in candidate for marker in group) for group in case.alternative_markers))
@@ -318,7 +520,7 @@ def evaluate_candidate(case, raw, candidate, observed_exit, raw_recoverable, sou
     schema = schema_check(case, candidate)
     reasons = []
     gates = {"exit": observed_exit == case.exit_code, "markers": _markers_valid(case, candidate),
-             "json_schema": schema["valid"], "exact_protected": case.exact_policy.get("mode") != "exact" or candidate == (raw if exact_raw is None else exact_raw),
+             "json_schema": schema["valid"], "exact_protected": _protected_gate(case, raw if exact_raw is None else exact_raw, candidate),
              "non_expansion": len(candidate.encode("utf-8", "replace")) <= len(raw.encode("utf-8", "replace")), "raw_recoverable": bool(raw_recoverable)}
     reasons.extend(gate for gate, passed in gates.items() if not passed)
     raw_bytes = len(raw.encode("utf-8", "replace")); candidate_bytes = len(candidate.encode("utf-8", "replace"))
@@ -346,7 +548,7 @@ def _candidate(case, raw, source, order, raw_recoverable, observed_exit, case_id
         candidate = apply_order(raw, order)
     except Exception as exc:
         result = evaluate_candidate(case, raw, raw, observed_exit, raw_recoverable, source, order, base_latency_ms, case_id, normalization, exact_raw)
-        result.update(valid=False, invalid_reasons=["stage-error", type(exc).__name__])
+        result.update(valid=False, invalid_reasons=result["invalid_reasons"] + ["stage-error", type(exc).__name__])
         return result
     return evaluate_candidate(case, raw, candidate, observed_exit, raw_recoverable, source, order,
                               round(base_latency_ms + (time.perf_counter() - started) * 1000.0, 3), case_id, normalization, exact_raw)
@@ -512,6 +714,15 @@ def _command_matrix(root, fixture_dir):
     _write(os.path.join(search_root, "sparse.txt"), "\n".join("needle sparse-%02d" % i for i in range(1, 8)) + "\n")
     _write(os.path.join(search_root, "dense.txt"), "\n".join("needle repeated payload %03d" % i for i in range(1, 120)) + "\n")
     for index in range(3): _write(os.path.join(search_root, "module%02d.py" % index), "needle module\n")
+    # Dense multi-file search results and a nested path listing exercise the
+    # structural search strategies on real `rg` and `find` captures.
+    dense_root = os.path.join(search_root, "dense"); os.makedirs(dense_root)
+    for index in range(24): _write(os.path.join(dense_root, "dense%02d.txt" % index), "\n".join("needle repeated payload %03d" % line for line in range(100)) + "\n")
+    tree_root = os.path.join(command_root, "tree")
+    for pkg in range(5):
+        for sub in range(4):
+            leaf = os.path.join(tree_root, "pkg%d" % pkg, "sub%d" % sub, "leaf%d" % pkg, "deep%d" % sub); os.makedirs(leaf)
+            for index in range(15): _write(os.path.join(leaf, "module%02d.py" % index), "fixture\n")
     _write(os.path.join(command_root, "README.md"), "README\n"); _write(os.path.join(command_root, "data.json"), "{}\n")
     cases = []
     if available["pytest"]:
@@ -530,10 +741,12 @@ def _command_matrix(root, fixture_dir):
     if available["rg"]:
         rg_bin = shutil.which("rg")
         cases += [CommandCase("rg-sparse", "search", "rg-sparse", 1, (rg_bin, "needle", os.path.join(search_root, "sparse.txt")), ("rtk", "rg", "needle", os.path.join(search_root, "sparse.txt")), command_root, 0, ("sparse-07",), normalization_root=command_root), CommandCase("rg-dense", "search", "rg-dense", 2, (rg_bin, "needle", os.path.join(search_root, "dense.txt")), ("rtk", "rg", "needle", os.path.join(search_root, "dense.txt")), command_root, 0, ("repeated payload",), normalization_root=command_root), CommandCase("rg-io-errors", "search", "rg-io-errors", 4, (rg_bin, "needle", os.path.join(search_root, "missing.txt")), ("rtk", "rg", "needle", os.path.join(search_root, "missing.txt")), command_root, 2, ("No such file or directory",), normalization_root=command_root)]
+        cases.append(CommandCase("rg-multifile", "search", "rg-multifile", 2, (rg_bin, "needle", dense_root), ("rtk", "rg", "needle", dense_root), command_root, 0, ("needle repeated payload",), normalization_root=command_root))
     if available["ls"]:
         ls_bin = shutil.which("ls"); cases.append(CommandCase("ls-output", "filesystem", "ls", 1, (ls_bin, "-1", command_root), ("rtk", "ls", "-1", command_root), command_root, 0, ("README.md", "data.json"), normalization_root=command_root))
     if available["find"]:
         find_bin = shutil.which("find"); cases.append(CommandCase("find-output", "filesystem", "find", 1, (find_bin, command_root, "-maxdepth", "1", "-type", "f", "-print"), ("rtk", "find", command_root, "-maxdepth", "1", "-type", "f", "-print"), command_root, 0, ("README.md", "fixture.json"), normalization_root=command_root))
+        cases.append(CommandCase("find-nested", "filesystem", "find-nested", 3, (find_bin, tree_root, "-type", "f", "-print"), ("rtk", "find", tree_root, "-type", "f", "-print"), command_root, 0, ("module",), normalization_root=command_root))
     cat = shutil.which("cat") or "/bin/cat"
     cases += [CommandCase("rtk-log", "logs", "rtk-log", 2, (cat, log_path), ("rtk", "log", log_path), command_root, 0, ("ERROR",), alternative_markers=(("heartbeat", "120 info messages"),), normalization_root=command_root), CommandCase("rtk-json", "json", "rtk-json", 3, (cat, json_path), ("rtk", "json", json_path), command_root, 0, ("status",), json_expectations=json_case.json_expectations, normalization_root=command_root)]
     return cases, available
@@ -544,13 +757,37 @@ def _manifest_argv(argv, root):
 
 
 def _run_in_root(root, enable_rtk=True, explicit_rtk=None):
+    """Evaluate the whole corpus inside one prepared scratch root.
+
+    Writes synthetic fixtures, captures the real command matrix, scores every
+    candidate pipeline, and aggregates the winners. Every record carries both
+    token estimates for one release: ``tokens_new`` (and ``raw_tokens``, used
+    by all gates, winners, and aggregates) from
+    ``tokenpipe.estimate_tokens``, and ``tokens_old`` from the superseded
+    ``tokenpipe.estimate_tokens_bytes``.
+
+    Args:
+        root (str): Existing writable scratch directory. Fixtures, the raw
+            spool, and the rtk history database are created beneath it.
+        enable_rtk (bool): Allow the external ``rtk`` route when a trusted
+            binary is discoverable.
+        explicit_rtk (str | None): Explicit ``rtk`` path; ``None`` searches
+            ``PATH``.
+
+    Returns:
+        dict: Full lab report; see ``markdown_summary`` for the rendered form.
+
+    Note:
+        Executes local fixture commands as subprocesses and writes only under
+        ``root`` and the runtime raw spool.
+    """
     fixture_dir = os.path.join(root, "fixtures"); raw_dir = tokenpipe._runtime_raw_root(); os.makedirs(fixture_dir); os.makedirs(raw_dir)
     rtk, rtk_status = _rtk_path(explicit_rtk, enable_rtk); env = os.environ.copy(); env["RTK_DB_PATH"] = os.path.join(root, "rtk-history.db"); env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
     records, orders_seen, invalid = [], set(), []
     for case in corpus():
         raw, exit_code, capture_latency = _capture(_write_fixture(case, fixture_dir)); ref = tokenpipe.spool_raw(raw, "compression-lab", case.case_id, raw_dir); recoverable = tokenpipe.show_raw(ref) == raw
         orders = enumerate_orders(_applicable_stages(case)); orders_seen.update(order_name(order) for order in orders); candidates = [_candidate(case, raw, "local", order, recoverable, exit_code, case.case_id) for order in orders]
-        best = _best(candidates); record = case.metadata(sha256(raw)); record.update(scope="synthetic", observed_exit_code=exit_code, raw_bytes=len(raw.encode()), raw_tokens=tokenpipe.estimate_tokens(raw), capture_latency_ms=capture_latency, raw_recoverable=recoverable, candidate_order_count=len(orders), candidate_orders=[order_name(order) for order in orders], winner=best["id"] if best else None, candidates=candidates); records.append(record)
+        best = _best(candidates); record = case.metadata(sha256(raw)); record.update(scope="synthetic", observed_exit_code=exit_code, raw_bytes=len(raw.encode()), raw_tokens=tokenpipe.estimate_tokens(raw), tokens_new=tokenpipe.estimate_tokens(raw), tokens_old=tokenpipe.estimate_tokens_bytes(raw), capture_latency_ms=capture_latency, raw_recoverable=recoverable, candidate_order_count=len(orders), candidate_orders=[order_name(order) for order in orders], winner=best["id"] if best else None, candidates=candidates); records.append(record)
         invalid += [(record["id"], item) for item in candidates if not item["valid"]]
     command_cases, discovered = _command_matrix(root, fixture_dir)
     for command in command_cases:
@@ -576,8 +813,8 @@ def _run_in_root(root, enable_rtk=True, explicit_rtk=None):
                     candidate = apply_order(rtk_quality, order); latency = rtk_overhead + round((time.perf_counter() - started) * 1000.0, 3)
                     candidates.append(evaluate_candidate(quality_case, quality_raw, candidate, rtk_exit, rtk_recoverable, "rtk->local", order, latency, command.case_id, normalization, raw))
                 except Exception as exc:
-                    failed = evaluate_candidate(quality_case, quality_raw, rtk_quality, rtk_exit, rtk_recoverable, "rtk->local", order, rtk_overhead, command.case_id, normalization, raw); failed.update(valid=False, invalid_reasons=["stage-error", type(exc).__name__]); candidates.append(failed)
-        best = _best(candidates); record = {"id": command.case_id, "scope": "command-matrix", "category": command.category, "route": command.route, "weight": command.weight, "exit_code": command.exit_code, "observed_exit_code": exit_code, "raw_sha256": sha256(normalized_raw), "raw_bytes": len(normalized_raw.encode()), "raw_tokens": tokenpipe.estimate_tokens(normalized_raw), "capture_latency_ms": capture_latency, "raw_recoverable": recoverable, "normalization": {"rules": normalization, "raw_changed": raw != normalized_raw}, "rtk_capture": rtk_capture, "winner": best["id"] if best else None, "candidates": candidates}; records.append(record); invalid += [(record["id"], item) for item in candidates if not item["valid"]]
+                    failed = evaluate_candidate(quality_case, quality_raw, rtk_quality, rtk_exit, rtk_recoverable, "rtk->local", order, rtk_overhead, command.case_id, normalization, raw); failed.update(valid=False, invalid_reasons=failed["invalid_reasons"] + ["stage-error", type(exc).__name__]); candidates.append(failed)
+        best = _best(candidates); record = {"id": command.case_id, "scope": "command-matrix", "category": command.category, "route": command.route, "weight": command.weight, "exit_code": command.exit_code, "observed_exit_code": exit_code, "raw_sha256": sha256(normalized_raw), "raw_bytes": len(normalized_raw.encode()), "raw_tokens": tokenpipe.estimate_tokens(normalized_raw), "tokens_new": tokenpipe.estimate_tokens(normalized_raw), "tokens_old": tokenpipe.estimate_tokens_bytes(normalized_raw), "capture_latency_ms": capture_latency, "raw_recoverable": recoverable, "normalization": {"rules": normalization, "raw_changed": raw != normalized_raw}, "rtk_capture": rtk_capture, "winner": best["id"] if best else None, "candidates": candidates}; records.append(record); invalid += [(record["id"], item) for item in candidates if not item["valid"]]
     manifest = {"synthetic_corpus": {"cases": [{key: value for key, value in record.items() if key in ("id", "category", "route", "weight", "exit_code", "must_keep", "alternative_markers", "secret_like_count", "secret_like_sha256", "exact_policy", "json_keys", "json_expectations", "raw_sha256")} for record in records if record["scope"] == "synthetic"], "partial_order": [list(item) for item in PARTIAL_ORDER], "orders": sorted(orders_seen)}, "command_matrix": {"cases": [{"id": case.case_id, "category": case.category, "route": case.route, "weight": case.weight, "argv": _manifest_argv(case.argv, root), "rtk_argv": _manifest_argv(case.rtk_argv, root), "exit_code": case.exit_code, "must_keep": list(case.must_keep), "alternative_markers": [list(group) for group in case.alternative_markers], "exact_policy": case.exact_policy, "json_expectations": [dict(item) for item in case.json_expectations]} for case in command_cases], "discovered": discovered}}
     synthetic_rows = _aggregate_rows(records, "synthetic"); command_rows = _aggregate_rows(records, "command-matrix")
     per_content = {}
@@ -589,7 +826,7 @@ def _run_in_root(root, enable_rtk=True, explicit_rtk=None):
     rtk_executed = sum(bool((record.get("rtk_capture") or {}).get("executed")) for record in command_records)
     capabilities = {"stdlib": {"discovered": True, "executed": True, "status": "available"}, "unittest": {"discovered": True, "executed": any(record["id"].startswith("unittest-") and record["observed_exit_code"] == record["exit_code"] for record in command_records), "status": "available"}, "pytest": {"discovered": discovered["pytest"], "executed": any(record["id"].startswith("pytest-") and record["observed_exit_code"] == record["exit_code"] for record in command_records), "status": "available" if discovered["pytest"] else "skipped (unavailable)"}, "rg": {"discovered": discovered["rg"], "executed": any(record["id"].startswith("rg-") and record["observed_exit_code"] == record["exit_code"] for record in command_records), "status": "available" if discovered["rg"] else "skipped (unavailable)"}, "git": {"discovered": discovered["git"], "executed": any(record["id"].startswith("git-") and record["observed_exit_code"] == record["exit_code"] for record in command_records), "status": "available" if discovered["git"] else "skipped (unavailable)"}, "ls": {"discovered": discovered["ls"], "executed": any(record["id"] == "ls-output" and record["observed_exit_code"] == record["exit_code"] for record in command_records), "status": "available" if discovered["ls"] else "skipped (unavailable)"}, "find": {"discovered": discovered["find"], "executed": any(record["id"] == "find-output" and record["observed_exit_code"] == record["exit_code"] for record in command_records), "status": "available" if discovered["find"] else "skipped (unavailable)"}, "rtk": {"discovered": discovered["rtk"], "executed": bool(rtk and rtk_executed == rtk_declared), "executed_count": rtk_executed, "declared_count": rtk_declared, "status": rtk_status}}
     policies = {"synthetic": _routing_policy(records, "synthetic"), "command_matrix": _routing_policy(records, "command-matrix")}
-    return {"schema_version": 2, "lab_version": LAB_VERSION, "manifest_sha256": canonical_hash(manifest), "manifest": manifest, "synthetic_corpus": {"case_count": sum(record["scope"] == "synthetic" for record in records), "raw_sha256": canonical_hash([record["raw_sha256"] for record in records if record["scope"] == "synthetic"]), "candidate_orders": len(orders_seen)}, "command_matrix": {"declared_case_count": len(command_cases), "executed_case_count": sum(record["observed_exit_code"] == record["exit_code"] and record["raw_recoverable"] for record in records if record["scope"] == "command-matrix"), "real_routes": [record["route"] for record in records if record["scope"] == "command-matrix"], "rtk_routes": [record["rtk_capture"]["argv"] for record in records if record.get("rtk_capture")]}, "normalization": {"rules": list(NORMALIZATION_RULES), "applied_capture_count": len(command_cases) * len(NORMALIZATION_RULES), "rule_counts": dict((rule, len(command_cases)) for rule in NORMALIZATION_RULES)}, "pipeline_comparison": {"evaluated": ["local-only"] + (["rtk-only", "rtk->local"] if rtk else []), "skipped": [] if rtk else ["rtk-only", "rtk->local"], "rejected": [{"order": "local->rtk", "reason": "would re-execute a stateful command"}]}, "capabilities": capabilities, "aggregate": {"cases": len(records), "candidate_orders": len(orders_seen), "candidates": len(all_candidates), "valid_candidates": valid_count, "invalid_candidates": len(invalid), "raw_bytes": sum(record["raw_bytes"] for record in records), "raw_tokens": sum(record["raw_tokens"] for record in records), "synthetic_cases": sum(record["scope"] == "synthetic" for record in records), "command_cases": len(command_cases), "total_weight": sum(record["weight"] for record in records)}, "pipeline_aggregates": {"synthetic": synthetic_rows, "command_matrix": command_rows}, "global_winners": policies, "per_content_winners": per_content, "pareto_frontier": _pareto(synthetic_rows + command_rows), "invalid_candidates": [{"case_id": case_id, "id": item["id"], "source": item["source"], "order": item["order"], "invalid_reasons": item["invalid_reasons"], "gates": item["gates"]} for case_id, item in invalid], "synthetic_cases": [record for record in records if record["scope"] == "synthetic"], "command_cases": [record for record in records if record["scope"] == "command-matrix"]}
+    return {"schema_version": 2, "lab_version": LAB_VERSION, "manifest_sha256": canonical_hash(manifest), "manifest": manifest, "synthetic_corpus": {"case_count": sum(record["scope"] == "synthetic" for record in records), "raw_sha256": canonical_hash([record["raw_sha256"] for record in records if record["scope"] == "synthetic"]), "candidate_orders": len(orders_seen)}, "command_matrix": {"declared_case_count": len(command_cases), "executed_case_count": sum(record["observed_exit_code"] == record["exit_code"] and record["raw_recoverable"] for record in records if record["scope"] == "command-matrix"), "real_routes": [record["route"] for record in records if record["scope"] == "command-matrix"], "rtk_routes": [record["rtk_capture"]["argv"] for record in records if record.get("rtk_capture")]}, "normalization": {"rules": list(NORMALIZATION_RULES), "applied_capture_count": len(command_cases) * len(NORMALIZATION_RULES), "rule_counts": dict((rule, len(command_cases)) for rule in NORMALIZATION_RULES)}, "pipeline_comparison": {"evaluated": ["local-only"] + (["rtk-only", "rtk->local"] if rtk else []), "skipped": [] if rtk else ["rtk-only", "rtk->local"], "rejected": [{"order": "local->rtk", "reason": "would re-execute a stateful command"}]}, "capabilities": capabilities, "aggregate": {"cases": len(records), "candidate_orders": len(orders_seen), "candidates": len(all_candidates), "valid_candidates": valid_count, "invalid_candidates": len(invalid), "raw_bytes": sum(record["raw_bytes"] for record in records), "raw_tokens": sum(record["raw_tokens"] for record in records), "raw_tokens_new": sum(record["tokens_new"] for record in records), "raw_tokens_old": sum(record["tokens_old"] for record in records), "synthetic_cases": sum(record["scope"] == "synthetic" for record in records), "command_cases": len(command_cases), "total_weight": sum(record["weight"] for record in records)}, "pipeline_aggregates": {"synthetic": synthetic_rows, "command_matrix": command_rows}, "global_winners": policies, "per_content_winners": per_content, "pareto_frontier": _pareto(synthetic_rows + command_rows), "invalid_candidates": [{"case_id": case_id, "id": item["id"], "source": item["source"], "order": item["order"], "invalid_reasons": item["invalid_reasons"], "gates": item["gates"]} for case_id, item in invalid], "synthetic_cases": [record for record in records if record["scope"] == "synthetic"], "command_cases": [record for record in records if record["scope"] == "command-matrix"]}
 
 
 def run_lab(enable_rtk=False, explicit_rtk=None, root=None):
@@ -604,8 +841,23 @@ def run_lab(enable_rtk=False, explicit_rtk=None, root=None):
 
 
 def markdown_summary(report):
+    """Render the human-readable lab report.
+
+    Args:
+        report (dict): Report produced by ``run_lab``/``_run_in_root``.
+
+    Returns:
+        str: Newline-joined summary. The ``Token estimator`` line reports the
+        corpus-wide shift from the previous UTF-8-byte estimate
+        (``tokens_old``) to the character-class estimate (``tokens_new``) that
+        every gate and winner already uses; it is printed for one release
+        while both estimates are recorded per fixture.
+    """
     aggregate = report["aggregate"]; caps = ", ".join("%s=%s (discovered=%s, executed=%s)" % (key, value["status"], value["discovered"], value["executed"]) for key, value in sorted(report["capabilities"].items()))
-    lines = ["Tokenpipe compression lab %s" % report["lab_version"], "Manifest: %s" % report["manifest_sha256"], "Deterministic synthetic corpus: %d cases | %d candidate orders" % (report["synthetic_corpus"]["case_count"], report["synthetic_corpus"]["candidate_orders"]), "Real command matrix: %d declared / %d executed cases | routes: %s" % (report["command_matrix"]["declared_case_count"], report["command_matrix"]["executed_case_count"], ", ".join(report["command_matrix"]["real_routes"])), "Candidates: %d total | %d valid / %d invalid" % (aggregate["candidates"], aggregate["valid_candidates"], aggregate["invalid_candidates"]), "Comparisons: %s | skipped: %s | rejected: local->rtk" % (", ".join(report["pipeline_comparison"]["evaluated"]), ", ".join(report["pipeline_comparison"]["skipped"]) or "none"), "Normalization: %d captures | %s" % (report["normalization"]["applied_capture_count"], "; ".join(report["normalization"]["rules"])), "Capabilities: %s" % caps, "Global policies:"]
+    old_tokens = aggregate["raw_tokens_old"]; new_tokens = aggregate["raw_tokens_new"]
+    token_delta = 0.0 if not old_tokens else (new_tokens - old_tokens) * 100.0 / old_tokens
+    lines = ["Tokenpipe compression lab %s" % report["lab_version"], "Manifest: %s" % report["manifest_sha256"],
+             "Token estimator: class-ratio v1 | corpus %d old (bytes/3.5) -> %d new est. tokens (%+.2f%%)" % (old_tokens, new_tokens, token_delta), "Deterministic synthetic corpus: %d cases | %d candidate orders" % (report["synthetic_corpus"]["case_count"], report["synthetic_corpus"]["candidate_orders"]), "Real command matrix: %d declared / %d executed cases | routes: %s" % (report["command_matrix"]["declared_case_count"], report["command_matrix"]["executed_case_count"], ", ".join(report["command_matrix"]["real_routes"])), "Candidates: %d total | %d valid / %d invalid" % (aggregate["candidates"], aggregate["valid_candidates"], aggregate["invalid_candidates"]), "Comparisons: %s | skipped: %s | rejected: local->rtk" % (", ".join(report["pipeline_comparison"]["evaluated"]), ", ".join(report["pipeline_comparison"]["skipped"]) or "none"), "Normalization: %d captures | %s" % (report["normalization"]["applied_capture_count"], "; ".join(report["normalization"]["rules"])), "Capabilities: %s" % caps, "Global policies:"]
     for scope, policy in sorted(report["global_winners"].items()):
         lines.append("  %s: selected=%s | savings=%.4f | ratio=%.4f | median/p95 latency=%.3f/%.3f ms | coverage=%.4f (corpus=%.4f)" % (scope, json.dumps(policy["selected"], sort_keys=True), policy["normalized_savings"], policy["normalized_output_ratio"], policy["median_latency_ms"], policy["p95_latency_ms"], policy["coverage"], policy["corpus_coverage"]))
     lines.append("Pareto frontier: %d aggregate pipeline rows" % len(report["pareto_frontier"]))

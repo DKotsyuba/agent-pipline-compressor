@@ -19,9 +19,143 @@ All notable changes to this project are documented here. The format follows
   differs from `argv[0]` in the native wrapper and hook, so Python module
   pytest invocations can run through RTK from trusted RTK configuration even when
   the interpreter binary is outside trusted head directories.
+- Net-win gate for output replacement. A replacement is emitted only when the
+  compressed candidate plus the recovery header the host renders with it is
+  smaller than the original; otherwise the exact original is returned with
+  `skip_reason=net-loss` and no raw file is spooled. The metric counterfactual
+  still measures the compressed candidate, so `stats` reports the potential the
+  header cost cancelled out. The native wrapper prices the recovery field its
+  own header would gain, and a cross-call repeat notice replaces output only
+  when it is smaller than the compressed candidate, which carries the same
+  header. The Codex and Claude post-tool headers are now rendered from
+  templates owned by `scripts/tokenpipe.py`, so the text shown and the cost
+  priced cannot drift apart.
+- Secret guard before raw spooling. Immediately before the raw copy is written,
+  both `process` and the native wrapper scan at most the first 256 KiB of the
+  output for PEM private key blocks, AWS access keys, GitHub tokens,
+  OpenAI/Anthropic-style keys, Slack tokens, JWTs, `Authorization: Bearer`
+  headers, and a credential key word directly assigned a value. A match is a
+  refusal, not a redaction: the exact original output is returned under
+  strategy `passthrough`, no file is written under the raw spool, no
+  repeat-index entry is recorded, and the metric row carries only the new
+  `secret-guard` skip reason. Prose mentioning `password` or `token` without an
+  assigned value does not match, and a credential appearing only after the
+  scanned window is deliberately not detected.
+
+- Per-category shown budgets. Bounding now uses one budget per content category
+  (`error`/`code`/`diff` 7000, `log`/`json` 6000, `plain`/`search`/`config`
+  5000 characters) instead of one global number, so every replacement stays
+  under the tightest documented host output cap. `TOKENPIPE_MAX_SHOWN_CHARS`
+  remains the global ceiling every budget is clamped to, and
+  `TOKENPIPE_BUDGET_<CATEGORY>` (for example `TOKENPIPE_BUDGET_ERROR=4000`)
+  overrides one category within `[256, TOKENPIPE_MAX_SHOWN_CHARS]`. Metric rows
+  gain `budget_chars`.
+
+- Recovery preview on the raw-output header. When bounding elides a middle
+  section, the header states how many characters were omitted and the exact
+  `show <raw_ref> --range <start>:<end>` command that prints them back; the new
+  `--range START:END` option of `show` prints exactly those characters of the
+  decoded original and refuses a malformed range with exit status 2. The
+  preview is part of the shared header renderers, so each host hook calls one
+  renderer and assembles no header text of its own, and the net-win gate prices
+  the longer header a bounded replacement actually ships.
+
+- Homogeneous JSON array folding: object arrays with six or more items that
+  share exactly the same key set collapse to their first two items, a
+  `__tokenpipe_similar_items__` marker carrying the exact omitted count and
+  the sorted key list, and the last item, applied recursively at any depth.
+  Non-homogeneous arrays keep the previous `__tokenpipe_omitted_items__`
+  behaviour.
+
+- Cross-call exact-repeat suppression, measurement-first. Every metric row now
+  carries `repeat_of_previous`, and `stats` prints a `Repeat outputs` line with
+  the tokens a repeat notice would avoid. Identity is a digest of the
+  normalized command category, tool name, session id, and the output digest;
+  the private `repeat-index.json` beside the raw spool stores only digests,
+  byte lengths, timestamps, and recovery paths, inherits the raw-output TTL,
+  and never holds command lines or output text. The notice replaces shown
+  output only when `TOKENPIPE_REPEAT_REPLACE=1` (or the persisted
+  `repeat-replace` setting) is on, the mode is `safe`/`full`, and the earlier
+  raw copy still reads back byte-for-byte; every other case, including an
+  unreadable index, keeps the previous behavior.
+- Log compression collapses non-adjacent near-repeats. Volatile fields
+  (timestamps, UUIDs, hex ids of eight or more characters, durations, byte
+  sizes, percentages, and memory addresses) are masked to build a comparison
+  key only; later lines sharing a key are dropped and the first, verbatim
+  occurrence gains a `[seen N times]` marker. Status codes, exit codes, and
+  plain integers below eight digits are never masked, and error, summary, and
+  final lines are never dropped.
+- Compression lab fixtures for a varying-timestamp log and for two cases with
+  non-empty interleaved `stderr`, so the log ratios and the stderr path are
+  measured honestly.
+- Structural compression for search-shaped output, detected as a new `search`
+  content category ahead of the error heuristics: `search-group` folds dense
+  `path:line:text` matches (ripgrep/grep, including `path:text` and
+  `path-line-text` context lines) into one entry per file with its match count
+  and the first and last matches verbatim, and `search-fold` folds bare path
+  listings (`find`, `git ls-files`) into one entry per directory with its entry
+  count and the first and last names. Both keep the original first and last
+  lines, mark every omission, leave short or sparse results byte-for-byte
+  unchanged, and still require a recoverable `raw_ref` before replacement.
+- Compression lab: dense multi-file `rg`, nested `find`, and short-grep
+  fixtures plus `search-group`/`search-fold` stages (lab version 2.1.0).
+
+### Changed
+
+- Token estimates come from character-class ratios instead of UTF-8 bytes /
+  3.5. One pass splits text into runs of prose, code punctuation, whitespace,
+  digits, hex/base64 identifiers, non-Latin alphabets, CJK, and symbols and
+  charges each run its own characters-per-token rate, so hashes and ids are no
+  longer under-counted by roughly 70% and English prose is no longer
+  over-counted. The rates are heuristics calibrated against published OpenAI
+  `o200k`-style measurements, not the Claude tokenizer, and remain estimates
+  rather than provider usage accounting. `stats` names the estimator with an
+  `Estimator: class-ratio v1` line; metric rows already on disk keep the
+  numbers they were written with and are not rewritten. The superseded formula
+  stays available as `estimate_tokens_bytes` for one release, and the
+  compression lab reports `tokens_old`/`tokens_new` per fixture plus a
+  corpus-wide delta line. All thresholds keep their numeric defaults: on the
+  lab corpus the same text now estimates 26.0% higher, so
+  `TOKENPIPE_MIN_TOKENS_ESTIMATE=1500` admits output about a fifth smaller
+  than before.
+
+- `code`, `diff`, and `config` output above `TOKENPIPE_MIN_TOKENS_ESTIMATE` is
+  no longer unconditionally exact passthrough: it is bounded to its verbatim
+  head and tail under the `bounded-code`, `bounded-diff`, and `bounded-config`
+  strategies, with mandatory raw spooling, byte-for-byte recovery validation,
+  and the usual `replace_categories` gate, on both the hook and the native
+  paths. Output at or below the threshold, output already within
+  `TOKENPIPE_MAX_SHOWN_CHARS`, and `binary` output of any size stay byte-exact.
+  The compression lab's protected fixtures follow the same policy and gained an
+  oversized unified-diff fixture.
 
 ### Fixed
 
+- Concurrent metric appends no longer lose rows to a spurious `ENOENT`.
+  On macOS/APFS, simultaneous `openat(dir_fd, "metrics.jsonl",
+  O_CREAT | O_APPEND)` calls intermittently fail even though the private
+  directory exists; the creating open is now retried up to three more
+  times with millisecond backoff. Every other `OSError` still propagates,
+  a genuinely missing directory still fails fast, and callers keep their
+  fail-open behaviour.
+
+- The compression lab mapped only the literal `json` route to the `json-lite`
+  stage, so real `rtk-json` captures scored as 1.000 passthrough; any route
+  suffixed `-json` now gets the JSON stage set, and the lab's array-count gate
+  understands the new fold marker.
+- A compression-lab candidate whose stage raised (such as `json-lite` on a
+  non-JSON `rtk-json` capture) reported only `stage-error` and dropped the
+  gates it had already failed; stage errors are now appended to the gate
+  reasons, so an rtk candidate without raw recovery still reports
+  `raw_recoverable`.
+
+- `stats` no longer counts native (RTK) metric rows written by other
+  `TOKENPIPE_HOME`s: rows carry a non-reversible `home` tag and the shared
+  runtime metrics file is filtered by it. Legacy rows without the tag are kept.
+- Hook latency on replacements: the raw-spool retention sweep is amortized to
+  once per `TOKENPIPE_CLEANUP_INTERVAL_SECONDS` (default 600) instead of
+  walking the whole spool on every replacement; `latency_ms` now uses a
+  monotonic clock. Byte-for-byte raw recovery validation still runs every time.
 - Trusted RTK symlinks now survive Homebrew upgrades and report missing configured binaries clearly.
 - Hook-level RTK bypass now applies only to `python -m pytest` with RTK enabled
   and executable; UV routes still require a trusted `uv` head and continue to be

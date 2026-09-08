@@ -14,9 +14,6 @@ sys.dont_write_bytecode = True
 from common import TOKENPIPE, _safe_id, command_category, mode, read_event, tool_output
 
 
-CLAUDE_MARKER = "tokenpipe-claude-v1"
-
-
 def _load_tokenpipe():
     spec = importlib.util.spec_from_file_location("tokenpipe_claude_core", str(TOKENPIPE))
     module = importlib.util.module_from_spec(spec)
@@ -25,6 +22,9 @@ def _load_tokenpipe():
 
 
 tokenpipe = _load_tokenpipe()
+# Marker and header template are owned by the compressor so the rendered text
+# and the cost its net-win gate prices stay identical.
+CLAUDE_MARKER = tokenpipe.CLAUDE_RECOVERY_MARKER
 
 
 def _limit() -> int:
@@ -102,16 +102,34 @@ def _request(event: Dict[str, Any], stream: str, output: str) -> Dict[str, Any]:
 
 
 def _recovery_context(streams: Dict[str, Dict[str, Any]]) -> str:
+    """Render the recovery context shown with a Claude replacement.
+
+    Args:
+        streams: Replaced stream name (``stdout``/``stderr``) to the
+            :func:`tokenpipe.process` result that produced it. Every present
+            entry must carry a ``raw_ref`` path and may carry a
+            ``recovery_preview``, whose shape the compressor owns. Not mutated.
+
+    Returns:
+        One ``additionalContext`` line naming each stream's recovery reference
+        and the command that restores it, followed by one ``show --range``
+        preview per stream whose replacement elided a middle section. Streams
+        that were not bounded add no preview. The template is owned by
+        ``scripts/tokenpipe.py`` so this text and the header cost priced by its
+        net-win gate cannot drift apart.
+    """
     recover = "/usr/bin/python3 %s show" % shlex.quote(str(TOKENPIPE))
     parts = []
+    previews = []
     for stream in ("stdout", "stderr"):
         result = streams.get(stream)
         if not result:
             continue
         parts.append("%s raw_ref=%s" % (stream, result["raw_ref"]))
-    return "%s compressed %s; recover with: %s <raw_ref>" % (
-        CLAUDE_MARKER, ", ".join(parts), recover,
-    )
+        preview = result.get("recovery_preview")
+        if preview:
+            previews.append("%s %s" % (stream, preview))
+    return tokenpipe.claude_recovery_header(parts, recover, CLAUDE_MARKER, previews)
 
 
 def adapt(event: Dict[str, Any], active_mode: Optional[str] = None) -> Optional[Dict[str, Any]]:
