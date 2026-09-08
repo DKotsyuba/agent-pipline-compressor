@@ -866,7 +866,11 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
     return result
 
 
-SAFE_EXEC_CATEGORIES = frozenset(("git-read", "search", "filesystem-read", "docker-read"))
+# Read-only categories allowed in safe mode, including commands routed through
+# the native wrapper without executing project code.
+SAFE_EXEC_CATEGORIES = frozenset((
+    "git-read", "search", "filesystem-read", "docker-read", "gh-read",
+))
 FULL_EXEC_CATEGORIES = SAFE_EXEC_CATEGORIES | frozenset(("test", "build", "lint"))
 # Explicit installed-entry roots. Tests may replace this immutable set in
 # process; untrusted child environments cannot extend it.
@@ -876,7 +880,8 @@ _TRUSTED_EXECUTABLE_DIRS = frozenset((
 NATIVE_MARKER = "tokenpipe-native-v1"
 _INTERACTIVE_FLAGS = frozenset((
     "-i", "-w", "--interactive", "--watch", "--watchall", "--watch-all",
-    "--follow", "--open", "--ui", "--pdb", "--trace", "--sw", "--paginate",
+    "--follow", "--open", "--ui", "--pdb", "--trace",
+    "--sw", "--paginate",
 ))
 _MUTATING_FLAGS = frozenset(("--fix", "--fix-only", "--write"))
 _FIND_MUTATING = frozenset((
@@ -894,22 +899,193 @@ def _normalize_exec_category(value):
     return aliases.get(value, value)
 
 
+def _git_subcommand_index(args):
+    """Return a read-only Git subcommand index after safe global flags.
+
+    Args:
+        args (Sequence[str]): Git arguments after ``argv[0]``.
+
+    Returns:
+        int | None: Index of ``status``, ``diff``, ``log``, or ``show`` in
+        ``args``; ``None`` when the prefix or subcommand is unsupported. The
+        command-line ``-c`` option is intentionally rejected because it can
+        select executable Git configuration despite the wrapper environment.
+    """
+    index = 0
+    while index < len(args):
+        item = args[index]
+        if item == "--no-pager":
+            index += 1
+        elif item == "-C":
+            if index + 1 >= len(args):
+                return None
+            index += 2
+        elif item.startswith("--git-dir=") or item.startswith("--work-tree="):
+            index += 1
+        elif item.startswith("-"):
+            return None
+        else:
+            return index if item in ("status", "diff", "log", "show") else None
+    return None
+
+
+def _read_file_args(args, command):
+    """Return plain file operands for a read-only filesystem command.
+
+    Args:
+        args (Sequence[str]): Arguments after the executable.
+        command (str): One of ``cat``, ``head``, ``tail``, or ``wc``.
+
+    Returns:
+        list[str] | None: File operands, or ``None`` for stdin-only/invalid
+        input. Numeric and ``-n``/``-c`` option values are not file operands.
+    """
+    files = []
+    options_end = False
+    index = 0
+    while index < len(args):
+        item = args[index]
+        if not options_end and item == "--":
+            options_end = True
+            index += 1
+            continue
+        if not options_end and item.startswith("-"):
+            if command in ("head", "tail") and item in ("-n", "-c") and index + 1 < len(args):
+                index += 2
+            else:
+                index += 1
+            continue
+        if not item or item == "-" or item.startswith("-"):
+            return None
+        files.append(item)
+        index += 1
+    return files or None
+
+
+def _grep_has_file(args):
+    """Return whether grep has a file operand instead of reading stdin only.
+
+    Args:
+        args (Sequence[str]): Arguments after ``grep``.
+
+    Returns:
+        bool: ``True`` when a pattern and at least one plain file operand are
+        present; pattern files supplied by ``-f`` are read-only and allowed.
+    """
+    positional = []
+    pattern_option = False
+    index = 0
+    while index < len(args):
+        item = args[index]
+        if item == "--":
+            positional.extend(args[index + 1:])
+            break
+        if item in ("-e", "-f"):
+            pattern_option = True
+            if index + 1 >= len(args):
+                return False
+            index += 2
+        elif item.startswith("-"):
+            index += 1
+        else:
+            positional.append(item)
+            index += 1
+    return len(positional) >= (1 if pattern_option else 2) and all(
+        item != "-" and not item.startswith("-") for item in positional[-1:]
+    )
+
+
+def _jq_read_only(args):
+    """Return whether jq has one filter and one or more file operands.
+
+    Args:
+        args (Sequence[str]): Arguments after ``jq``.
+
+    Returns:
+        bool: ``True`` only for read-only file-backed jq invocations.
+    """
+    positional = []
+    index = 0
+    while index < len(args):
+        item = args[index]
+        if item in ("--rawfile", "--slurpfile", "-f", "--from-file") or item.startswith("--arg"):
+            return False
+        if item == "--":
+            positional.extend(args[index + 1:])
+            break
+        if item.startswith("-"):
+            index += 1
+            continue
+        positional.append(item)
+        index += 1
+    return len(positional) >= 2 and all(
+        item != "-" and not item.startswith("-") for item in positional[1:]
+    )
+
+
+def _python_pytest(argv):
+    """Return whether argv is a supported Python module pytest invocation.
+
+    Args:
+        argv (Sequence[str]): Candidate executable and arguments.
+
+    Returns:
+        bool: ``True`` for Python ``-m pytest`` with any remaining arguments.
+    """
+    head = os.path.basename(str(argv[0])).lower() if argv else ""
+    return (
+        (head == "python" or head == "python3" or
+         (head.startswith("python3.") and head[8:].isdigit()))
+        and len(argv) >= 3
+        and str(argv[1]).lower() == "-m"
+        and str(argv[2]).lower() == "pytest"
+    )
+
+
 def _argv_category(argv):
+    """Classify a direct argv vector using conservative read-only policies.
+
+    Args:
+        argv (Sequence[str]): Candidate executable and arguments; values are
+        inspected only and the sequence is not mutated.
+
+    Returns:
+        str: Wrapper category, or ``unknown`` for unsupported/stdin-only or
+        potentially mutating commands.
+    """
     if not argv:
         return "unknown"
     head = os.path.basename(argv[0]).lower()
     args = [str(item).lower() for item in argv[1:]]
-    if head == "git" and args and args[0] in ("status", "diff", "log", "show"):
+    if head == "git" and _git_subcommand_index([str(item) for item in argv[1:]]) is not None:
         return "git-read"
     if head == "rg" and not any(item == "--pre" or item.startswith("--pre=") for item in args):
         return "search"
+    if head == "grep" and _grep_has_file(args):
+        return "search"
     if head == "find" and not any(item in ("-delete", "-exec", "-execdir", "-ok", "-okdir") for item in args):
         return "search"
+    if head in ("cat", "head", "tail", "wc") and _read_file_args(args, head):
+        return "filesystem-read"
+    if head == "jq" and _jq_read_only(args):
+        return "filesystem-read"
     if head == "ls":
         return "filesystem-read"
-    if head == "docker" and args and args[0] in ("ps", "logs") and "-f" not in args and "--follow" not in args:
+    if head == "docker" and args and (
+        args[0] in ("ps", "logs", "images")
+        or args[:2] == ["compose", "ps"]
+    ):
         return "docker-read"
-    if head in ("pytest", "py.test", "jest", "vitest"):
+    if head == "gh" and len(args) == 2 and args in (
+        ["pr", "list"], ["pr", "view"], ["pr", "checks"], ["pr", "status"],
+        ["issue", "list"], ["issue", "view"], ["run", "list"], ["run", "view"],
+    ):
+        return "gh-read"
+    if head in ("pytest", "py.test", "jest", "vitest") or _python_pytest(argv):
+        return "test"
+    if head == "uv" and len(args) >= 2 and args[0] == "run" and (
+        args[1] == "pytest" or args[1:4] == ["python", "-m", "pytest"]
+    ):
         return "test"
     if head == "cargo" and args:
         return {"test": "test", "check": "lint", "clippy": "lint", "build": "build"}.get(args[0], "unknown")
@@ -961,7 +1137,7 @@ def _strict_argv_category(argv):
     if head == "git":
         forbidden_git = {
             "--ext-diff", "--textconv", "--config-env", "--exec-path",
-            "--git-dir", "--work-tree", "--namespace", "--no-index",
+            "--namespace", "--no-index",
         }
         if any(
             item in forbidden_git
@@ -969,11 +1145,60 @@ def _strict_argv_category(argv):
             for item in args
         ):
             return "unknown"
+        if any(item in ("-o", "--output") or item.startswith("--output=") for item in args):
+            return "unknown"
     if head == "find" and any(item in _FIND_MUTATING for item in args):
+        return "unknown"
+    if head in ("head", "tail") and any(item in ("-f", "-F") for item in args):
+        return "unknown"
+    if head == "rg" and any(item == "--pre" or item.startswith("--pre=") for item in args):
         return "unknown"
     if head == "docker" and any(item in ("-f", "--follow") for item in args):
         return "unknown"
     return category
+
+
+def rtk_argv(argv, category):
+    """Build RTK's safe argv for one already-classified native command.
+
+    Args:
+        argv (Sequence[str]): Original executable and arguments. The sequence
+            is inspected only and is never mutated.
+        category (str): Validated tokenpipe command category.
+
+    Returns:
+        list[str]: RTK argv using a literal ``rtk`` placeholder where needed;
+        callers replace that placeholder with the trusted configured RTK
+        executable path. UV pytest routes preserve the original ``argv[0]``
+        and ``uv run`` environment. Unsupported RTK rewrites retain the
+        original basename and arguments.
+    """
+    if not argv:
+        return ["rtk"]
+    head = os.path.basename(str(argv[0])).lower()
+    rest = [str(item) for item in argv[1:]]
+    if category == "test" and _python_pytest(argv):
+        return ["rtk", "pytest"] + rest[2:]
+    if category == "test" and head == "uv":
+        if rest[:2] == ["run", "pytest"]:
+            return [str(argv[0]), "run", "rtk", "pytest"] + rest[2:]
+        if rest[:4] == ["run", "python", "-m", "pytest"]:
+            return [str(argv[0]), "run", "rtk", "pytest"] + rest[4:]
+    if category == "filesystem-read":
+        if head == "cat" and len(rest) == 1 and not rest[0].startswith("-"):
+            return ["rtk", "read", rest[0]]
+        if head in ("head", "tail") and len(rest) == 2 and not rest[1].startswith("-"):
+            count = None
+            if rest[0].startswith("-") and rest[0][1:].isdigit():
+                count = rest[0][1:]
+            if count is not None:
+                option = "--max-lines" if head == "head" else "--tail-lines"
+                return ["rtk", "read", rest[1], option, count]
+        if head in ("head", "tail") and len(rest) == 3 and rest[0] in ("-n", "-c"):
+            if rest[0] == "-n" and rest[1].isdigit() and not rest[2].startswith("-"):
+                option = "--max-lines" if head == "head" else "--tail-lines"
+                return ["rtk", "read", rest[2], option, rest[1]]
+    return ["rtk", head] + rest
 
 
 def _resolve_trusted_executable(value):
@@ -1295,9 +1520,11 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
     original_command_argv = [resolved_executable] + list(argv[1:])
     child_env = os.environ.copy()
     if supplied_category == "git-read":
-        subcommand = str(argv[1]).lower()
+        subcommand_index = _git_subcommand_index([str(item) for item in argv[1:]])
+        subcommand = str(argv[1 + subcommand_index]).lower()
         if subcommand in ("diff", "log", "show"):
-            original_command_argv[2:2] = ["--no-ext-diff", "--no-textconv"]
+            insert_at = 2 + subcommand_index
+            original_command_argv[insert_at:insert_at] = ["--no-ext-diff", "--no-textconv"]
         for key in list(child_env):
             if key.startswith("GIT_CONFIG_") or key in {
                 "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
@@ -1324,7 +1551,18 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
     rtk_used = bool(want_rtk and category_ok and rtk_trusted)
     rtk_missing = bool(persisted_rtk_enabled and not rtk_trusted)
     if rtk_used:
-        command_argv = [rtk_path, os.path.basename(str(argv[0]))] + command_argv[1:]
+        # For python -m pytest, RTK executes ``pytest``; the interpreter itself
+        # is never executed by this wrapper when RTK is used. Without RTK,
+        # passthrough retains the existing trusted-head rule unchanged, so an
+        # untrusted Python path still runs natively as before the hook rewrite.
+        routed = rtk_argv([argv[0]] + command_argv[1:], supplied_category)
+        command_argv = list(routed)
+        placeholder_index = next(
+            (index for index, item in enumerate(command_argv) if item == "rtk"),
+            None,
+        )
+        if placeholder_index is not None:
+            command_argv[placeholder_index] = rtk_path
     try:
         if rtk_used:
             child_env.setdefault("RTK_DB_PATH", os.path.join(_runtime_home(), "rtk-history.db"))

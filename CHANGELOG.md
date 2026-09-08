@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Native wrapper and optional RTK coverage for approved Git global options,
+  Python/UV pytest commands, file readers, jq, grep, GitHub CLI reads, and
+  Docker read commands.
+
 ### Fixed
 
 - Trusted RTK symlinks now survive Homebrew upgrades and report missing configured binaries clearly.

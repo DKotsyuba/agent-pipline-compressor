@@ -1,5 +1,6 @@
 import contextlib
 import importlib
+import importlib.util
 import io
 import json
 import os
@@ -15,6 +16,81 @@ sys.path.insert(0, str(HOOKS))
 common = importlib.import_module("common")
 pre_tool = importlib.import_module("pre_tool")
 post_tool = importlib.import_module("post_tool")
+TOKENPIPE_SPEC = importlib.util.spec_from_file_location("tokenpipe_classifier", ROOT / "scripts" / "tokenpipe.py")
+tokenpipe = importlib.util.module_from_spec(TOKENPIPE_SPEC)
+TOKENPIPE_SPEC.loader.exec_module(tokenpipe)
+
+
+class ClassifierParityTests(unittest.TestCase):
+    """Keep hook admission and direct-wrapper classification in lockstep."""
+
+    def test_table_driven_classifier_parity(self):
+        """Compare at least forty supported and rejected argv vectors."""
+        rows = [
+            (["git", "status"], "git-read"),
+            (["git", "-C", ".", "status"], "git-read"),
+            (["git", "--no-pager", "diff"], "git-read"),
+            (["git", "-c", "core.fsmonitor=x", "status"], None),
+            (["git", "-C", ".", "-c", "core.pager=less", "diff"], None),
+            (["git", "--git-dir=repo.git", "show"], "git-read"),
+            (["git", "--work-tree=repo", "status"], "git-read"),
+            (["git", "-C", ".", "push"], None),
+            (["git", "status", "--output=x"], None),
+            (["git", "status", "-o", "out"], None),
+            (["rg", "needle", "README.md"], "search"),
+            (["rg", "--pre", "cat", "needle", "README.md"], None),
+            (["grep", "needle", "README.md"], "search"),
+            (["grep", "-f", "patterns", "README.md"], "search"),
+            (["grep", "needle"], None),
+            (["find", ".", "-name", "*.py"], "search"),
+            (["find", ".", "-type", "f", "-print"], "search"),
+            (["find", ".", "-delete"], None),
+            (["cat", "README.md"], "filesystem-read"),
+            (["cat", "-n", "README.md"], "filesystem-read"),
+            (["cat"], None),
+            (["head", "-20", "README.md"], "filesystem-read"),
+            (["head", "-c", "20", "README.md"], "filesystem-read"),
+            (["head", "-50"], None),
+            (["tail", "-n", "20", "README.md"], "filesystem-read"),
+            (["tail", "-f", "README.md"], None),
+            (["tail", "-F", "README.md"], None),
+            (["wc", "-l", "README.md"], "filesystem-read"),
+            (["wc", "-c", "README.md"], "filesystem-read"),
+            (["wc"], None),
+            (["jq", ".name", "data.json"], "filesystem-read"),
+            (["jq", "-r", ".name", "data.json"], "filesystem-read"),
+            (["jq", "--rawfile", "x", "f", ".", "data.json"], None),
+            (["jq", ".name"], None),
+            (["docker", "ps"], "docker-read"),
+            (["docker", "images"], "docker-read"),
+            (["docker", "compose", "ps"], "docker-read"),
+            (["docker", "rm", "container"], None),
+            (["gh", "pr", "list"], "gh-read"),
+            (["gh", "pr", "checks"], "gh-read"),
+            (["gh", "issue", "view"], "gh-read"),
+            (["gh", "run", "view"], "gh-read"),
+            (["gh", "pr", "merge"], None),
+            (["pytest", "-q"], "test"),
+            (["python", "-m", "pytest", "-q"], "test"),
+            (["python3.12", "-m", "pytest", "-q"], "test"),
+            (["python", "-m", "http.server"], None),
+            (["uv", "run", "pytest", "-q"], "test"),
+            (["uv", "run", "python", "-m", "pytest", "-q"], "test"),
+        ]
+        self.assertGreaterEqual(len(rows), 40)
+        for argv, expected in rows:
+            hook_category = pre_tool._wrapper_category(argv)
+            hook_effective = hook_category if pre_tool._allowed(argv, "full") else None
+            strict_category = tokenpipe._strict_argv_category(argv)
+            strict_effective = strict_category if strict_category != "unknown" else None
+            self.assertEqual(hook_effective, expected, argv)
+            self.assertEqual(strict_effective, expected, argv)
+
+    def test_coarse_metric_categories_cover_new_command_shapes(self):
+        """Keep post-hook coarse metrics stable for global-option commands."""
+        self.assertEqual(common.command_category("git -C . status"), "git")
+        self.assertEqual(common.command_category("python3.12 -m pytest -q"), "test")
+        self.assertEqual(common.command_category("uv run pytest -q"), "test")
 
 
 class HookSecurityTests(unittest.TestCase):

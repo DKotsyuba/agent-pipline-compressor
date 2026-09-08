@@ -39,20 +39,178 @@ def _has_forbidden_syntax(command: str) -> bool:
     return any(word.startswith("~") for word in command.split())
 
 
+def _git_subcommand_index(args: List[str]) -> Optional[int]:
+    """Return a supported Git subcommand index after safe global flags.
+
+    Args:
+        args (List[str]): Arguments after ``git``.
+
+    Returns:
+        Optional[int]: Read-only subcommand index, or ``None`` when unsupported.
+            Git's ``-c`` option is always unsupported because it can select
+            executable configuration outside the wrapper's environment.
+    """
+    index = 0
+    while index < len(args):
+        item = args[index]
+        if item == "--no-pager":
+            index += 1
+        elif item == "-C":
+            if index + 1 >= len(args):
+                return None
+            index += 2
+        elif item.startswith("--git-dir=") or item.startswith("--work-tree="):
+            index += 1
+        elif item.startswith("-"):
+            return None
+        else:
+            return index if item in {"status", "diff", "log", "show"} else None
+    return None
+
+
+def _read_file_args(args: List[str], command: str) -> bool:
+    """Return whether filesystem-read arguments contain a plain file path.
+
+    Args:
+        args (List[str]): Lower-cased arguments after a file-reading command.
+        command (str): The file-reading executable name.
+
+    Returns:
+        bool: ``True`` for one or more non-stdin file operands.
+    """
+    files = []
+    options_end = False
+    index = 0
+    while index < len(args):
+        item = args[index]
+        if not options_end and item == "--":
+            options_end = True
+            index += 1
+            continue
+        if not options_end and item.startswith("-"):
+            if command in {"head", "tail"} and item in {"-n", "-c"} and index + 1 < len(args):
+                index += 2
+            else:
+                index += 1
+            continue
+        if not item or item == "-" or item.startswith("-"):
+            return False
+        files.append(item)
+        index += 1
+    return bool(files)
+
+
+def _grep_has_file(args: List[str]) -> bool:
+    """Return whether grep has a file operand and does not read stdin only.
+
+    Args:
+        args (List[str]): Lower-cased arguments after ``grep``.
+
+    Returns:
+        bool: ``True`` when grep has a pattern and a plain file operand.
+    """
+    positional = []
+    pattern_option = False
+    index = 0
+    while index < len(args):
+        item = args[index]
+        if item == "--":
+            positional.extend(args[index + 1:])
+            break
+        if item in {"-e", "-f"}:
+            pattern_option = True
+            if index + 1 >= len(args):
+                return False
+            index += 2
+        elif item.startswith("-"):
+            index += 1
+        else:
+            positional.append(item)
+            index += 1
+    return len(positional) >= (1 if pattern_option else 2) and positional[-1] != "-" and not positional[-1].startswith("-")
+
+
+def _jq_read_only(args: List[str]) -> bool:
+    """Return whether jq has one filter and one or more file operands.
+
+    Args:
+        args (List[str]): Lower-cased arguments after ``jq``.
+
+    Returns:
+        bool: ``True`` only for file-backed read-only jq usage.
+    """
+    positional = []
+    index = 0
+    while index < len(args):
+        item = args[index]
+        if item in {"--rawfile", "--slurpfile", "-f", "--from-file"} or item.startswith("--arg"):
+            return False
+        if item == "--":
+            positional.extend(args[index + 1:])
+            break
+        if item.startswith("-"):
+            index += 1
+            continue
+        positional.append(item)
+        index += 1
+    return len(positional) >= 2 and all(item != "-" and not item.startswith("-") for item in positional[1:])
+
+
+def _python_pytest(words: List[str]) -> bool:
+    """Return whether words invoke pytest through a Python interpreter.
+
+    Args:
+        words (List[str]): Complete executable and argument vector.
+
+    Returns:
+        bool: ``True`` for ``python[3[.N]] -m pytest``.
+    """
+    head = Path(words[0]).name.lower() if words else ""
+    return (
+        (head == "python" or head == "python3" or
+         (head.startswith("python3.") and head[8:].isdigit()))
+        and len(words) >= 3
+        and words[1].lower() == "-m"
+        and words[2].lower() == "pytest"
+    )
+
+
 def _wrapper_category(words: List[str]) -> Optional[str]:
+    """Classify a command eligible for the native wrapper.
+
+    Args:
+        words (List[str]): Shell-split executable and arguments.
+
+    Returns:
+        Optional[str]: Conservative wrapper category, or ``None`` when the
+        command is unsupported or stdin-only.
+    """
     if not words:
         return None
     head = Path(words[0]).name.lower()
     args = [word.lower() for word in words[1:]]
-    if head == "git":
+    if head == "git" and _git_subcommand_index(words[1:]) is not None:
         return "git-read"
-    if head == "rg" or head == "find":
+    if head == "rg" or (head == "grep" and _grep_has_file(args)) or head == "find":
         return "search"
+    if head in {"cat", "head", "tail", "wc"} and _read_file_args(args, head):
+        return "filesystem-read"
+    if head == "jq" and _jq_read_only(args):
+        return "filesystem-read"
     if head == "ls":
         return "filesystem-read"
-    if head == "docker":
+    if head == "docker" and args and (args[0] in {"ps", "logs", "images"} or args[:2] == ["compose", "ps"]):
         return "docker-read"
-    if head in {"pytest", "py.test", "jest", "vitest"}:
+    if head == "gh" and args in (
+        ["pr", "list"], ["pr", "view"], ["pr", "checks"], ["pr", "status"],
+        ["issue", "list"], ["issue", "view"], ["run", "list"], ["run", "view"],
+    ):
+        return "gh-read"
+    if head in {"pytest", "py.test", "jest", "vitest"} or _python_pytest(words):
+        return "test"
+    if head == "uv" and len(args) >= 2 and args[0] == "run" and (
+        args[1] == "pytest" or args[1:4] == ["python", "-m", "pytest"]
+    ):
         return "test"
     if head == "cargo" and args:
         return {"test": "test", "check": "lint", "clippy": "lint", "build": "build"}.get(args[0])
@@ -67,6 +225,15 @@ def _wrapper_category(words: List[str]) -> Optional[str]:
 
 
 def _allowed(words: List[str], active_mode: str) -> bool:
+    """Check shell words against the hook's conservative execution policy.
+
+    Args:
+        words (List[str]): Shell-split executable and arguments.
+        active_mode (str): ``safe`` or ``full`` policy mode.
+
+    Returns:
+        bool: Whether the hook may rewrite this command into the wrapper.
+    """
     if not words or ENV_PREFIX.match(words[0]):
         return False
     head = Path(words[0]).name.lower()
@@ -82,15 +249,15 @@ def _allowed(words: List[str], active_mode: str) -> bool:
         return False
     if any(flag in MUTATING_FLAGS or flag.startswith("--output=") for flag in lowered):
         return False
-    if head == "docker" and "-f" in lowered:
+    if head == "git" and any(flag in {"-o", "--output"} or flag.startswith("--output=") for flag in lowered):
         return False
 
     if head == "git":
-        if "--output" in lowered:
-            return False
-        return bool(lowered) and lowered[0] in {"status", "diff", "log", "show"}
+        return _git_subcommand_index(words[1:]) is not None
     if head == "docker":
-        return bool(lowered) and lowered[0] in {"ps", "logs"}
+        if "-f" in lowered:
+            return False
+        return bool(lowered) and (lowered[0] in {"ps", "logs", "images"} or lowered[:2] == ["compose", "ps"])
     if head == "rg":
         return not any(flag == "--pre" or flag.startswith("--pre=") for flag in lowered)
     if head == "find":
@@ -102,11 +269,20 @@ def _allowed(words: List[str], active_mode: str) -> bool:
     if head == "ls":
         return True
 
+    if head in {"cat", "head", "tail", "wc", "jq", "grep", "gh"}:
+        if head in {"head", "tail"} and any(flag in {"-f", "-F"} for flag in lowered):
+            return False
+        return _wrapper_category(words) is not None
+
     # Safe mode is intentionally read-only. Commands below can execute project
     # code or write build/cache artifacts, so they are full-mode only.
     if active_mode != "full":
         return False
-    if head in {"pytest", "py.test", "jest", "vitest"}:
+    if head in {"pytest", "py.test", "jest", "vitest"} or _python_pytest(words):
+        return True
+    if head == "uv" and len(lowered) >= 2 and lowered[0] == "run" and (
+        lowered[1] == "pytest" or lowered[1:4] == ["python", "-m", "pytest"]
+    ):
         return True
     if head == "cargo":
         return bool(lowered) and lowered[0] in {"test", "check", "clippy", "build"}

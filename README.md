@@ -108,6 +108,10 @@ claude --bare --plugin-dir . -p "..."
 | Python | 3.8 minimum | Current source and tests are compatible with Python 3.8; see the CI workflow for the release-tested matrix. |
 | Platform | macOS/Linux convention | Hook execution requires `/usr/bin/python3`; nonstandard layouts need explicit packaging support. |
 
+### Native wrapper command coverage
+
+In `safe` mode, the native wrapper recognizes read-only `git status|diff|log|show` (including approved global options), `rg`, `grep`, `find`, `ls`, `cat`, `head`, `tail`, `wc`, file-backed `jq`, `gh` read commands (`pr list|view|checks|status`, `issue list|view`, `run list|view`), and Docker `ps`, `logs`, `images`, and `compose ps`. `full` mode additionally recognizes `pytest`, Python `-m pytest`, `uv run pytest`, `uv run python -m pytest`, and the existing test/build/lint commands. Interactive, mutating, stdin-only, and unsupported subcommands pass through unchanged.
+
 ## Modes and configuration
 
 | Mode | Default | Behavior |
@@ -146,6 +150,8 @@ python3 scripts/tokenpipe.py rtk off
 ```
 
 When active, RTK owns filtering. Tokenpipe does not stack its own Lite/CCA transforms, cannot measure RTK's raw-to-filtered savings, and cannot provide a Tokenpipe `raw_ref` for that stage. Keep it off when recoverability and Tokenpipe-owned measurements matter.
+
+RTK routing uses `rtk pytest` for Python/UV pytest commands, `rtk read` for single-file `cat` and counted `head`/`tail`, and the original command shape for unsupported RTK rewrites such as `wc`, multiple files, or byte-counted reads.
 
 ## Recovery, statistics, and privacy
 
