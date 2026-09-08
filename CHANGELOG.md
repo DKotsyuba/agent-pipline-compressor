@@ -11,6 +11,10 @@ All notable changes to this project are documented here. The format follows
 - Native wrapper and optional RTK coverage for approved Git global options,
   Python/UV pytest commands, file readers, jq, grep, GitHub CLI reads, and
   Docker read commands.
+- Privacy-safe `command_head` metric on native wrapper calls (allow-listed head
+  plus subcommand, never arguments or paths), a matching `stats` section, and
+  the `rtk_skip` setting via `tokenpipe rtk --skip` to run listed command heads
+  natively instead of through RTK (`skip_reason` `rtk-skipped`).
 
 ### Fixed
 

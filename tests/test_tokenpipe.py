@@ -818,6 +818,100 @@ class TokenpipeTests(unittest.TestCase):
         finally:
             victim_dir.cleanup()
 
+    def test_command_head_uses_only_allow_listed_tokens(self):
+        """Labels combine head and allow-listed subcommand, never arguments."""
+        cases = [
+            (["git", "-C", "dir", "status", "--porcelain"], "git-read", "git status"),
+            (["git", "--no-pager", "diff", "path/with/secret"], "git-read", "git diff"),
+            (["python3", "-m", "pytest", "x"], "test", "pytest"),
+            (["uv", "run", "python", "-m", "pytest", "-q"], "test", "pytest"),
+            (["gh", "pr", "list"], "gh-read", "gh pr list"),
+            (["docker", "compose", "ps"], "docker-read", "docker compose ps"),
+            (["docker", "logs", "container-name"], "docker-read", "docker logs"),
+            (["/bin/cat", "/etc/hosts"], "filesystem-read", "cat"),
+            (["rg", "--token=DO_NOT_LOG", "."], "search", "rg"),
+            (["npm", "run", "test"], "test", "npm test"),
+            (["cargo", "test"], "test", "cargo test"),
+            (["ls", "-la", "/private"], "filesystem-read", "ls"),
+            (["rm", "-rf", "x"], "unknown", None),
+            ([], "unknown", None),
+        ]
+        for argv, category, expected in cases:
+            self.assertEqual(tokenpipe.command_head(argv, category), expected, argv)
+        for argv, category, expected in cases:
+            if expected is not None:
+                self.assertNotIn("/", expected)
+                self.assertNotIn("DO_NOT_LOG", expected)
+
+    def test_stats_groups_command_head_only_for_native_rows(self):
+        """The command_head section appears only once a native row carries it."""
+        tokenpipe.process(self.payload("repeat\n" * 200), "audit")
+        self.assertNotIn("command_head", tokenpipe.aggregate(tokenpipe.load_metrics())["groups"])
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            self.assertEqual(tokenpipe.main(["stats"]), 0)
+        self.assertNotIn("command_head:", stdout.getvalue())
+        tokenpipe.execute_native(["/bin/ls", self.temp.name], "filesystem-read", "safe")
+        self.assertEqual(tokenpipe.load_metrics()[-1]["command_head"], "ls")
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            self.assertEqual(tokenpipe.main(["stats"]), 0)
+        self.assertIn("\ncommand_head:\n  ls: 1 calls", stdout.getvalue())
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            self.assertEqual(tokenpipe.main(["stats", "--json"]), 0)
+        self.assertEqual(json.loads(stdout.getvalue())["groups"]["command_head"]["ls"]["calls"], 1)
+
+    def test_rtk_skip_round_trips_through_config(self):
+        """`rtk --skip` trims, de-duplicates, prints, and clears the list."""
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            self.assertEqual(tokenpipe.main(["rtk", "--skip", " git status , cat,git status,,"]), 0)
+        self.assertEqual(stdout.getvalue(), "disabled\nskip: git status, cat\n")
+        self.assertEqual(tokenpipe.configured_settings()["rtk_skip"], ["git status", "cat"])
+        self.assertEqual(tokenpipe.configured_rtk_skip(), ["git status", "cat"])
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            self.assertEqual(tokenpipe.main(["rtk"]), 0)
+        self.assertEqual(stdout.getvalue(), "disabled\nskip: git status, cat\n")
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            self.assertEqual(tokenpipe.main(["rtk", "--skip", ""]), 0)
+        self.assertEqual(stdout.getvalue(), "disabled\n")
+        self.assertNotIn("rtk_skip", tokenpipe.configured_settings())
+        self.assertEqual(tokenpipe.configured_rtk_skip(), [])
+
+    def test_rtk_skip_head_runs_natively_with_skip_reason(self):
+        """A skipped head bypasses a trusted RTK and records rtk-skipped."""
+        command_seen = os.path.join(self.temp.name, "rtk-skip-command-seen")
+        rtk = self.executable(
+            "rtk",
+            "import os, sys\nopen(%r, 'w').write(sys.argv[1])\nos.execvp(sys.argv[1], sys.argv[1:])\n"
+            % command_seen,
+        )
+        for index in range(200):
+            self.executable("item-%03d" % index, "")
+        try:
+            tokenpipe.set_configured_rtk(rtk)
+            tokenpipe.set_configured_rtk_skip("ls")
+            with mock.patch.object(
+                tokenpipe, "compress", return_value=("mock", "compressed\n")
+            ):
+                output, status_code = tokenpipe.execute_native(
+                    ["/bin/ls", self.temp.name], "filesystem-read", "safe"
+                )
+            self.assertEqual(status_code, 0)
+            self.assertNotIn("rtk-direct", output.splitlines()[0])
+            self.assertFalse(os.path.exists(command_seen))
+            metric = tokenpipe.load_metrics()[-1]
+            self.assertFalse(metric["rtk_used"])
+            self.assertEqual(metric["skip_reason"], "rtk-skipped")
+            self.assertEqual(metric["command_head"], "ls")
+            tokenpipe.set_configured_rtk_skip("cat")
+            output, status_code = tokenpipe.execute_native(
+                ["/bin/ls", self.temp.name], "filesystem-read", "safe"
+            )
+            self.assertEqual(status_code, 0)
+            self.assertIn("strategy=rtk-direct", output.splitlines()[0])
+            self.assertTrue(os.path.exists(command_seen))
+        finally:
+            tokenpipe.set_configured_rtk_skip("")
+            tokenpipe.set_configured_rtk(None)
+
 
 if __name__ == "__main__":
     unittest.main()
