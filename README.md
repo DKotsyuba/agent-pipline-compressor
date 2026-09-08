@@ -153,11 +153,21 @@ When active, RTK owns filtering. Tokenpipe does not stack its own Lite/CCA trans
 
 RTK routing uses `rtk pytest` for Python/UV pytest commands, `rtk read` for single-file `cat` and counted `head`/`tail`, and the original command shape for unsupported RTK rewrites such as `wc`, multiple files, or byte-counted reads.
 
+RTK helps some commands (`git status`, `git log`) and not others (`cat`, `git status --porcelain`). Exclude the useless ones by `command_head` (see below) with `--skip`; listed commands run natively with strategy `passthrough` and `skip_reason` `rtk-skipped`. The list is stored as `rtk_skip` next to `use_rtk` in the private settings file:
+
+```bash
+python3 scripts/tokenpipe.py rtk --skip "git status,cat"   # comma-separated, trimmed, de-duplicated
+python3 scripts/tokenpipe.py rtk                           # prints the state and `skip: git status, cat`
+python3 scripts/tokenpipe.py rtk --skip ""                 # clears the list
+```
+
 ## Recovery, statistics, and privacy
 
 Replacement is allowed only after raw output is securely spooled; a spool error leaves the original output unchanged. Raw files are private runtime state (`0700` directories and `0600` files), may contain secrets from commands, and are subject to retention and size caps. Treat any `raw_ref` as sensitive.
 
-`stats` reads private metrics and reports estimates by mode, command category, strategy, and plugin version. Metrics omit prompts, command arguments, and tool output. They are not provider billing/usage measurements.
+`stats` reads private metrics and reports estimates by mode, command category, command head, strategy, and plugin version. Metrics omit prompts, command arguments, and tool output. They are not provider billing/usage measurements.
+
+Native wrapper metrics also record `command_head`: the allow-listed executable name plus, where applicable, its allow-listed subcommand (`git status`, `gh pr list`, `docker ps`, `pytest` for every pytest spelling). It is derived from the same fixed lists the wrapper uses to authorize a command and never contains arguments, paths, or flag values. Post-hook metrics do not carry it; `stats` prints the `command_head:` section (and `--json` includes the group) only when at least one record has the field, so you can see which commands RTK actually helps.
 
 ```bash
 python3 scripts/tokenpipe.py stats

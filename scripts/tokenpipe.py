@@ -1158,6 +1158,47 @@ def _strict_argv_category(argv):
     return category
 
 
+def command_head(argv, category):
+    """Return the privacy-safe command label recorded in native metrics.
+
+    Args:
+        argv (Sequence[str]): Direct command vector already classified by
+            :func:`_strict_argv_category`; inspected only, never mutated.
+        category (str): Coarse category that classification returned for
+            ``argv``. ``unknown`` yields no label.
+
+    Returns:
+        str | None: Lower-cased allow-listed executable basename, optionally
+        followed by its allow-listed subcommand (``git status``, ``gh pr list``,
+        ``docker compose ps``, ``npm test``); ``pytest`` for every supported
+        pytest spelling including ``python -m pytest`` and ``uv run pytest``.
+        ``None`` when ``category`` is ``unknown`` or ``argv`` is empty.
+
+    The value is built only from tokens that the category classification has
+    already matched against fixed allow-lists, so it never carries arguments,
+    paths, flag values, or free-form user input. Any shape not covered here
+    falls back to the bare executable basename.
+    """
+    if not argv or category == "unknown":
+        return None
+    head = os.path.basename(str(argv[0])).lower()
+    args = [str(item).lower() for item in argv[1:]]
+    if head == "git":
+        index = _git_subcommand_index([str(item) for item in argv[1:]])
+        return head if index is None else head + " " + args[index]
+    if category == "test" and (head == "uv" or _python_pytest(argv)):
+        return "pytest"
+    if head == "docker" and args:
+        return head + " " + " ".join(args[:2] if args[0] == "compose" else args[:1])
+    if head == "gh":
+        return head + " " + " ".join(args[:2])
+    if head in ("cargo", "go") and args:
+        return head + " " + args[0]
+    if head in ("npm", "pnpm", "yarn") and args:
+        return head + " " + (args[1] if args[0] == "run" and len(args) > 1 else args[0])
+    return head
+
+
 def rtk_argv(argv, category):
     """Build RTK's safe argv for one already-classified native command.
 
@@ -1401,6 +1442,49 @@ def configured_rtk():
     return (path if isinstance(path, str) else None), enabled
 
 
+def configured_rtk_skip():
+    """Return the persisted ``rtk_skip`` list of command heads.
+
+    Returns:
+        list[str]: Command-head labels (see :func:`command_head`) that must run
+        natively even when RTK is enabled. Missing, malformed, or non-string
+        entries are ignored, so a damaged setting fails open to ``[]``.
+    """
+    value = configured_settings().get("rtk_skip")
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str) and item]
+
+
+def set_configured_rtk_skip(value):
+    """Persist the ``rtk_skip`` exclusion list from a comma-separated string.
+
+    Args:
+        value (str): Comma-separated command heads such as ``"git status,cat"``.
+            Entries are whitespace-trimmed, inner whitespace collapsed,
+            lower-cased, and de-duplicated preserving first occurrence. An
+            empty or blank string removes the key.
+
+    Returns:
+        list[str]: The list now persisted, as :func:`configured_rtk_skip` reads it.
+
+    Side effects:
+        Rewrites the private settings file atomically; other keys are kept.
+    """
+    heads = []
+    for item in str(value or "").split(","):
+        head = " ".join(item.split()).lower()
+        if head and head not in heads:
+            heads.append(head)
+    settings = configured_settings()
+    if heads:
+        settings["rtk_skip"] = heads
+    else:
+        settings.pop("rtk_skip", None)
+    _write_settings(settings)
+    return configured_rtk_skip()
+
+
 def set_configured_rtk(path):
     settings = configured_settings()
     if path is None:
@@ -1435,13 +1519,40 @@ def _label_streams(stdout, stderr):
 
 def _metric_base(payload, mode, category, strategy, content_category, original, shown,
                  counterfactual, exit_status, skip_reason, raw_ref, compressor_error,
-                 started, native_header_bytes=0, audit_overflow=False, rtk_used=False):
+                 started, native_header_bytes=0, audit_overflow=False, rtk_used=False,
+                 command_head=None):
+    """Build one private metric record shared by post-hook and native paths.
+
+    Args:
+        payload (dict): Hook payload; only sanitized ``session_id`` and
+            ``tool_name`` are read from it.
+        mode (str): Effective mode (``audit``, ``safe``, ``full``).
+        category (str): Coarse command category.
+        strategy (str): Final rendering strategy label.
+        content_category (str): Classified output content kind.
+        original (str): Model-visible text without tokenpipe.
+        shown (str): Text actually returned to the model.
+        counterfactual (str): Text tokenpipe would show if replacement applied.
+        exit_status (int | None): Child exit status when known.
+        skip_reason (str | None): Why replacement did not happen, if it did not.
+        raw_ref (str | None): Recovery reference; only its presence is recorded.
+        compressor_error (str | None): Exception class name, if any.
+        started (float): ``time.time()`` at call start, for latency.
+        native_header_bytes (int): Size of the native header, ``0`` for post-hook rows.
+        audit_overflow (bool): Whether audit output exceeded the shown cap.
+        rtk_used (bool): Whether RTK executed the child.
+        command_head (str | None): Allow-listed label from :func:`command_head`
+            for native wrapper calls; the key is omitted when ``None``.
+
+    Returns:
+        dict: JSON-serialisable metric row without arguments, paths, or output.
+    """
     now = _dt.datetime.now(_dt.timezone.utc)
     original_est = estimate_tokens(original)
     shown_est = estimate_tokens(shown)
     counter_est = estimate_tokens(counterfactual)
     saved = 0.0 if not original_est else 100.0 * (original_est - counter_est) / original_est
-    return {
+    metric = {
         "timestamp": now.isoformat(), "day": now.date().isoformat(),
         "session": _safe_component(payload.get("session_id"), "unknown-session"),
         "tool": _safe_component(payload.get("tool_name"), "exec_command"),
@@ -1461,6 +1572,9 @@ def _metric_base(payload, mode, category, strategy, content_category, original, 
         "audit_overflow": bool(audit_overflow),
         "rtk_used": bool(rtk_used),
     }
+    if command_head is not None:
+        metric["command_head"] = command_head
+    return metric
 
 
 def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None,
@@ -1484,6 +1598,10 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
     Git reads receive a sanitized config/environment that disables hooks,
     fsmonitor, pagers, external diff, and textconv. Capture/compressor/metric
     failures preserve execution or fail open without broadening argv authority.
+    When RTK is enabled but the command's :func:`command_head` is listed in the
+    ``rtk_skip`` setting, the command runs natively with strategy
+    ``passthrough`` and ``skip_reason`` ``rtk-skipped`` (unless another skip
+    reason applies). Executed native metrics carry ``command_head``.
     """
     started = time.time()
     mode = mode or configured_mode()
@@ -1550,6 +1668,10 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
     rtk_trusted = trusted_rtk_path(rtk_path)
     rtk_used = bool(want_rtk and category_ok and rtk_trusted)
     rtk_missing = bool(persisted_rtk_enabled and not rtk_trusted)
+    head_label = command_head(argv, derived_category)
+    rtk_skipped = bool(rtk_used and head_label in configured_rtk_skip())
+    if rtk_skipped:
+        rtk_used = False
     if rtk_used:
         # For python -m pytest, RTK executes ``pytest``; the interpreter itself
         # is never executed by this wrapper when RTK is used. Without RTK,
@@ -1621,6 +1743,8 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
         compressor_error = type(exc).__name__
     if skip_reason is None and rtk_missing:
         skip_reason = "rtk-untrusted"
+    elif skip_reason is None and rtk_skipped:
+        skip_reason = "rtk-skipped"
     replace = mode in ("safe", "full") and candidate != body
     payload = {
         "session_id": session_id, "tool_call_id": tool_call_id,
@@ -1657,7 +1781,7 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
         original_native, shown, counter_native, exit_status, skip_reason, raw_ref,
         compressor_error, started, len(shown_header.encode("utf-8", "replace")),
         mode == "audit" and len(shown) > max(256, int(os.environ.get("TOKENPIPE_MAX_SHOWN_CHARS", "7000"))),
-        rtk_used,
+        rtk_used, head_label,
     )
     try:
         _append_metric(metric)
@@ -1723,13 +1847,26 @@ def load_metrics(since=None, session=None):
 
 
 def aggregate(rows):
+    """Aggregate metric rows into totals and per-dimension groups.
+
+    Args:
+        rows (list[dict]): Metric records as returned by :func:`load_metrics`.
+
+    Returns:
+        dict: Report with estimate totals, native/RTK coverage counters, and
+        ``groups`` keyed by dimension. The ``command_head`` dimension is present
+        only when at least one row carries that field; other dimensions bucket
+        missing values under ``none``.
+    """
     groups = {
-        "day": {}, "session": {}, "command_category": {},
+        "day": {}, "session": {}, "command_category": {}, "command_head": {},
         "strategy": {}, "content_category": {}, "skip_reason": {},
         "mode": {}, "plugin_version": {},
     }
     for dimension in groups:
         for row in rows:
+            if dimension == "command_head" and not row.get(dimension):
+                continue
             key = row.get(dimension) or "none"
             group = groups[dimension].setdefault(key, {
                 "calls": 0, "original_tokens_estimate": 0,
@@ -1743,6 +1880,9 @@ def aggregate(rows):
             group["counterfactual_tokens_estimate"] += int(row.get("counterfactual_tokens_estimate") or 0)
             group["errors"] += 1 if row.get("compressor_error") else 0
             group["rtk_calls"] += 1 if row.get("rtk_used") else 0
+    if not groups["command_head"]:
+        # Only native wrapper rows carry the field; hide the section otherwise.
+        del groups["command_head"]
     original = sum(int(row.get("original_tokens_estimate") or 0) for row in rows)
     shown = sum(int(row.get("shown_tokens_estimate") or 0) for row in rows)
     counterfactual = sum(int(row.get("counterfactual_tokens_estimate") or 0) for row in rows)
@@ -1821,6 +1961,15 @@ def show_raw(path):
 
 
 def main(argv=None):
+    """Run the tokenpipe CLI.
+
+    Args:
+        argv (list[str] | None): Command-line arguments without the program
+            name; ``None`` reads :data:`sys.argv`.
+
+    Returns:
+        int: Process exit status; ``exec`` forwards the child's status.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", action="version", version=VERSION)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -1839,6 +1988,9 @@ def main(argv=None):
     replace_cmd.add_argument("value", nargs="?")
     rtk_cmd = commands.add_parser("rtk", help="show, enable, or disable trusted RTK integration")
     rtk_cmd.add_argument("value", nargs="?", help="absolute RTK executable path, or 'off'")
+    rtk_cmd.add_argument(
+        "--skip", metavar="HEADS",
+        help="comma-separated command heads (e.g. 'git status,cat') that bypass RTK; '' clears")
     native = commands.add_parser("exec", help="execute direct argv and emit native compressed output")
     native.add_argument("--category", required=True)
     native.add_argument("--session-id")
@@ -1889,9 +2041,11 @@ def main(argv=None):
             if report["rtk_owned_calls"]:
                 print("RTK savings are external to these estimates; verify them with `rtk gain`.")
             for dimension in (
-                "day", "session", "command_category", "strategy",
+                "day", "session", "command_category", "command_head", "strategy",
                 "content_category", "skip_reason", "mode", "plugin_version",
             ):
+                if dimension not in report["groups"]:
+                    continue
                 print("\n%s:" % dimension)
                 for key, value in sorted(report["groups"][dimension].items()):
                     print("  %s: %d calls, %d -> %d est. tokens" % (
@@ -1921,12 +2075,17 @@ def main(argv=None):
                 set_configured_rtk(None)
             elif args.value:
                 set_configured_rtk(args.value)
+            if args.skip is not None:
+                set_configured_rtk_skip(args.skip)
             path, enabled = configured_rtk()
             if enabled and path:
                 state = " (missing)" if not trusted_rtk_path(path) else ""
                 print("enabled{} {}".format(state, path))
             else:
                 print("disabled")
+            skipped = configured_rtk_skip()
+            if skipped:
+                print("skip: " + ", ".join(skipped))
         except ValueError as exc:
             print("tokenpipe: {}".format(exc), file=sys.stderr)
             return 2
