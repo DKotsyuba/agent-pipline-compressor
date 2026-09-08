@@ -309,6 +309,25 @@ class TokenpipeTests(unittest.TestCase):
         self.assertIn("category-not-allowed-in-mode", tokenpipe.load_metrics()[-2]["skip_reason"])
         self.assertIn("raw_ref=", full.splitlines()[0])
 
+    def test_rtk_argv_routes_supported_native_commands(self):
+        """Verify direct RTK rewrites and conservative passthrough cases."""
+        cases = [
+            (["python3", "-m", "pytest", "-q"], "test", ["rtk", "pytest", "-q"]),
+            (["uv", "run", "pytest", "-q"], "test", ["rtk", "pytest", "-q"]),
+            (["uv", "run", "python", "-m", "pytest", "-q"], "test", ["rtk", "uv", "run", "python", "-m", "pytest", "-q"]),
+            (["cat", "README.md"], "filesystem-read", ["rtk", "read", "README.md"]),
+            (["head", "-20", "README.md"], "filesystem-read", ["rtk", "read", "README.md", "--max-lines", "20"]),
+            (["head", "-n", "20", "README.md"], "filesystem-read", ["rtk", "read", "README.md", "--max-lines", "20"]),
+            (["tail", "-20", "README.md"], "filesystem-read", ["rtk", "read", "README.md", "--tail-lines", "20"]),
+            (["head", "-c", "20", "README.md"], "filesystem-read", ["rtk", "head", "-c", "20", "README.md"]),
+            (["head", "-20", "a", "b"], "filesystem-read", ["rtk", "head", "-20", "a", "b"]),
+            (["head", "README.md"], "filesystem-read", ["rtk", "head", "README.md"]),
+            (["wc", "-l", "README.md"], "filesystem-read", ["rtk", "wc", "-l", "README.md"]),
+            (["git", "status"], "git-read", ["rtk", "git", "status"]),
+        ]
+        for argv, category, expected in cases:
+            self.assertEqual(tokenpipe.rtk_argv(argv, category), expected, argv)
+
     def test_refused_audit_exec_does_not_inflate_native_coverage(self):
         ls_path = shutil.which("ls")
         output, status = tokenpipe.execute_native(

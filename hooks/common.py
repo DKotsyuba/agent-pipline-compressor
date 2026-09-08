@@ -146,8 +146,20 @@ def command_category(command: Optional[str]) -> str:
         return "unknown"
     head = Path(words[0]).name.lower()
     if head == "git" and len(words) > 1:
+        # Keep global-option forms such as ``git -C dir status`` in the same
+        # coarse metric bucket without retaining any command arguments.
         sub = words[1].lower()
+        if sub in {"-C", "-c", "--no-pager"} and len(words) > 2:
+            sub = words[2].lower()
         return "git"
+    if head == "python" or head == "python3" or (head.startswith("python3.") and head[8:].isdigit()):
+        if len(words) >= 3 and words[1].lower() == "-m" and words[2].lower() == "pytest":
+            return "test"
+    if head == "uv" and len(words) >= 3 and words[1].lower() == "run":
+        if words[2].lower() == "pytest" or (
+            len(words) >= 5 and words[2:5] == ["python", "-m", "pytest"]
+        ):
+            return "test"
     if head in {"pytest", "py.test", "jest", "vitest"}:
         return "test"
     if head == "cargo" and len(words) > 1:
