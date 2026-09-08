@@ -613,9 +613,159 @@ def markdown_summary(report):
     return "\n".join(lines)
 
 
+def _rtk_fixture_project(root):
+    """Generate the deterministic project used by the RTK baseline.
+
+    Args:
+        root (str): Temporary directory in which to create the project.
+
+    Returns:
+        str: The generated project directory.
+
+    The project is local-only and has stable source, JSON, Git, and pytest
+    content. Git metadata uses fixed identity and timestamps.
+    """
+    project = os.path.join(root, "rtk-project")
+    os.makedirs(project)
+    module = "\n".join("def synthetic_function_%03d(value): return value + %d" % (i, i) for i in range(300)) + "\n"
+    _write(os.path.join(project, "synthetic_module.py"), module)
+    _write(os.path.join(project, "fixture.json"), json.dumps({"items": list(range(40)), "status": "ok"}, indent=2) + "\n")
+    _write(os.path.join(project, "test_pass.py"), "def test_pass():\n    assert 2 + 2 == 4\n")
+    _write(os.path.join(project, "test_fail.py"), "def test_fail():\n    assert 2 + 2 == 5\n")
+    _write(os.path.join(project, "dirty.txt"), "committed\nchanged\n")
+    env = os.environ.copy()
+    env.update({"GIT_AUTHOR_NAME": "Lab User", "GIT_AUTHOR_EMAIL": "lab@example.invalid",
+                "GIT_COMMITTER_NAME": "Lab User", "GIT_COMMITTER_EMAIL": "lab@example.invalid",
+                "GIT_AUTHOR_DATE": "2026-01-01T00:00:00+0000", "GIT_COMMITTER_DATE": "2026-01-01T00:00:00+0000"})
+    subprocess.run(["git", "init", "-q", project], check=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    for key, value in (("user.name", "Lab User"), ("user.email", "lab@example.invalid"), ("commit.gpgSign", "false")):
+        subprocess.run(["git", "-C", project, "config", key, value], check=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    subprocess.run(["git", "-C", project, "add", "."], check=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    subprocess.run(["git", "-C", project, "commit", "-q", "-m", "fixture commit one"], check=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    _write(os.path.join(project, "dirty.txt"), "committed\nchanged again\n")
+    subprocess.run(["git", "-C", project, "add", "dirty.txt"], check=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    subprocess.run(["git", "-C", project, "commit", "-q", "-m", "fixture commit two"], check=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    _write(os.path.join(project, "dirty.txt"), "committed\nchanged after commit\n")
+    return project
+
+
+def _rtk_commands(project):
+    """Return deterministic direct and RTK argv pairs for baseline rows.
+
+    Args:
+        project (str): Generated fixture project directory.
+
+    Returns:
+        list[dict[str, object]]: Command labels, argv, and optional skip reasons.
+    """
+    module = os.path.join(project, "synthetic_module.py")
+    json_path = os.path.join(project, "fixture.json")
+    rows = [
+        ("git status", ["git", "status"], ["git", "status"]),
+        ("git status --porcelain", ["git", "status", "--porcelain"], ["git", "status", "--porcelain"]),
+        ("git diff", ["git", "diff"], ["git", "diff"]),
+        ("git log -n 20", ["git", "log", "-n", "20"], ["git", "log", "-n", "20"]),
+        ("git show HEAD", ["git", "show", "HEAD"], ["git", "show", "HEAD"]),
+        ("ls -la project", ["ls", "-la", project], ["ls", project]),
+        ("cat synthetic_module.py", ["cat", module], ["read", module]),
+        ("head -50 synthetic_module.py", ["head", "-50", module], ["read", module, "--max-lines", "50"]),
+        ("tail -50 synthetic_module.py", ["tail", "-50", module], ["read", module, "--tail-lines", "50"]),
+        ("wc -l synthetic_module.py", ["wc", "-l", module], ["wc", module]),
+        ("rg synthetic_function project", ["rg", "synthetic_function", project], ["rg", "synthetic_function", project]),
+        ("find Python files", ["find", project, "-name", "*.py"], ["find", project, "-name", "*.py"]),
+        ("jq fixture.json", ["jq", ".", json_path], ["jq", ".", json_path]),
+        ("pytest passing", [sys.executable, "-m", "pytest", "-q", "test_pass.py"], ["pytest", "-q", "test_pass.py"]),
+        ("pytest failing", [sys.executable, "-m", "pytest", "-q", "test_fail.py"], ["pytest", "-q", "test_fail.py"]),
+    ]
+    skips = {"rg synthetic_function project": None if shutil.which("rg") else "rg missing",
+             "find Python files": None if shutil.which("find") else "find missing",
+             "jq fixture.json": None if shutil.which("jq") else "jq missing"}
+    pytest_ok = _pytest_python() is not None
+    if not pytest_ok:
+        skips["pytest passing"], skips["pytest failing"] = "pytest missing", "pytest missing"
+    return [{"command": label, "argv": tuple(argv), "rtk_argv": tuple(rtk_argv), "skip": skips.get(label)}
+            for label, argv, rtk_argv in rows]
+
+
+def _rtk_cell(size, tokens, raw_size):
+    """Format one baseline size cell with its percentage of raw output."""
+    percent = 100.0 * size / raw_size if raw_size else 0.0
+    return "%d/%d (%.1f%%)" % (size, tokens, percent)
+
+
+def render_rtk_table(rows, version):
+    """Render the public RTK baseline table without filesystem paths.
+
+    Args:
+        rows (list[dict[str, object]]): Baseline measurements.
+        version (str): Version string reported by the RTK binary.
+
+    Returns:
+        str: Markdown document containing the version header and table.
+    """
+    lines = ["RTK version: %s" % version, "Numbers are UTF-8 bytes and estimated tokens (bytes / 3.5).", "",
+             "| command | raw bytes/tokens | rtk bytes/tokens (%) | tokenpipe bytes/tokens (%) |",
+             "| --- | ---: | ---: | ---: |"]
+    for row in rows:
+        raw = _rtk_cell(row["raw_bytes"], row["raw_tokens"], row["raw_bytes"])
+        rtk = row.get("rtk") if row.get("rtk") else row.get("rtk_error", "skipped")
+        if isinstance(rtk, dict):
+            rtk = _rtk_cell(rtk["bytes"], rtk["tokens"], row["raw_bytes"])
+        pipe = _rtk_cell(row["tokenpipe_bytes"], row["tokenpipe_tokens"], row["raw_bytes"])
+        lines.append("| %s | %s | %s | %s |" % (row["command"], raw, rtk, pipe))
+    return "\n".join(lines) + "\n"
+
+
+def run_rtk_baseline(rtk_bin, output_path=None):
+    """Run the RTK-vs-tokenpipe baseline over a generated fixture project.
+
+    Args:
+        rtk_bin (str): Absolute path to the RTK executable.
+        output_path (str | None): Optional Markdown output path.
+
+    Returns:
+        str: Rendered Markdown table. RTK failures remain row-local errors.
+    """
+    with tempfile.TemporaryDirectory(prefix="tokenpipe-rtk-baseline-") as root:
+        project = _rtk_fixture_project(root)
+        history = os.path.join(root, "rtk-history")
+        os.makedirs(history)
+        env = os.environ.copy()
+        env["RTK_DB_PATH"] = history
+        version_capture = _capture([rtk_bin, "--version"], env=env, cwd=project)[0].strip() or "unknown"
+        rows = []
+        for spec in _rtk_commands(project):
+            if spec["skip"]:
+                raw = ""
+                rows.append({"command": spec["command"], "raw_bytes": 0, "raw_tokens": 0,
+                             "rtk_error": "skipped (%s)" % spec["skip"], "tokenpipe_bytes": 0,
+                             "tokenpipe_tokens": 0})
+                continue
+            raw, _, _ = _capture(spec["argv"], env=env, cwd=project)
+            category = tokenpipe.classify(raw)
+            _, compressed = tokenpipe.compress(raw, category)
+            rtk_output, rtk_exit, _ = _capture([rtk_bin] + list(spec["rtk_argv"]), env=env, cwd=project)
+            row = {"command": spec["command"], "raw_bytes": len(raw.encode("utf-8")),
+                   "raw_tokens": tokenpipe.estimate_tokens(raw), "tokenpipe_bytes": len(compressed.encode("utf-8")),
+                   "tokenpipe_tokens": tokenpipe.estimate_tokens(compressed)}
+            if rtk_exit:
+                row["rtk_error"] = "error %d" % rtk_exit
+            else:
+                row["rtk"] = {"bytes": len(rtk_output.encode("utf-8")), "tokens": tokenpipe.estimate_tokens(rtk_output)}
+            rows.append(row)
+        table = render_rtk_table(rows, version_capture)
+    if output_path:
+        _write(output_path, table)
+    return table
+
+
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__); parser.add_argument("--json", action="store_true"); parser.add_argument("--rtk"); parser.add_argument("--no-rtk", action="store_true")
-    args = parser.parse_args(argv); report = run_lab(enable_rtk=not args.no_rtk, explicit_rtk=args.rtk)
+    parser = argparse.ArgumentParser(description=__doc__); parser.add_argument("--json", action="store_true"); parser.add_argument("--rtk"); parser.add_argument("--no-rtk", action="store_true"); parser.add_argument("--rtk-bin"); parser.add_argument("--rtk-out", default=os.path.join(ROOT, "docs", "rtk-coverage.md"))
+    args = parser.parse_args(argv)
+    if args.rtk_bin:
+        print(run_rtk_baseline(args.rtk_bin, args.rtk_out), end="")
+        return 0
+    report = run_lab(enable_rtk=not args.no_rtk, explicit_rtk=args.rtk)
     if args.json: json.dump(report, sys.stdout, ensure_ascii=False, indent=2, sort_keys=True); sys.stdout.write("\n")
     else: print(markdown_summary(report))
     return 0

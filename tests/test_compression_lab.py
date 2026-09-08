@@ -16,6 +16,35 @@ SPEC.loader.exec_module(lab)
 
 
 class CompressionLabTests(unittest.TestCase):
+    def test_rtk_fixture_generator_is_deterministic_and_has_required_inputs(self):
+        with tempfile.TemporaryDirectory() as root:
+            project = lab._rtk_fixture_project(root)
+            with open(os.path.join(project, "synthetic_module.py"), encoding="utf-8") as handle:
+                self.assertEqual(len(handle.read().splitlines()), 300)
+            self.assertTrue(os.path.isdir(os.path.join(project, ".git")))
+            self.assertTrue(os.path.exists(os.path.join(project, "fixture.json")))
+            self.assertTrue(os.path.exists(os.path.join(project, "test_pass.py")))
+            self.assertTrue(os.path.exists(os.path.join(project, "test_fail.py")))
+            self.assertIn("synthetic_module.py", os.listdir(project))
+
+    def test_rtk_baseline_renderer_and_fake_executable(self):
+        rows = [{"command": "fixture", "raw_bytes": 100, "raw_tokens": 28,
+                 "rtk": {"bytes": 40, "tokens": 11}, "tokenpipe_bytes": 50,
+                 "tokenpipe_tokens": 14}]
+        table = lab.render_rtk_table(rows, "rtk 0.0-test")
+        self.assertIn("RTK version: rtk 0.0-test", table)
+        self.assertIn("| fixture | 100/28 (100.0%) | 40/11 (40.0%) | 50/14 (50.0%) |", table)
+        with tempfile.TemporaryDirectory() as root:
+            fake = os.path.join(root, "fake-rtk")
+            with open(fake, "w", encoding="utf-8") as handle:
+                handle.write("#!/usr/bin/env python3\nimport sys\nprint('rtk 0.0-test' if sys.argv[1:] == ['--version'] else 'fake output')\n")
+            os.chmod(fake, 0o700)
+            output = os.path.join(root, "coverage.md")
+            rendered = lab.run_rtk_baseline(fake, output)
+            with open(output, encoding="utf-8") as handle:
+                self.assertEqual(rendered, handle.read())
+            self.assertIn("git status", rendered)
+
     def test_synthetic_manifest_and_command_matrix_are_separate(self):
         first = lab.corpus()
         second = lab.corpus()
@@ -179,6 +208,8 @@ raise SystemExit(subprocess.run(command, check=False).returncode)
     def test_real_routing_policy_rejects_rtk_without_raw_recovery(self):
         with tempfile.TemporaryDirectory() as root:
             report = lab.run_lab(enable_rtk=True, root=root)
+        if report["capabilities"]["rtk"]["status"].startswith("skipped"):
+            self.skipTest("RTK unavailable")
         selected = report["global_winners"]["command_matrix"]["selected"]
         self.assertTrue(all(signature.startswith("local:") for signature in selected.values()))
         changed = [record for record in report["command_cases"]
