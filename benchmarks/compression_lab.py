@@ -630,8 +630,18 @@ def _rtk_fixture_project(root):
     module = "\n".join("def synthetic_function_%03d(value): return value + %d" % (i, i) for i in range(300)) + "\n"
     _write(os.path.join(project, "synthetic_module.py"), module)
     _write(os.path.join(project, "fixture.json"), json.dumps({"items": list(range(40)), "status": "ok"}, indent=2) + "\n")
-    _write(os.path.join(project, "test_pass.py"), "def test_pass():\n    assert 2 + 2 == 4\n")
-    _write(os.path.join(project, "test_fail.py"), "def test_fail():\n    assert 2 + 2 == 5\n")
+    for directory in ("alpha", "beta", "gamma", "delta"):
+        os.makedirs(os.path.join(project, directory))
+        for index in range(7 if directory != "delta" else 9):
+            _write(os.path.join(project, directory, "tracked_%02d.txt" % index),
+                   "fixture %s %02d\n" % (directory, index))
+    _write(os.path.join(project, "test_pass.py"), "import pytest\n@pytest.mark.parametrize('value', range(60))\ndef test_pass(value):\n    assert value >= 0\n")
+    fail_lines = ["import pytest", "", "@pytest.mark.parametrize('value', range(60))", "def test_many_pass(value):", "    assert value >= 0", "",
+                  "def _value_error_helper():", "    raise ValueError('synthetic helper failure with detail')", "", "def test_helper_error():", "    _value_error_helper()", "",
+                  "def test_dict_comparison():", "    assert {'expected': 1, 'stable': 'value'} == {'actual': 2, 'stable': 'value'}", "",
+                  "def test_long_list_comparison():", "    expected = list(range(30))", "    actual = list(range(29)) + [999]", "    assert actual == expected", "",
+                  "def test_expected_exception():", "    with pytest.raises(KeyError):", "        pass", ""]
+    _write(os.path.join(project, "test_fail.py"), "\n".join(fail_lines))
     _write(os.path.join(project, "dirty.txt"), "committed\nchanged\n")
     env = os.environ.copy()
     env.update({"GIT_AUTHOR_NAME": "Lab User", "GIT_AUTHOR_EMAIL": "lab@example.invalid",
@@ -641,11 +651,20 @@ def _rtk_fixture_project(root):
     for key, value in (("user.name", "Lab User"), ("user.email", "lab@example.invalid"), ("commit.gpgSign", "false")):
         subprocess.run(["git", "-C", project, "config", key, value], check=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     subprocess.run(["git", "-C", project, "add", "."], check=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    subprocess.run(["git", "-C", project, "commit", "-q", "-m", "fixture commit one"], check=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    _write(os.path.join(project, "dirty.txt"), "committed\nchanged again\n")
-    subprocess.run(["git", "-C", project, "add", "dirty.txt"], check=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    subprocess.run(["git", "-C", project, "commit", "-q", "-m", "fixture commit two"], check=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    _write(os.path.join(project, "dirty.txt"), "committed\nchanged after commit\n")
+    subprocess.run(["git", "-C", project, "commit", "-q", "-m", "fixture commit 01"], check=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    history_file = os.path.join(project, "alpha", "tracked_00.txt")
+    for commit in range(2, 26):
+        _write(history_file, "fixture alpha 00\nhistory commit %02d\n" % commit)
+        subprocess.run(["git", "-C", project, "add", history_file], check=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(["git", "-C", project, "commit", "-q", "-m", "fixture commit %02d" % commit], check=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    for index in range(8):
+        path = os.path.join(project, ("alpha", "beta", "gamma", "delta")[index // 2], "tracked_%02d.txt" % (index % 2))
+        _write(path, "modified file %02d\n" % index + "\n".join("diff detail %03d" % line for line in range(35)) + "\n")
+    for index in range(8, 12):
+        path = os.path.join(project, ("alpha", "beta", "gamma", "delta")[index // 3], "tracked_%02d.txt" % (index % 3))
+        _write(path, "small modification %02d\n" % index)
+    for index in range(5):
+        _write(os.path.join(project, "delta", "untracked_%02d.txt" % index), "untracked fixture %02d\n" % index)
     return project
 
 
@@ -674,8 +693,8 @@ def _rtk_commands(project):
         ("rg synthetic_function project", ["rg", "synthetic_function", project], ["rg", "synthetic_function", project]),
         ("find Python files", ["find", project, "-name", "*.py"], ["find", project, "-name", "*.py"]),
         ("jq fixture.json", ["jq", ".", json_path], ["jq", ".", json_path]),
-        ("pytest passing", [sys.executable, "-m", "pytest", "-q", "test_pass.py"], ["pytest", "-q", "test_pass.py"]),
-        ("pytest failing", [sys.executable, "-m", "pytest", "-q", "test_fail.py"], ["pytest", "-q", "test_fail.py"]),
+        ("pytest passing", [sys.executable, "-m", "pytest", "test_pass.py"], ["pytest", "test_pass.py"]),
+        ("pytest failing", [sys.executable, "-m", "pytest", "test_fail.py"], ["pytest", "test_fail.py"]),
     ]
     skips = {"rg synthetic_function project": None if shutil.which("rg") else "rg missing",
              "find Python files": None if shutil.which("find") else "find missing",
@@ -683,7 +702,8 @@ def _rtk_commands(project):
     pytest_ok = _pytest_python() is not None
     if not pytest_ok:
         skips["pytest passing"], skips["pytest failing"] = "pytest missing", "pytest missing"
-    return [{"command": label, "argv": tuple(argv), "rtk_argv": tuple(rtk_argv), "skip": skips.get(label)}
+    expected = {"pytest passing": 0, "pytest failing": 1}
+    return [{"command": label, "argv": tuple(argv), "rtk_argv": tuple(rtk_argv), "expected_exit": expected.get(label, 0), "skip": skips.get(label)}
             for label, argv, rtk_argv in rows]
 
 
@@ -703,7 +723,7 @@ def render_rtk_table(rows, version):
     Returns:
         str: Markdown document containing the version header and table.
     """
-    lines = ["RTK version: %s" % version, "Numbers are UTF-8 bytes and estimated tokens (bytes / 3.5).", "",
+    lines = ["RTK version: %s" % version, "Numbers are UTF-8 bytes and estimated tokens (bytes / 3.5).", "Fixture runtime: Python 3.12 with pytest 8.x.", "",
              "| command | raw bytes/tokens | rtk bytes/tokens (%) | tokenpipe bytes/tokens (%) |",
              "| --- | ---: | ---: | ---: |"]
     for row in rows:
@@ -713,6 +733,20 @@ def render_rtk_table(rows, version):
             rtk = _rtk_cell(rtk["bytes"], rtk["tokens"], row["raw_bytes"])
         pipe = _rtk_cell(row["tokenpipe_bytes"], row["tokenpipe_tokens"], row["raw_bytes"])
         lines.append("| %s | %s | %s | %s |" % (row["command"], raw, rtk, pipe))
+    lines.append("")
+    winners = []
+    for row in rows:
+        rtk = row.get("rtk")
+        if not rtk:
+            winner = "neither"
+        elif rtk["bytes"] < row["tokenpipe_bytes"]:
+            winner = "rtk"
+        elif row["tokenpipe_bytes"] < rtk["bytes"]:
+            winner = "tokenpipe"
+        else:
+            winner = "neither"
+        winners.append("%s: %s" % (row["command"], winner))
+    lines.append("Winner per row: %s" % "; ".join(winners))
     return "\n".join(lines) + "\n"
 
 
@@ -748,7 +782,7 @@ def run_rtk_baseline(rtk_bin, output_path=None):
             row = {"command": spec["command"], "raw_bytes": len(raw.encode("utf-8")),
                    "raw_tokens": tokenpipe.estimate_tokens(raw), "tokenpipe_bytes": len(compressed.encode("utf-8")),
                    "tokenpipe_tokens": tokenpipe.estimate_tokens(compressed)}
-            if rtk_exit:
+            if rtk_exit != spec["expected_exit"]:
                 row["rtk_error"] = "error %d" % rtk_exit
             else:
                 row["rtk"] = {"bytes": len(rtk_output.encode("utf-8")), "tokens": tokenpipe.estimate_tokens(rtk_output)}
