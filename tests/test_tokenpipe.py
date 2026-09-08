@@ -491,43 +491,65 @@ class TokenpipeTests(unittest.TestCase):
 
     def test_safe_git_disables_external_diff_and_fsmonitor_helpers(self):
         """Safe Git reads must not invoke repository-configured executables."""
-        git = shutil.which("git")
-        if not git:
-            self.skipTest("git unavailable")
+        old_path = os.environ.get("PATH", "")
+        trusted_dirs = "/usr/bin:/usr/local/bin:/opt/homebrew/bin:/bin"
+        os.environ["PATH"] = trusted_dirs
+        trusted_git = tokenpipe._resolve_trusted_executable("git")
+        os.environ["PATH"] = old_path
+        if not trusted_git:
+            self.skipTest("trusted git unavailable")
         repo = tempfile.TemporaryDirectory()
         marker = os.path.join(repo.name, "helper-ran")
         helper = os.path.join(repo.name, "helper")
+        os.environ["PATH"] = trusted_dirs + os.pathsep + old_path
         with open(helper, "w", encoding="utf-8") as handle:
             handle.write("#!/bin/sh\nprintf ran > %s\nexit 0\n" % marker)
         os.chmod(helper, 0o700)
-        subprocess.run([git, "init", "-q", repo.name], check=True)
-        subprocess.run([git, "-C", repo.name, "config", "user.email", "test@example.invalid"], check=True)
-        subprocess.run([git, "-C", repo.name, "config", "user.name", "test"], check=True)
+        subprocess.run([trusted_git, "init", "-q", repo.name], check=True)
+        subprocess.run(
+            [trusted_git, "-C", repo.name, "config", "user.email", "test@example.invalid"],
+            check=True,
+        )
+        subprocess.run(
+            [trusted_git, "-C", repo.name, "config", "user.name", "test"],
+            check=True,
+        )
         path = os.path.join(repo.name, "file.txt")
         with open(path, "w", encoding="utf-8") as handle:
             handle.write("one\n")
-        subprocess.run([git, "-C", repo.name, "add", "file.txt"], check=True)
-        subprocess.run([git, "-C", repo.name, "commit", "-qm", "base"], check=True)
+        subprocess.run([trusted_git, "-C", repo.name, "add", "file.txt"], check=True)
+        subprocess.run([trusted_git, "-C", repo.name, "commit", "-qm", "base"], check=True)
         with open(path, "w", encoding="utf-8") as handle:
             handle.write("two\n")
-        subprocess.run([git, "-C", repo.name, "config", "diff.external", helper], check=True)
-        subprocess.run([git, "-C", repo.name, "config", "core.fsmonitor", helper], check=True)
+        subprocess.run(
+            [trusted_git, "-C", repo.name, "config", "diff.external", helper],
+            check=True,
+        )
+        subprocess.run(
+            [trusted_git, "-C", repo.name, "config", "core.fsmonitor", helper],
+            check=True,
+        )
         previous = os.getcwd()
         try:
             os.chdir(repo.name)
-            output, status_code = tokenpipe.execute_native(["git", "diff"], "git-read", "safe")
+            output, status_code = tokenpipe.execute_native(
+                [trusted_git, "diff"], "git-read", "safe"
+            )
             self.assertEqual(status_code, 0, output)
             self.assertFalse(os.path.exists(marker))
-            output, status_code = tokenpipe.execute_native(["git", "status", "--short"], "git-read", "safe")
+            output, status_code = tokenpipe.execute_native(
+                [trusted_git, "status", "--short"], "git-read", "safe"
+            )
             self.assertEqual(status_code, 0, output)
             self.assertFalse(os.path.exists(marker))
             refused, refused_status = tokenpipe.execute_native(
-                ["git", "diff", "--ext-diff"], "git-read", "safe"
+                [trusted_git, "diff", "--ext-diff"], "git-read", "safe"
             )
             self.assertEqual(refused_status, 126)
             self.assertIn("category-command-mismatch", refused)
         finally:
             os.chdir(previous)
+            os.environ["PATH"] = old_path
             repo.cleanup()
 
     def test_native_capture_limit_terminates_and_reports_child(self):
@@ -757,6 +779,123 @@ class TokenpipeTests(unittest.TestCase):
             )
             self.assertEqual(status_code, 0)
             self.assertNotIn("strategy=rtk-direct", output.splitlines()[0])
+        finally:
+            tokenpipe.set_configured_rtk(None)
+
+    def test_rtk_python_pytest_bypasses_untrusted_interpreter_head(self):
+        untrusted_py = os.path.join(self.temp.name, "venv", "python3")
+        os.makedirs(os.path.dirname(untrusted_py), exist_ok=True)
+        with open(untrusted_py, "w", encoding="utf-8") as handle:
+            handle.write("#!%s\nprint('interpreter should not run')\n" % sys.executable)
+        os.chmod(untrusted_py, 0o700)
+        routed = os.path.join(self.temp.name, "pytest-routed-command")
+        rtk = self.executable(
+            "rtk",
+            "import sys\nopen(%r, 'w').write(' '.join(sys.argv[1:]))\n"
+            % routed,
+        )
+        command_path = os.environ["PATH"]
+        try:
+            os.environ["PATH"] = "/usr/bin:/bin"
+            tokenpipe.set_configured_rtk(rtk)
+            output, status_code = tokenpipe.execute_native(
+                [untrusted_py, "-m", "pytest", "--version"], "test", "full"
+            )
+            self.assertEqual(status_code, 0, output)
+            self.assertIn("strategy=rtk-direct", output.splitlines()[0])
+            with open(routed, "r", encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "pytest --version")
+            metric = tokenpipe.load_metrics()[-1]
+            self.assertTrue(metric["rtk_used"])
+            self.assertTrue(metric["rtk_head_substituted"])
+        finally:
+            os.environ["PATH"] = command_path
+            tokenpipe.set_configured_rtk(None)
+
+    def test_rtk_spawn_failure_never_execs_untrusted_interpreter(self):
+        """A vanished RTK binary must not fall back to running argv[0] itself."""
+        untrusted_py = os.path.join(self.temp.name, "venv", "python3")
+        os.makedirs(os.path.dirname(untrusted_py), exist_ok=True)
+        with open(untrusted_py, "w", encoding="utf-8") as handle:
+            handle.write("#!%s\nprint('interpreter should not run')\n" % sys.executable)
+        os.chmod(untrusted_py, 0o700)
+        rtk = self.executable("rtk", "pass\n")
+        command_path = os.environ["PATH"]
+        try:
+            os.environ["PATH"] = "/usr/bin:/bin"
+            tokenpipe.set_configured_rtk(rtk)
+            with mock.patch.object(tokenpipe, "_run_captured", side_effect=FileNotFoundError("rtk gone")), \
+                    mock.patch.object(tokenpipe.os, "execvpe") as fallback:
+                output, status_code = tokenpipe.execute_native(
+                    [untrusted_py, "-m", "pytest", "--version"], "test", "full", exec_fallback=True
+                )
+            fallback.assert_not_called()
+            self.assertEqual(status_code, 127, output)
+            self.assertIn("FileNotFoundError", output)
+        finally:
+            os.environ["PATH"] = command_path
+            tokenpipe.set_configured_rtk(None)
+
+    def test_rtk_untrusted_python_pytest_without_rtk_config_is_refused(self):
+        untrusted_py = os.path.join(self.temp.name, "venv", "python3")
+        os.makedirs(os.path.dirname(untrusted_py), exist_ok=True)
+        with open(untrusted_py, "w", encoding="utf-8") as handle:
+            handle.write("#!%s\nprint('interpreter should not run')\n" % sys.executable)
+        os.chmod(untrusted_py, 0o700)
+        command_path = os.environ["PATH"]
+        try:
+            os.environ["PATH"] = "/usr/bin:/bin"
+            tokenpipe.set_configured_rtk(None)
+            output, status_code = tokenpipe.execute_native(
+                [untrusted_py, "-m", "pytest", "--version"], "test", "full"
+            )
+            self.assertEqual(status_code, 126)
+            self.assertIn("untrusted-executable", output)
+        finally:
+            os.environ["PATH"] = command_path
+
+    def test_rtk_enabled_does_not_override_untrusted_uv_head(self):
+        untrusted_uv = os.path.join(self.temp.name, "venv", "uv")
+        os.makedirs(os.path.dirname(untrusted_uv), exist_ok=True)
+        with open(untrusted_uv, "w", encoding="utf-8") as handle:
+            handle.write("#!%s\nprint('uv should not run')\n" % sys.executable)
+        os.chmod(untrusted_uv, 0o700)
+        routed = os.path.join(self.temp.name, "uv-routed-command")
+        rtk = self.executable(
+            "rtk",
+            "import sys\nopen(%r, 'w').write(' '.join(sys.argv[1:]))\n"
+            % routed,
+        )
+        command_path = os.environ["PATH"]
+        try:
+            os.environ["PATH"] = "/usr/bin:/bin"
+            tokenpipe.set_configured_rtk(rtk)
+            output, status_code = tokenpipe.execute_native(
+                [untrusted_uv, "run", "pytest", "-q"], "test", "full"
+            )
+            self.assertEqual(status_code, 126)
+            self.assertIn("untrusted-executable", output)
+        finally:
+            os.environ["PATH"] = command_path
+            tokenpipe.set_configured_rtk(None)
+
+    def test_trusted_bare_pytest_route_remains_rtk_wrapped(self):
+        command_seen = os.path.join(self.temp.name, "pytest-command-seen")
+        rtk = self.executable(
+            "rtk",
+            "import sys\nopen(%r, 'w').write(sys.argv[1])\n"
+            % command_seen,
+        )
+        pytest = self.executable("pytest", "print('pytest head')\n")
+        try:
+            tokenpipe.set_configured_rtk(rtk)
+            output, status_code = tokenpipe.execute_native([pytest], "test", "full")
+            self.assertEqual(status_code, 0)
+            self.assertIn("strategy=rtk-direct", output.splitlines()[0])
+            self.assertEqual(
+                open(command_seen, "r", encoding="utf-8").read(),
+                "pytest",
+            )
         finally:
             tokenpipe.set_configured_rtk(None)
 

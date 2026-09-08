@@ -1520,7 +1520,7 @@ def _label_streams(stdout, stderr):
 def _metric_base(payload, mode, category, strategy, content_category, original, shown,
                  counterfactual, exit_status, skip_reason, raw_ref, compressor_error,
                  started, native_header_bytes=0, audit_overflow=False, rtk_used=False,
-                 command_head=None):
+                 command_head=None, rtk_head_substituted=False):
     """Build one private metric record shared by post-hook and native paths.
 
     Args:
@@ -1543,6 +1543,8 @@ def _metric_base(payload, mode, category, strategy, content_category, original, 
         rtk_used (bool): Whether RTK executed the child.
         command_head (str | None): Allow-listed label from :func:`command_head`
             for native wrapper calls; the key is omitted when ``None``.
+        rtk_head_substituted (bool): Whether RTK replaced an untrusted
+            interpreter head (``python -m pytest``) so argv[0] never ran.
 
     Returns:
         dict: JSON-serialisable metric row without arguments, paths, or output.
@@ -1571,6 +1573,7 @@ def _metric_base(payload, mode, category, strategy, content_category, original, 
         "raw_ref_present": bool(raw_ref), "compressor_error": compressor_error,
         "audit_overflow": bool(audit_overflow),
         "rtk_used": bool(rtk_used),
+        "rtk_head_substituted": bool(rtk_head_substituted),
     }
     if command_head is not None:
         metric["command_head"] = command_head
@@ -1608,12 +1611,32 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
     mode = mode if mode in ("audit", "safe", "full") else "audit"
     supplied_category = _normalize_exec_category(category)
     derived_category = _strict_argv_category(argv)
-    resolved_executable = _resolve_trusted_executable(argv[0] if argv else None)
     category_ok = supplied_category == derived_category and supplied_category in FULL_EXEC_CATEGORIES
     allowed_for_mode = supplied_category in (
         SAFE_EXEC_CATEGORIES if mode == "safe" else FULL_EXEC_CATEGORIES
     )
-    if mode not in ("safe", "full") or not category_ok or not allowed_for_mode or not resolved_executable:
+    rtk_path, persisted_rtk_enabled = configured_rtk()
+    want_rtk = use_rtk if use_rtk is not None else persisted_rtk_enabled
+    rtk_trusted = trusted_rtk_path(rtk_path)
+    rtk_route = rtk_argv(argv or [], supplied_category)
+    rtk_head_substituted = (
+        category_ok
+        and (want_rtk and rtk_trusted)
+        and supplied_category == "test"
+        and argv
+        and rtk_route[0] != argv[0]
+    )
+    resolved_executable = (
+        argv[0]
+        if rtk_head_substituted
+        else _resolve_trusted_executable(argv[0] if argv else None)
+    )
+    if (
+            mode not in ("safe", "full")
+            or not category_ok
+            or not allowed_for_mode
+            or (not resolved_executable and not rtk_head_substituted)
+    ):
         reason = (
             "mode-does-not-execute" if mode not in ("safe", "full")
             else "untrusted-executable" if not resolved_executable
@@ -1631,6 +1654,8 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
                 payload, mode, supplied_category, "refused", "unknown",
                 output, output, output, 126, reason, None, None, started,
                 len(output.encode("utf-8", "replace")),
+                rtk_used=False,
+                rtk_head_substituted=rtk_head_substituted,
             ))
         except Exception:
             pass
@@ -1663,9 +1688,6 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
             "PAGER": "cat",
         })
     command_argv = list(original_command_argv)
-    rtk_path, persisted_rtk_enabled = configured_rtk()
-    want_rtk = use_rtk if use_rtk is not None else persisted_rtk_enabled
-    rtk_trusted = trusted_rtk_path(rtk_path)
     rtk_used = bool(want_rtk and category_ok and rtk_trusted)
     rtk_missing = bool(persisted_rtk_enabled and not rtk_trusted)
     head_label = command_head(argv, derived_category)
@@ -1677,7 +1699,7 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
         # is never executed by this wrapper when RTK is used. Without RTK,
         # passthrough retains the existing trusted-head rule unchanged, so an
         # untrusted Python path still runs natively as before the hook rewrite.
-        routed = rtk_argv([argv[0]] + command_argv[1:], supplied_category)
+        routed = rtk_route
         command_argv = list(routed)
         placeholder_index = next(
             (index for index, item in enumerate(command_argv) if item == "rtk"),
@@ -1701,7 +1723,10 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
                 "%d bytes\n" % _capture_limit()
             )
     except (PermissionError, OSError) as exc:
-        if exec_fallback:
+        # Never fall back to the original argv when RTK stood in for an
+        # untrusted interpreter: that argv[0] was never validated and must not
+        # be executed.
+        if exec_fallback and not rtk_head_substituted:
             os.execvpe(original_command_argv[0], original_command_argv, child_env)
         exit_status = 127
         stdout = ""
@@ -1782,6 +1807,7 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
         compressor_error, started, len(shown_header.encode("utf-8", "replace")),
         mode == "audit" and len(shown) > max(256, int(os.environ.get("TOKENPIPE_MAX_SHOWN_CHARS", "7000"))),
         rtk_used, head_label,
+        rtk_head_substituted=rtk_head_substituted,
     )
     try:
         _append_metric(metric)

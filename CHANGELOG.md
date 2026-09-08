@@ -15,10 +15,17 @@ All notable changes to this project are documented here. The format follows
   plus subcommand, never arguments or paths), a matching `stats` section, and
   the `rtk_skip` setting via `tokenpipe rtk --skip` to run listed command heads
   natively instead of through RTK (`skip_reason` `rtk-skipped`).
+- Added explicit RTK exception path for test commands where the rewritten head
+  differs from `argv[0]` in the native wrapper and hook, so Python module
+  pytest invocations can run through RTK from trusted RTK configuration even when
+  the interpreter binary is outside trusted head directories.
 
 ### Fixed
 
 - Trusted RTK symlinks now survive Homebrew upgrades and report missing configured binaries clearly.
+- Hook-level RTK bypass now applies only to `python -m pytest` with RTK enabled
+  and executable; UV routes still require a trusted `uv` head and continue to be
+  refused when RTK is configured but the head cannot be trusted.
 
 ## [0.2.1] - 2026-09-01
 

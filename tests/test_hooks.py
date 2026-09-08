@@ -433,6 +433,25 @@ class HookSecurityTests(unittest.TestCase):
         # setUp resolves heads into /usr/bin, a trusted prefix.
         self.assertIsNotNone(pre_tool.rewrite("cargo test", "full"))
 
+    def test_full_mode_python_pytest_rewrite_requires_enabled_rtk(self):
+        command_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(command_dir.cleanup)
+        command_path = os.path.join(command_dir.name, "python3")
+        with open(command_path, "w", encoding="utf-8") as handle:
+            handle.write("#!%s\necho shim\n" % sys.executable)
+        os.chmod(command_path, 0o700)
+        config_path = os.path.join(os.environ["TOKENPIPE_HOME"], "config.json")
+        with open(config_path, "w", encoding="utf-8") as handle:
+            json.dump({"use_rtk": False}, handle)
+        self.assertIsNone(pre_tool.rewrite(command_path + " -m pytest -q", "full"))
+        rtk_script = os.path.join(command_dir.name, "rtk-enabled")
+        with open(rtk_script, "w", encoding="utf-8") as handle:
+            handle.write("#!%s\nprint('rtk')\n" % sys.executable)
+        os.chmod(rtk_script, 0o700)
+        with open(config_path, "w", encoding="utf-8") as handle:
+            json.dump({"use_rtk": True, "rtk_bin": rtk_script}, handle)
+        self.assertIsNotNone(pre_tool.rewrite(command_path + " -m pytest -q", "full"))
+
     def test_safe_mode_git_is_still_rewritten(self):
         self.assertIsNotNone(pre_tool.rewrite("git status", "safe"))
 

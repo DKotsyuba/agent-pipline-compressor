@@ -160,6 +160,7 @@ python3 scripts/tokenpipe.py rtk --skip "git status,cat"   # comma-separated, tr
 python3 scripts/tokenpipe.py rtk                           # prints the state and `skip: git status, cat`
 python3 scripts/tokenpipe.py rtk --skip ""                 # clears the list
 ```
+For `python -m pytest`, the rewritten head becomes `rtk` so Tokenpipe no longer executes the untrusted Python shim; `pytest` is resolved from RTK's own PATH. Projects that install pytest only in an inactive virtual environment should run with `uv run pytest` or activate that environment so RTK's `pytest` resolver can see it.
 
 ## Recovery, statistics, and privacy
 
