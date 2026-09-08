@@ -900,24 +900,24 @@ def _normalize_exec_category(value):
 
 
 def _git_subcommand_index(args):
-    """Return the read-only Git subcommand index after approved global flags.
+    """Return a read-only Git subcommand index after safe global flags.
 
     Args:
         args (Sequence[str]): Git arguments after ``argv[0]``.
 
     Returns:
         int | None: Index of ``status``, ``diff``, ``log``, or ``show`` in
-        ``args``; ``None`` when the prefix or subcommand is unsupported.
+        ``args``; ``None`` when the prefix or subcommand is unsupported. The
+        command-line ``-c`` option is intentionally rejected because it can
+        select executable Git configuration despite the wrapper environment.
     """
     index = 0
     while index < len(args):
         item = args[index]
         if item == "--no-pager":
             index += 1
-        elif item in ("-C", "-c"):
+        elif item == "-C":
             if index + 1 >= len(args):
-                return None
-            if item == "-c" and "=" not in args[index + 1]:
                 return None
             index += 2
         elif item.startswith("--git-dir=") or item.startswith("--work-tree="):
@@ -1167,9 +1167,11 @@ def rtk_argv(argv, category):
         category (str): Validated tokenpipe command category.
 
     Returns:
-        list[str]: RTK argv using the literal ``rtk`` head; callers replace
-        that placeholder with the trusted configured RTK executable path.
-        Unsupported RTK rewrites retain the original basename and arguments.
+        list[str]: RTK argv using a literal ``rtk`` placeholder where needed;
+        callers replace that placeholder with the trusted configured RTK
+        executable path. UV pytest routes preserve the original ``argv[0]``
+        and ``uv run`` environment. Unsupported RTK rewrites retain the
+        original basename and arguments.
     """
     if not argv:
         return ["rtk"]
@@ -1177,8 +1179,11 @@ def rtk_argv(argv, category):
     rest = [str(item) for item in argv[1:]]
     if category == "test" and _python_pytest(argv):
         return ["rtk", "pytest"] + rest[2:]
-    if category == "test" and head == "uv" and rest[:2] == ["run", "pytest"]:
-        return ["rtk", "pytest"] + rest[2:]
+    if category == "test" and head == "uv":
+        if rest[:2] == ["run", "pytest"]:
+            return [str(argv[0]), "run", "rtk", "pytest"] + rest[2:]
+        if rest[:4] == ["run", "python", "-m", "pytest"]:
+            return [str(argv[0]), "run", "rtk", "pytest"] + rest[4:]
     if category == "filesystem-read":
         if head == "cat" and len(rest) == 1 and not rest[0].startswith("-"):
             return ["rtk", "read", rest[0]]
@@ -1551,7 +1556,13 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
         # passthrough retains the existing trusted-head rule unchanged, so an
         # untrusted Python path still runs natively as before the hook rewrite.
         routed = rtk_argv([argv[0]] + command_argv[1:], supplied_category)
-        command_argv = [rtk_path] + routed[1:]
+        command_argv = list(routed)
+        placeholder_index = next(
+            (index for index, item in enumerate(command_argv) if item == "rtk"),
+            None,
+        )
+        if placeholder_index is not None:
+            command_argv[placeholder_index] = rtk_path
     try:
         if rtk_used:
             child_env.setdefault("RTK_DB_PATH", os.path.join(_runtime_home(), "rtk-history.db"))

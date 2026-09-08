@@ -40,21 +40,23 @@ def _has_forbidden_syntax(command: str) -> bool:
 
 
 def _git_subcommand_index(args: List[str]) -> Optional[int]:
-    """Return the supported Git subcommand index after safe global flags.
+    """Return a supported Git subcommand index after safe global flags.
 
     Args:
         args (List[str]): Arguments after ``git``.
 
     Returns:
         Optional[int]: Read-only subcommand index, or ``None`` when unsupported.
+            Git's ``-c`` option is always unsupported because it can select
+            executable configuration outside the wrapper's environment.
     """
     index = 0
     while index < len(args):
         item = args[index]
         if item == "--no-pager":
             index += 1
-        elif item in {"-C", "-c"}:
-            if index + 1 >= len(args) or (item == "-c" and "=" not in args[index + 1]):
+        elif item == "-C":
+            if index + 1 >= len(args):
                 return None
             index += 2
         elif item.startswith("--git-dir=") or item.startswith("--work-tree="):
