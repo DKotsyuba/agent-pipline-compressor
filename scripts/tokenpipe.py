@@ -1626,7 +1626,10 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
                 "%d bytes\n" % _capture_limit()
             )
     except (PermissionError, OSError) as exc:
-        if exec_fallback:
+        # Never fall back to the original argv when RTK stood in for an
+        # untrusted interpreter: that argv[0] was never validated and must not
+        # be executed.
+        if exec_fallback and not rtk_head_substituted:
             os.execvpe(original_command_argv[0], original_command_argv, child_env)
         exit_status = 127
         stdout = ""

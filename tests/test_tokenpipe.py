@@ -812,6 +812,30 @@ class TokenpipeTests(unittest.TestCase):
             os.environ["PATH"] = command_path
             tokenpipe.set_configured_rtk(None)
 
+    def test_rtk_spawn_failure_never_execs_untrusted_interpreter(self):
+        """A vanished RTK binary must not fall back to running argv[0] itself."""
+        untrusted_py = os.path.join(self.temp.name, "venv", "python3")
+        os.makedirs(os.path.dirname(untrusted_py), exist_ok=True)
+        with open(untrusted_py, "w", encoding="utf-8") as handle:
+            handle.write("#!%s\nprint('interpreter should not run')\n" % sys.executable)
+        os.chmod(untrusted_py, 0o700)
+        rtk = self.executable("rtk", "pass\n")
+        command_path = os.environ["PATH"]
+        try:
+            os.environ["PATH"] = "/usr/bin:/bin"
+            tokenpipe.set_configured_rtk(rtk)
+            with mock.patch.object(tokenpipe, "_run_captured", side_effect=FileNotFoundError("rtk gone")), \
+                    mock.patch.object(tokenpipe.os, "execvpe") as fallback:
+                output, status_code = tokenpipe.execute_native(
+                    [untrusted_py, "-m", "pytest", "--version"], "test", "full", exec_fallback=True
+                )
+            fallback.assert_not_called()
+            self.assertEqual(status_code, 127, output)
+            self.assertIn("FileNotFoundError", output)
+        finally:
+            os.environ["PATH"] = command_path
+            tokenpipe.set_configured_rtk(None)
+
     def test_rtk_untrusted_python_pytest_without_rtk_config_is_refused(self):
         untrusted_py = os.path.join(self.temp.name, "venv", "python3")
         os.makedirs(os.path.dirname(untrusted_py), exist_ok=True)
