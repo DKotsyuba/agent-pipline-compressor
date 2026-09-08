@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import os
 import stat
@@ -610,6 +611,71 @@ class TokenpipeTests(unittest.TestCase):
         metric = tokenpipe.load_metrics()[-1]
         self.assertTrue(metric["audit_overflow"])
         self.assertEqual(metric["original_bytes"], 0)
+
+    def test_trusted_rtk_path_accepts_symlink_in_trusted_dir(self):
+        """Accept a trusted-directory symlink whose target passes validation."""
+        target = self.executable("rtk-target", "")
+        link = os.path.join(self.temp.name, "rtk-link")
+        os.symlink(target, link)
+        self.assertTrue(tokenpipe.trusted_rtk_path(link))
+
+    def test_trusted_rtk_path_rejects_dangling_symlink(self):
+        """Reject a trusted-directory symlink with no resolved target."""
+        link = os.path.join(self.temp.name, "rtk-dangling")
+        os.symlink(os.path.join(self.temp.name, "missing"), link)
+        self.assertFalse(tokenpipe.trusted_rtk_path(link))
+
+    def test_trusted_rtk_path_rejects_world_writable_symlink_target(self):
+        """Reject a symlink whose target is group- or world-writable."""
+        target = self.executable("rtk-world-writable", "")
+        os.chmod(target, 0o722)
+        link = os.path.join(self.temp.name, "rtk-world-writable-link")
+        os.symlink(target, link)
+        self.assertFalse(tokenpipe.trusted_rtk_path(link))
+
+    def test_trusted_rtk_path_rejects_symlink_outside_trusted_directory(self):
+        """Reject a valid target reached through an untrusted symlink directory."""
+        target = self.executable("rtk-outside-target", "")
+        outside = os.path.join(self.temp.name, "outside")
+        os.mkdir(outside)
+        link = os.path.join(outside, "rtk-link")
+        os.symlink(target, link)
+        self.assertFalse(tokenpipe.trusted_rtk_path(link))
+
+    def test_rtk_subcommand_reports_missing_configured_binary(self):
+        """Show a missing marker when the configured RTK target disappears."""
+        target = self.executable("rtk-missing-target", "")
+        link = os.path.join(self.temp.name, "rtk-missing-link")
+        os.symlink(target, link)
+        tokenpipe.set_configured_rtk(link)
+        os.unlink(target)
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            self.assertEqual(tokenpipe.main(["rtk"]), 0)
+        self.assertEqual(stdout.getvalue(), "enabled (missing) " + link + "\n")
+        tokenpipe.set_configured_rtk(None)
+
+    def test_native_missing_rtk_records_untrusted_skip_reason(self):
+        """Record RTK trust loss without changing native output or status."""
+        target = self.executable("rtk-native-missing-target", "")
+        link = os.path.join(self.temp.name, "rtk-native-missing-link")
+        os.symlink(target, link)
+        tokenpipe.set_configured_rtk(link)
+        os.unlink(target)
+        for index in range(200):
+            self.executable("item-%03d" % index, "")
+        try:
+            with mock.patch.object(
+                tokenpipe, "compress", return_value=("mock", "compressed\\n")
+            ):
+                output, status_code = tokenpipe.execute_native(
+                    ["/bin/ls", self.temp.name], "filesystem-read", "safe",
+                    session_id="missing-rtk"
+                )
+            self.assertEqual(status_code, 0)
+            self.assertNotIn("strategy=rtk-direct", output.splitlines()[0])
+            self.assertEqual(tokenpipe.load_metrics()[-1]["skip_reason"], "rtk-untrusted")
+        finally:
+            tokenpipe.set_configured_rtk(None)
 
     def test_rtk_direct_prefix_requires_trusted_absolute_binary(self):
         db_path_seen = os.path.join(self.temp.name, "rtk-db-path-seen")

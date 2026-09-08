@@ -1138,17 +1138,34 @@ def _run_captured(argv, child_env=None):
 
 
 def trusted_rtk_path(path):
+    """Return whether an RTK executable satisfies the local trust policy.
+
+    Args:
+        path (str | None): Absolute executable path to validate.
+
+    Returns:
+        bool: True for a trusted regular file or a trusted-directory symlink
+            whose resolved target passes the ownership, mode, and executable
+            checks.
+    """
     if not path or not os.path.isabs(path):
         return False
+    executable = path
     try:
-        info = os.stat(path, follow_symlinks=False)
+        if os.path.islink(path):
+            if os.path.dirname(os.path.abspath(path)) not in _TRUSTED_EXECUTABLE_DIRS:
+                return False
+            executable = os.path.realpath(path)
+            info = os.stat(executable)
+        else:
+            info = os.stat(path, follow_symlinks=False)
     except OSError:
         return False
     return (
         stat.S_ISREG(info.st_mode)
         and info.st_uid in (0, os.getuid())
         and not (info.st_mode & 0o022)
-        and os.access(path, os.X_OK)
+        and os.access(executable, os.X_OK)
     )
 
 
@@ -1303,7 +1320,9 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
     command_argv = list(original_command_argv)
     rtk_path, persisted_rtk_enabled = configured_rtk()
     want_rtk = use_rtk if use_rtk is not None else persisted_rtk_enabled
-    rtk_used = bool(want_rtk and category_ok and trusted_rtk_path(rtk_path))
+    rtk_trusted = trusted_rtk_path(rtk_path)
+    rtk_used = bool(want_rtk and category_ok and rtk_trusted)
+    rtk_missing = bool(persisted_rtk_enabled and not rtk_trusted)
     if rtk_used:
         command_argv = [rtk_path, os.path.basename(str(argv[0]))] + command_argv[1:]
     try:
@@ -1362,6 +1381,8 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
         strategy = "rtk-direct" if rtk_used else "passthrough"
         skip_reason = "compressor-error"
         compressor_error = type(exc).__name__
+    if skip_reason is None and rtk_missing:
+        skip_reason = "rtk-untrusted"
     replace = mode in ("safe", "full") and candidate != body
     payload = {
         "session_id": session_id, "tool_call_id": tool_call_id,
@@ -1663,7 +1684,11 @@ def main(argv=None):
             elif args.value:
                 set_configured_rtk(args.value)
             path, enabled = configured_rtk()
-            print("enabled {}".format(path) if enabled and path else "disabled")
+            if enabled and path:
+                state = " (missing)" if not trusted_rtk_path(path) else ""
+                print("enabled{} {}".format(state, path))
+            else:
+                print("disabled")
         except ValueError as exc:
             print("tokenpipe: {}".format(exc), file=sys.stderr)
             return 2

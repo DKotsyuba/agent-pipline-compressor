@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Trusted RTK symlinks now survive Homebrew upgrades and report missing configured binaries clearly.
+
 ## [0.2.1] - 2026-09-01
 
 ### Added

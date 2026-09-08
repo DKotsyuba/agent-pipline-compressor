@@ -138,6 +138,8 @@ Persist a mode with `python3 scripts/tokenpipe.py mode audit|safe|full`. `TOKENP
 
 RTK is disabled unless explicitly configured with a trusted absolute executable:
 
+On Homebrew, configure the stable symlink `/opt/homebrew/bin/rtk` so upgrades do not leave a stale Cellar path behind. If the configured executable disappears, `tokenpipe rtk` reports `enabled (missing)` and native calls fail open without RTK.
+
 ```bash
 python3 scripts/tokenpipe.py rtk /absolute/path/to/rtk
 python3 scripts/tokenpipe.py rtk off
