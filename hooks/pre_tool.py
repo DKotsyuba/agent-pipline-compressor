@@ -11,7 +11,7 @@ from typing import List, Optional
 
 sys.dont_write_bytecode = True
 
-from common import TOKENPIPE, _safe_id, emit, mode, read_event, tool_input, unwrap_shell_command
+from common import TOKENPIPE, _safe_id, emit, mode, read_event, rtk_enabled, tool_input, unwrap_shell_command
 
 
 ENV_PREFIX = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
@@ -343,7 +343,11 @@ def rewrite(command: str, active_mode: Optional[str] = None,
         # Full-mode heads (cargo, npm, pnpm, yarn, tsc, pyright, venv pytest)
         # usually live under $HOME; passing the command through untouched beats
         # rewriting it into a wrapper that would exit 126.
-        return None
+        if not (category == "test" and _python_pytest(words) and rtk_enabled()):
+            return None
+        # Keep full-mode, test-only Python pytest invocations functional when RTK
+        # is explicitly configured and executable. In this shape the wrapper
+        # executes RTK instead of the python shim itself.
     # Resolve the installed plugin's absolute script path inside the hook. The
     # later Bash process does not inherit the hook-only PLUGIN_ROOT variable.
     # Only the already parsed argv is shell-quoted; no opaque/base64 transport is

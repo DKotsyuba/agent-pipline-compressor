@@ -61,6 +61,31 @@ def post_replace_value() -> Optional[str]:
         return None
 
 
+def rtk_enabled() -> Optional[str]:
+    """Return an enabled RTK executable path only when configured and executable."""
+    try:
+        config_home = Path(
+            os.path.expanduser(os.environ.get("TOKENPIPE_HOME", "~/.codex/tokenpipe"))
+        )
+        config_path = config_home / "config.json"
+        if config_path.stat().st_size > 4096:
+            return None
+        with config_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if (
+            not isinstance(payload, dict)
+            or payload.get("use_rtk") is not True
+            or not isinstance(payload.get("rtk_bin"), str)
+        ):
+            return None
+        rtk_path = payload.get("rtk_bin")
+        if not os.path.isabs(rtk_path):
+            return None
+        return rtk_path if os.path.isfile(rtk_path) and os.access(rtk_path, os.X_OK) else None
+    except (OSError, TypeError, ValueError):
+        return None
+
+
 def read_event() -> Optional[Dict[str, Any]]:
     try:
         value = json.load(sys.stdin)

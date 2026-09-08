@@ -1435,7 +1435,34 @@ def _label_streams(stdout, stderr):
 
 def _metric_base(payload, mode, category, strategy, content_category, original, shown,
                  counterfactual, exit_status, skip_reason, raw_ref, compressor_error,
-                 started, native_header_bytes=0, audit_overflow=False, rtk_used=False):
+                 started, native_header_bytes=0, audit_overflow=False,
+                 rtk_used=False, rtk_head_substituted=False):
+    """Build a metrics payload for a native execution decision or result.
+
+    Args:
+        payload (dict): Original tool payload used for attribution fields.
+        mode (str): Runtime mode (audit, safe, full).
+        category (str): Coarse command category used for accounting.
+        strategy (str): Native strategy label written to result headers.
+        content_category (str): Coarse content category from processing pipeline.
+        original (str): Unmodified command output string.
+        shown (str): Displayed output string after compression or passthrough.
+        counterfactual (str): Compressed/counterfactual output string.
+        exit_status (int): Observed child process exit code.
+        skip_reason (str | None): Refusal reason when strategy is refused.
+        raw_ref (str | None): Raw output reference identifier.
+        compressor_error (str | None): Non-fatal compressor error text.
+        started (float): `time.time()` timestamp for latency measurement.
+        native_header_bytes (int): Bytes in wrapper status header.
+        audit_overflow (bool): True when audit mode output exceeded reporting cap.
+        rtk_used (bool): True when RTK command path was requested and trusted.
+        rtk_head_substituted (bool): True when RTK changed head from untrusted
+            interpreter to `rtk` in route construction.
+
+    Returns:
+        dict[str, object]: Canonical metric record including raw-ref presence,
+        token estimates, and RTK routing metadata.
+    """
     now = _dt.datetime.now(_dt.timezone.utc)
     original_est = estimate_tokens(original)
     shown_est = estimate_tokens(shown)
@@ -1460,6 +1487,7 @@ def _metric_base(payload, mode, category, strategy, content_category, original, 
         "raw_ref_present": bool(raw_ref), "compressor_error": compressor_error,
         "audit_overflow": bool(audit_overflow),
         "rtk_used": bool(rtk_used),
+        "rtk_head_substituted": bool(rtk_head_substituted),
     }
 
 
@@ -1490,12 +1518,32 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
     mode = mode if mode in ("audit", "safe", "full") else "audit"
     supplied_category = _normalize_exec_category(category)
     derived_category = _strict_argv_category(argv)
-    resolved_executable = _resolve_trusted_executable(argv[0] if argv else None)
     category_ok = supplied_category == derived_category and supplied_category in FULL_EXEC_CATEGORIES
     allowed_for_mode = supplied_category in (
         SAFE_EXEC_CATEGORIES if mode == "safe" else FULL_EXEC_CATEGORIES
     )
-    if mode not in ("safe", "full") or not category_ok or not allowed_for_mode or not resolved_executable:
+    rtk_path, persisted_rtk_enabled = configured_rtk()
+    want_rtk = use_rtk if use_rtk is not None else persisted_rtk_enabled
+    rtk_trusted = trusted_rtk_path(rtk_path)
+    rtk_route = rtk_argv(argv or [], supplied_category)
+    rtk_head_substituted = (
+        category_ok
+        and (want_rtk and rtk_trusted)
+        and supplied_category == "test"
+        and argv
+        and rtk_route[0] != argv[0]
+    )
+    resolved_executable = (
+        argv[0]
+        if rtk_head_substituted
+        else _resolve_trusted_executable(argv[0] if argv else None)
+    )
+    if (
+            mode not in ("safe", "full")
+            or not category_ok
+            or not allowed_for_mode
+            or (not resolved_executable and not rtk_head_substituted)
+    ):
         reason = (
             "mode-does-not-execute" if mode not in ("safe", "full")
             else "untrusted-executable" if not resolved_executable
@@ -1513,6 +1561,8 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
                 payload, mode, supplied_category, "refused", "unknown",
                 output, output, output, 126, reason, None, None, started,
                 len(output.encode("utf-8", "replace")),
+                rtk_used=False,
+                rtk_head_substituted=rtk_head_substituted,
             ))
         except Exception:
             pass
@@ -1545,9 +1595,6 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
             "PAGER": "cat",
         })
     command_argv = list(original_command_argv)
-    rtk_path, persisted_rtk_enabled = configured_rtk()
-    want_rtk = use_rtk if use_rtk is not None else persisted_rtk_enabled
-    rtk_trusted = trusted_rtk_path(rtk_path)
     rtk_used = bool(want_rtk and category_ok and rtk_trusted)
     rtk_missing = bool(persisted_rtk_enabled and not rtk_trusted)
     if rtk_used:
@@ -1555,7 +1602,7 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
         # is never executed by this wrapper when RTK is used. Without RTK,
         # passthrough retains the existing trusted-head rule unchanged, so an
         # untrusted Python path still runs natively as before the hook rewrite.
-        routed = rtk_argv([argv[0]] + command_argv[1:], supplied_category)
+        routed = rtk_route
         command_argv = list(routed)
         placeholder_index = next(
             (index for index, item in enumerate(command_argv) if item == "rtk"),
@@ -1658,6 +1705,7 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
         compressor_error, started, len(shown_header.encode("utf-8", "replace")),
         mode == "audit" and len(shown) > max(256, int(os.environ.get("TOKENPIPE_MAX_SHOWN_CHARS", "7000"))),
         rtk_used,
+        rtk_head_substituted=rtk_head_substituted,
     )
     try:
         _append_metric(metric)

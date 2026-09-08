@@ -153,6 +153,8 @@ When active, RTK owns filtering. Tokenpipe does not stack its own Lite/CCA trans
 
 RTK routing uses `rtk pytest` for Python/UV pytest commands, `rtk read` for single-file `cat` and counted `head`/`tail`, and the original command shape for unsupported RTK rewrites such as `wc`, multiple files, or byte-counted reads.
 
+For `python -m pytest`, the rewritten head becomes `rtk` so Tokenpipe no longer executes the untrusted Python shim; `pytest` is resolved from RTK's own PATH. Projects that install pytest only in an inactive virtual environment should run with `uv run pytest` or activate that environment so RTK's `pytest` resolver can see it.
+
 ## Recovery, statistics, and privacy
 
 Replacement is allowed only after raw output is securely spooled; a spool error leaves the original output unchanged. Raw files are private runtime state (`0700` directories and `0600` files), may contain secrets from commands, and are subject to retention and size caps. Treat any `raw_ref` as sensitive.
