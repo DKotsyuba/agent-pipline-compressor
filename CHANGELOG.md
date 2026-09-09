@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-09
+
 ### Added
 
 - Native wrapper and optional RTK coverage for approved Git global options,
@@ -232,7 +234,8 @@ All notable changes to this project are documented here. The format follows
 - Claude hook commands use absolute `/usr/bin/python3` instead of a
   machine-specific Python Framework path or a project-controlled PATH lookup.
 
-[Unreleased]: https://github.com/DKotsyuba/agent-pipline-compressor/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/DKotsyuba/agent-pipline-compressor/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/DKotsyuba/agent-pipline-compressor/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/DKotsyuba/agent-pipline-compressor/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/DKotsyuba/agent-pipline-compressor/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/DKotsyuba/agent-pipline-compressor/releases/tag/v0.1.0
