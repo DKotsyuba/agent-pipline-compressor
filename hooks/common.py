@@ -61,6 +61,31 @@ def post_replace_value() -> Optional[str]:
         return None
 
 
+def rtk_enabled() -> Optional[str]:
+    """Return an enabled RTK executable path only when configured and executable."""
+    try:
+        config_home = Path(
+            os.path.expanduser(os.environ.get("TOKENPIPE_HOME", "~/.codex/tokenpipe"))
+        )
+        config_path = config_home / "config.json"
+        if config_path.stat().st_size > 4096:
+            return None
+        with config_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if (
+            not isinstance(payload, dict)
+            or payload.get("use_rtk") is not True
+            or not isinstance(payload.get("rtk_bin"), str)
+        ):
+            return None
+        rtk_path = payload.get("rtk_bin")
+        if not os.path.isabs(rtk_path):
+            return None
+        return rtk_path if os.path.isfile(rtk_path) and os.access(rtk_path, os.X_OK) else None
+    except (OSError, TypeError, ValueError):
+        return None
+
+
 def read_event() -> Optional[Dict[str, Any]]:
     try:
         value = json.load(sys.stdin)
@@ -146,8 +171,20 @@ def command_category(command: Optional[str]) -> str:
         return "unknown"
     head = Path(words[0]).name.lower()
     if head == "git" and len(words) > 1:
+        # Keep global-option forms such as ``git -C dir status`` in the same
+        # coarse metric bucket without retaining any command arguments.
         sub = words[1].lower()
+        if sub in {"-C", "-c", "--no-pager"} and len(words) > 2:
+            sub = words[2].lower()
         return "git"
+    if head == "python" or head == "python3" or (head.startswith("python3.") and head[8:].isdigit()):
+        if len(words) >= 3 and words[1].lower() == "-m" and words[2].lower() == "pytest":
+            return "test"
+    if head == "uv" and len(words) >= 3 and words[1].lower() == "run":
+        if words[2].lower() == "pytest" or (
+            len(words) >= 5 and words[2:5] == ["python", "-m", "pytest"]
+        ):
+            return "test"
     if head in {"pytest", "py.test", "jest", "vitest"}:
         return "test"
     if head == "cargo" and len(words) > 1:

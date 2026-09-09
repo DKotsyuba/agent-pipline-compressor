@@ -6,8 +6,21 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-09
+
 ### Added
 
+- Native wrapper and optional RTK coverage for approved Git global options,
+  Python/UV pytest commands, file readers, jq, grep, GitHub CLI reads, and
+  Docker read commands.
+- Privacy-safe `command_head` metric on native wrapper calls (allow-listed head
+  plus subcommand, never arguments or paths), a matching `stats` section, and
+  the `rtk_skip` setting via `tokenpipe rtk --skip` to run listed command heads
+  natively instead of through RTK (`skip_reason` `rtk-skipped`).
+- Added explicit RTK exception path for test commands where the rewritten head
+  differs from `argv[0]` in the native wrapper and hook, so Python module
+  pytest invocations can run through RTK from trusted RTK configuration even when
+  the interpreter binary is outside trusted head directories.
 - Net-win gate for output replacement. A replacement is emitted only when the
   compressed candidate plus the recovery header the host renders with it is
   smaller than the original; otherwise the exact original is returned with
@@ -88,6 +101,7 @@ All notable changes to this project are documented here. The format follows
   unchanged, and still require a recoverable `raw_ref` before replacement.
 - Compression lab: dense multi-file `rg`, nested `find`, and short-grep
   fixtures plus `search-group`/`search-fold` stages (lab version 2.1.0).
+
 ### Changed
 
 - Token estimates come from character-class ratios instead of UTF-8 bytes /
@@ -144,6 +158,10 @@ All notable changes to this project are documented here. The format follows
   once per `TOKENPIPE_CLEANUP_INTERVAL_SECONDS` (default 600) instead of
   walking the whole spool on every replacement; `latency_ms` now uses a
   monotonic clock. Byte-for-byte raw recovery validation still runs every time.
+- Trusted RTK symlinks now survive Homebrew upgrades and report missing configured binaries clearly.
+- Hook-level RTK bypass now applies only to `python -m pytest` with RTK enabled
+  and executable; UV routes still require a trusted `uv` head and continue to be
+  refused when RTK is configured but the head cannot be trusted.
 
 ## [0.2.1] - 2026-09-01
 
@@ -216,7 +234,8 @@ All notable changes to this project are documented here. The format follows
 - Claude hook commands use absolute `/usr/bin/python3` instead of a
   machine-specific Python Framework path or a project-controlled PATH lookup.
 
-[Unreleased]: https://github.com/DKotsyuba/agent-pipline-compressor/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/DKotsyuba/agent-pipline-compressor/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/DKotsyuba/agent-pipline-compressor/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/DKotsyuba/agent-pipline-compressor/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/DKotsyuba/agent-pipline-compressor/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/DKotsyuba/agent-pipline-compressor/releases/tag/v0.1.0

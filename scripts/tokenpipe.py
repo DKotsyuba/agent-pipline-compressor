@@ -28,7 +28,7 @@ import time
 import uuid
 
 
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 ANSI_RE = re.compile(r"\x1b(?:[@-_][0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 SECRET_KEY_RE = re.compile(r"(?i)(token|secret|password|authorization|api[_-]?key|cookie)")
 # Bound on how much output the secret guard inspects, in characters.
@@ -1490,7 +1490,9 @@ def compress(text, category):
             return "cca-log", cca_rank(lite)
         return "lite-log", lite
     if category in ("error", "plain"):
-        return "cca-" + category, cca_rank(text)
+        # The label is model-visible in the envelope header; never let the
+        # content category ("error") read as the tool's outcome.
+        return "cca-rank", cca_rank(text)
     return "passthrough", text
 
 
@@ -2186,7 +2188,11 @@ def process(payload, mode=None, cleanup=True, record_metric=True):
     return result
 
 
-SAFE_EXEC_CATEGORIES = frozenset(("git-read", "search", "filesystem-read", "docker-read"))
+# Read-only categories allowed in safe mode, including commands routed through
+# the native wrapper without executing project code.
+SAFE_EXEC_CATEGORIES = frozenset((
+    "git-read", "search", "filesystem-read", "docker-read", "gh-read",
+))
 FULL_EXEC_CATEGORIES = SAFE_EXEC_CATEGORIES | frozenset(("test", "build", "lint"))
 # Explicit installed-entry roots. Tests may replace this immutable set in
 # process; untrusted child environments cannot extend it.
@@ -2196,7 +2202,8 @@ _TRUSTED_EXECUTABLE_DIRS = frozenset((
 NATIVE_MARKER = "tokenpipe-native-v1"
 _INTERACTIVE_FLAGS = frozenset((
     "-i", "-w", "--interactive", "--watch", "--watchall", "--watch-all",
-    "--follow", "--open", "--ui", "--pdb", "--trace", "--sw", "--paginate",
+    "--follow", "--open", "--ui", "--pdb", "--trace",
+    "--sw", "--paginate",
 ))
 _MUTATING_FLAGS = frozenset(("--fix", "--fix-only", "--write"))
 _FIND_MUTATING = frozenset((
@@ -2214,22 +2221,193 @@ def _normalize_exec_category(value):
     return aliases.get(value, value)
 
 
+def _git_subcommand_index(args):
+    """Return a read-only Git subcommand index after safe global flags.
+
+    Args:
+        args (Sequence[str]): Git arguments after ``argv[0]``.
+
+    Returns:
+        int | None: Index of ``status``, ``diff``, ``log``, or ``show`` in
+        ``args``; ``None`` when the prefix or subcommand is unsupported. The
+        command-line ``-c`` option is intentionally rejected because it can
+        select executable Git configuration despite the wrapper environment.
+    """
+    index = 0
+    while index < len(args):
+        item = args[index]
+        if item == "--no-pager":
+            index += 1
+        elif item == "-C":
+            if index + 1 >= len(args):
+                return None
+            index += 2
+        elif item.startswith("--git-dir=") or item.startswith("--work-tree="):
+            index += 1
+        elif item.startswith("-"):
+            return None
+        else:
+            return index if item in ("status", "diff", "log", "show") else None
+    return None
+
+
+def _read_file_args(args, command):
+    """Return plain file operands for a read-only filesystem command.
+
+    Args:
+        args (Sequence[str]): Arguments after the executable.
+        command (str): One of ``cat``, ``head``, ``tail``, or ``wc``.
+
+    Returns:
+        list[str] | None: File operands, or ``None`` for stdin-only/invalid
+        input. Numeric and ``-n``/``-c`` option values are not file operands.
+    """
+    files = []
+    options_end = False
+    index = 0
+    while index < len(args):
+        item = args[index]
+        if not options_end and item == "--":
+            options_end = True
+            index += 1
+            continue
+        if not options_end and item.startswith("-"):
+            if command in ("head", "tail") and item in ("-n", "-c") and index + 1 < len(args):
+                index += 2
+            else:
+                index += 1
+            continue
+        if not item or item == "-" or item.startswith("-"):
+            return None
+        files.append(item)
+        index += 1
+    return files or None
+
+
+def _grep_has_file(args):
+    """Return whether grep has a file operand instead of reading stdin only.
+
+    Args:
+        args (Sequence[str]): Arguments after ``grep``.
+
+    Returns:
+        bool: ``True`` when a pattern and at least one plain file operand are
+        present; pattern files supplied by ``-f`` are read-only and allowed.
+    """
+    positional = []
+    pattern_option = False
+    index = 0
+    while index < len(args):
+        item = args[index]
+        if item == "--":
+            positional.extend(args[index + 1:])
+            break
+        if item in ("-e", "-f"):
+            pattern_option = True
+            if index + 1 >= len(args):
+                return False
+            index += 2
+        elif item.startswith("-"):
+            index += 1
+        else:
+            positional.append(item)
+            index += 1
+    return len(positional) >= (1 if pattern_option else 2) and all(
+        item != "-" and not item.startswith("-") for item in positional[-1:]
+    )
+
+
+def _jq_read_only(args):
+    """Return whether jq has one filter and one or more file operands.
+
+    Args:
+        args (Sequence[str]): Arguments after ``jq``.
+
+    Returns:
+        bool: ``True`` only for read-only file-backed jq invocations.
+    """
+    positional = []
+    index = 0
+    while index < len(args):
+        item = args[index]
+        if item in ("--rawfile", "--slurpfile", "-f", "--from-file") or item.startswith("--arg"):
+            return False
+        if item == "--":
+            positional.extend(args[index + 1:])
+            break
+        if item.startswith("-"):
+            index += 1
+            continue
+        positional.append(item)
+        index += 1
+    return len(positional) >= 2 and all(
+        item != "-" and not item.startswith("-") for item in positional[1:]
+    )
+
+
+def _python_pytest(argv):
+    """Return whether argv is a supported Python module pytest invocation.
+
+    Args:
+        argv (Sequence[str]): Candidate executable and arguments.
+
+    Returns:
+        bool: ``True`` for Python ``-m pytest`` with any remaining arguments.
+    """
+    head = os.path.basename(str(argv[0])).lower() if argv else ""
+    return (
+        (head == "python" or head == "python3" or
+         (head.startswith("python3.") and head[8:].isdigit()))
+        and len(argv) >= 3
+        and str(argv[1]).lower() == "-m"
+        and str(argv[2]).lower() == "pytest"
+    )
+
+
 def _argv_category(argv):
+    """Classify a direct argv vector using conservative read-only policies.
+
+    Args:
+        argv (Sequence[str]): Candidate executable and arguments; values are
+        inspected only and the sequence is not mutated.
+
+    Returns:
+        str: Wrapper category, or ``unknown`` for unsupported/stdin-only or
+        potentially mutating commands.
+    """
     if not argv:
         return "unknown"
     head = os.path.basename(argv[0]).lower()
     args = [str(item).lower() for item in argv[1:]]
-    if head == "git" and args and args[0] in ("status", "diff", "log", "show"):
+    if head == "git" and _git_subcommand_index([str(item) for item in argv[1:]]) is not None:
         return "git-read"
     if head == "rg" and not any(item == "--pre" or item.startswith("--pre=") for item in args):
         return "search"
+    if head == "grep" and _grep_has_file(args):
+        return "search"
     if head == "find" and not any(item in ("-delete", "-exec", "-execdir", "-ok", "-okdir") for item in args):
         return "search"
+    if head in ("cat", "head", "tail", "wc") and _read_file_args(args, head):
+        return "filesystem-read"
+    if head == "jq" and _jq_read_only(args):
+        return "filesystem-read"
     if head == "ls":
         return "filesystem-read"
-    if head == "docker" and args and args[0] in ("ps", "logs") and "-f" not in args and "--follow" not in args:
+    if head == "docker" and args and (
+        args[0] in ("ps", "logs", "images")
+        or args[:2] == ["compose", "ps"]
+    ):
         return "docker-read"
-    if head in ("pytest", "py.test", "jest", "vitest"):
+    if head == "gh" and len(args) == 2 and args in (
+        ["pr", "list"], ["pr", "view"], ["pr", "checks"], ["pr", "status"],
+        ["issue", "list"], ["issue", "view"], ["run", "list"], ["run", "view"],
+    ):
+        return "gh-read"
+    if head in ("pytest", "py.test", "jest", "vitest") or _python_pytest(argv):
+        return "test"
+    if head == "uv" and len(args) >= 2 and args[0] == "run" and (
+        args[1] == "pytest" or args[1:4] == ["python", "-m", "pytest"]
+    ):
         return "test"
     if head == "cargo" and args:
         return {"test": "test", "check": "lint", "clippy": "lint", "build": "build"}.get(args[0], "unknown")
@@ -2281,7 +2459,7 @@ def _strict_argv_category(argv):
     if head == "git":
         forbidden_git = {
             "--ext-diff", "--textconv", "--config-env", "--exec-path",
-            "--git-dir", "--work-tree", "--namespace", "--no-index",
+            "--namespace", "--no-index",
         }
         if any(
             item in forbidden_git
@@ -2289,11 +2467,101 @@ def _strict_argv_category(argv):
             for item in args
         ):
             return "unknown"
+        if any(item in ("-o", "--output") or item.startswith("--output=") for item in args):
+            return "unknown"
     if head == "find" and any(item in _FIND_MUTATING for item in args):
+        return "unknown"
+    if head in ("head", "tail") and any(item in ("-f", "-F") for item in args):
+        return "unknown"
+    if head == "rg" and any(item == "--pre" or item.startswith("--pre=") for item in args):
         return "unknown"
     if head == "docker" and any(item in ("-f", "--follow") for item in args):
         return "unknown"
     return category
+
+
+def command_head(argv, category):
+    """Return the privacy-safe command label recorded in native metrics.
+
+    Args:
+        argv (Sequence[str]): Direct command vector already classified by
+            :func:`_strict_argv_category`; inspected only, never mutated.
+        category (str): Coarse category that classification returned for
+            ``argv``. ``unknown`` yields no label.
+
+    Returns:
+        str | None: Lower-cased allow-listed executable basename, optionally
+        followed by its allow-listed subcommand (``git status``, ``gh pr list``,
+        ``docker compose ps``, ``npm test``); ``pytest`` for every supported
+        pytest spelling including ``python -m pytest`` and ``uv run pytest``.
+        ``None`` when ``category`` is ``unknown`` or ``argv`` is empty.
+
+    The value is built only from tokens that the category classification has
+    already matched against fixed allow-lists, so it never carries arguments,
+    paths, flag values, or free-form user input. Any shape not covered here
+    falls back to the bare executable basename.
+    """
+    if not argv or category == "unknown":
+        return None
+    head = os.path.basename(str(argv[0])).lower()
+    args = [str(item).lower() for item in argv[1:]]
+    if head == "git":
+        index = _git_subcommand_index([str(item) for item in argv[1:]])
+        return head if index is None else head + " " + args[index]
+    if category == "test" and (head == "uv" or _python_pytest(argv)):
+        return "pytest"
+    if head == "docker" and args:
+        return head + " " + " ".join(args[:2] if args[0] == "compose" else args[:1])
+    if head == "gh":
+        return head + " " + " ".join(args[:2])
+    if head in ("cargo", "go") and args:
+        return head + " " + args[0]
+    if head in ("npm", "pnpm", "yarn") and args:
+        return head + " " + (args[1] if args[0] == "run" and len(args) > 1 else args[0])
+    return head
+
+
+def rtk_argv(argv, category):
+    """Build RTK's safe argv for one already-classified native command.
+
+    Args:
+        argv (Sequence[str]): Original executable and arguments. The sequence
+            is inspected only and is never mutated.
+        category (str): Validated tokenpipe command category.
+
+    Returns:
+        list[str]: RTK argv using a literal ``rtk`` placeholder where needed;
+        callers replace that placeholder with the trusted configured RTK
+        executable path. UV pytest routes preserve the original ``argv[0]``
+        and ``uv run`` environment. Unsupported RTK rewrites retain the
+        original basename and arguments.
+    """
+    if not argv:
+        return ["rtk"]
+    head = os.path.basename(str(argv[0])).lower()
+    rest = [str(item) for item in argv[1:]]
+    if category == "test" and _python_pytest(argv):
+        return ["rtk", "pytest"] + rest[2:]
+    if category == "test" and head == "uv":
+        if rest[:2] == ["run", "pytest"]:
+            return [str(argv[0]), "run", "rtk", "pytest"] + rest[2:]
+        if rest[:4] == ["run", "python", "-m", "pytest"]:
+            return [str(argv[0]), "run", "rtk", "pytest"] + rest[4:]
+    if category == "filesystem-read":
+        if head == "cat" and len(rest) == 1 and not rest[0].startswith("-"):
+            return ["rtk", "read", rest[0]]
+        if head in ("head", "tail") and len(rest) == 2 and not rest[1].startswith("-"):
+            count = None
+            if rest[0].startswith("-") and rest[0][1:].isdigit():
+                count = rest[0][1:]
+            if count is not None:
+                option = "--max-lines" if head == "head" else "--tail-lines"
+                return ["rtk", "read", rest[1], option, count]
+        if head in ("head", "tail") and len(rest) == 3 and rest[0] in ("-n", "-c"):
+            if rest[0] == "-n" and rest[1].isdigit() and not rest[2].startswith("-"):
+                option = "--max-lines" if head == "head" else "--tail-lines"
+                return ["rtk", "read", rest[2], option, rest[1]]
+    return ["rtk", head] + rest
 
 
 def _resolve_trusted_executable(value):
@@ -2458,17 +2726,34 @@ def _run_captured(argv, child_env=None):
 
 
 def trusted_rtk_path(path):
+    """Return whether an RTK executable satisfies the local trust policy.
+
+    Args:
+        path (str | None): Absolute executable path to validate.
+
+    Returns:
+        bool: True for a trusted regular file or a trusted-directory symlink
+            whose resolved target passes the ownership, mode, and executable
+            checks.
+    """
     if not path or not os.path.isabs(path):
         return False
+    executable = path
     try:
-        info = os.stat(path, follow_symlinks=False)
+        if os.path.islink(path):
+            if os.path.dirname(os.path.abspath(path)) not in _TRUSTED_EXECUTABLE_DIRS:
+                return False
+            executable = os.path.realpath(path)
+            info = os.stat(executable)
+        else:
+            info = os.stat(path, follow_symlinks=False)
     except OSError:
         return False
     return (
         stat.S_ISREG(info.st_mode)
         and info.st_uid in (0, os.getuid())
         and not (info.st_mode & 0o022)
-        and os.access(path, os.X_OK)
+        and os.access(executable, os.X_OK)
     )
 
 
@@ -2477,6 +2762,49 @@ def configured_rtk():
     path = settings.get("rtk_bin")
     enabled = settings.get("use_rtk") is True
     return (path if isinstance(path, str) else None), enabled
+
+
+def configured_rtk_skip():
+    """Return the persisted ``rtk_skip`` list of command heads.
+
+    Returns:
+        list[str]: Command-head labels (see :func:`command_head`) that must run
+        natively even when RTK is enabled. Missing, malformed, or non-string
+        entries are ignored, so a damaged setting fails open to ``[]``.
+    """
+    value = configured_settings().get("rtk_skip")
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str) and item]
+
+
+def set_configured_rtk_skip(value):
+    """Persist the ``rtk_skip`` exclusion list from a comma-separated string.
+
+    Args:
+        value (str): Comma-separated command heads such as ``"git status,cat"``.
+            Entries are whitespace-trimmed, inner whitespace collapsed,
+            lower-cased, and de-duplicated preserving first occurrence. An
+            empty or blank string removes the key.
+
+    Returns:
+        list[str]: The list now persisted, as :func:`configured_rtk_skip` reads it.
+
+    Side effects:
+        Rewrites the private settings file atomically; other keys are kept.
+    """
+    heads = []
+    for item in str(value or "").split(","):
+        head = " ".join(item.split()).lower()
+        if head and head not in heads:
+            heads.append(head)
+    settings = configured_settings()
+    if heads:
+        settings["rtk_skip"] = heads
+    else:
+        settings.pop("rtk_skip", None)
+    _write_settings(settings)
+    return configured_rtk_skip()
 
 
 def set_configured_rtk(path):
@@ -2533,8 +2861,9 @@ def _label_streams(stdout, stderr):
 def _metric_base(payload, mode, category, strategy, content_category, original, shown,
                  counterfactual, exit_status, skip_reason, raw_ref, compressor_error,
                  started, native_header_bytes=0, audit_overflow=False, rtk_used=False,
+                 command_head=None, rtk_head_substituted=False,
                  repeat_of_previous=False, budget_chars=0):
-    """Build one bounded metric row for the native and skip recording paths.
+    """Build one bounded metric row shared by the post-hook, native, and skip paths.
 
     Args:
         payload (dict[str, object]): Hook payload read for ``session_id`` and
@@ -2552,9 +2881,14 @@ def _metric_base(payload, mode, category, strategy, content_category, original, 
         compressor_error (str | None): Bounded exception type name, not text.
         started (float): Start timestamp from the caller's clock, used only as
             a difference to derive ``latency_ms``.
-        native_header_bytes (int): Byte size of the synthesized native header.
+        native_header_bytes (int): Byte size of the synthesized native header,
+            ``0`` for post-hook rows.
         audit_overflow (bool): True when audit output exceeded the shown bound.
-        rtk_used (bool): True when the external token counter was consulted.
+        rtk_used (bool): Whether RTK executed the child.
+        command_head (str | None): Allow-listed label from :func:`command_head`
+            for native wrapper calls; the key is omitted when ``None``.
+        rtk_head_substituted (bool): Whether RTK replaced an untrusted
+            interpreter head (``python -m pytest``) so argv[0] never ran.
         repeat_of_previous (bool): True when this exact output was already
             recorded for the same identity; paths without cross-call repeat
             detection leave it false.
@@ -2575,7 +2909,7 @@ def _metric_base(payload, mode, category, strategy, content_category, original, 
     shown_est = estimate_tokens(shown)
     counter_est = estimate_tokens(counterfactual)
     saved = 0.0 if not original_est else 100.0 * (original_est - counter_est) / original_est
-    return {
+    metric = {
         "timestamp": now.isoformat(), "day": now.date().isoformat(),
         "home": _home_id(),
         "session": _safe_component(payload.get("session_id"), "unknown-session"),
@@ -2596,8 +2930,12 @@ def _metric_base(payload, mode, category, strategy, content_category, original, 
         "audit_overflow": bool(audit_overflow),
         "budget_chars": int(budget_chars),
         "rtk_used": bool(rtk_used),
+        "rtk_head_substituted": bool(rtk_head_substituted),
         "repeat_of_previous": bool(repeat_of_previous),
     }
+    if command_head is not None:
+        metric["command_head"] = command_head
+    return metric
 
 
 def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None,
@@ -2633,18 +2971,42 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
     broadening argv authority. Output that :func:`_looks_like_secret` flags is
     never spooled or replaced: it is returned exactly, under skip reason
     ``secret-guard``.
+    When RTK is enabled but the command's :func:`command_head` is listed in the
+    ``rtk_skip`` setting, the command runs natively with strategy
+    ``passthrough`` and ``skip_reason`` ``rtk-skipped`` (unless another skip
+    reason applies). Executed native metrics carry ``command_head``.
     """
     started = time.time()
     mode = mode or configured_mode()
     mode = mode if mode in ("audit", "safe", "full") else "audit"
     supplied_category = _normalize_exec_category(category)
     derived_category = _strict_argv_category(argv)
-    resolved_executable = _resolve_trusted_executable(argv[0] if argv else None)
     category_ok = supplied_category == derived_category and supplied_category in FULL_EXEC_CATEGORIES
     allowed_for_mode = supplied_category in (
         SAFE_EXEC_CATEGORIES if mode == "safe" else FULL_EXEC_CATEGORIES
     )
-    if mode not in ("safe", "full") or not category_ok or not allowed_for_mode or not resolved_executable:
+    rtk_path, persisted_rtk_enabled = configured_rtk()
+    want_rtk = use_rtk if use_rtk is not None else persisted_rtk_enabled
+    rtk_trusted = trusted_rtk_path(rtk_path)
+    rtk_route = rtk_argv(argv or [], supplied_category)
+    rtk_head_substituted = (
+        category_ok
+        and (want_rtk and rtk_trusted)
+        and supplied_category == "test"
+        and argv
+        and rtk_route[0] != argv[0]
+    )
+    resolved_executable = (
+        argv[0]
+        if rtk_head_substituted
+        else _resolve_trusted_executable(argv[0] if argv else None)
+    )
+    if (
+            mode not in ("safe", "full")
+            or not category_ok
+            or not allowed_for_mode
+            or (not resolved_executable and not rtk_head_substituted)
+    ):
         reason = (
             "mode-does-not-execute" if mode not in ("safe", "full")
             else "untrusted-executable" if not resolved_executable
@@ -2662,6 +3024,8 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
                 payload, mode, supplied_category, "refused", "unknown",
                 output, output, output, 126, reason, None, None, started,
                 len(output.encode("utf-8", "replace")),
+                rtk_used=False,
+                rtk_head_substituted=rtk_head_substituted,
             ))
         except Exception:
             pass
@@ -2669,9 +3033,11 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
     original_command_argv = [resolved_executable] + list(argv[1:])
     child_env = os.environ.copy()
     if supplied_category == "git-read":
-        subcommand = str(argv[1]).lower()
+        subcommand_index = _git_subcommand_index([str(item) for item in argv[1:]])
+        subcommand = str(argv[1 + subcommand_index]).lower()
         if subcommand in ("diff", "log", "show"):
-            original_command_argv[2:2] = ["--no-ext-diff", "--no-textconv"]
+            insert_at = 2 + subcommand_index
+            original_command_argv[insert_at:insert_at] = ["--no-ext-diff", "--no-textconv"]
         for key in list(child_env):
             if key.startswith("GIT_CONFIG_") or key in {
                 "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
@@ -2692,11 +3058,25 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
             "PAGER": "cat",
         })
     command_argv = list(original_command_argv)
-    rtk_path, persisted_rtk_enabled = configured_rtk()
-    want_rtk = use_rtk if use_rtk is not None else persisted_rtk_enabled
-    rtk_used = bool(want_rtk and category_ok and trusted_rtk_path(rtk_path))
+    rtk_used = bool(want_rtk and category_ok and rtk_trusted)
+    rtk_missing = bool(persisted_rtk_enabled and not rtk_trusted)
+    head_label = command_head(argv, derived_category)
+    rtk_skipped = bool(rtk_used and head_label in configured_rtk_skip())
+    if rtk_skipped:
+        rtk_used = False
     if rtk_used:
-        command_argv = [rtk_path, os.path.basename(str(argv[0]))] + command_argv[1:]
+        # For python -m pytest, RTK executes ``pytest``; the interpreter itself
+        # is never executed by this wrapper when RTK is used. Without RTK,
+        # passthrough retains the existing trusted-head rule unchanged, so an
+        # untrusted Python path still runs natively as before the hook rewrite.
+        routed = rtk_route
+        command_argv = list(routed)
+        placeholder_index = next(
+            (index for index, item in enumerate(command_argv) if item == "rtk"),
+            None,
+        )
+        if placeholder_index is not None:
+            command_argv[placeholder_index] = rtk_path
     try:
         if rtk_used:
             child_env.setdefault("RTK_DB_PATH", os.path.join(_runtime_home(), "rtk-history.db"))
@@ -2713,7 +3093,10 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
                 "%d bytes\n" % _capture_limit()
             )
     except (PermissionError, OSError) as exc:
-        if exec_fallback:
+        # Never fall back to the original argv when RTK stood in for an
+        # untrusted interpreter: that argv[0] was never validated and must not
+        # be executed.
+        if exec_fallback and not rtk_head_substituted:
             os.execvpe(original_command_argv[0], original_command_argv, child_env)
         exit_status = 127
         stdout = ""
@@ -2778,6 +3161,10 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
         strategy = "rtk-direct" if rtk_used else "passthrough"
         skip_reason = "compressor-error"
         compressor_error = type(exc).__name__
+    if skip_reason is None and rtk_missing:
+        skip_reason = "rtk-untrusted"
+    elif skip_reason is None and rtk_skipped:
+        skip_reason = "rtk-skipped"
     replace = mode in ("safe", "full") and candidate != body
     payload = {
         "session_id": session_id, "tool_call_id": tool_call_id,
@@ -2825,7 +3212,9 @@ def execute_native(argv, category, mode=None, session_id=None, tool_call_id=None
         original_native, shown, counter_native, exit_status, skip_reason, raw_ref,
         compressor_error, started, len(shown_header.encode("utf-8", "replace")),
         mode == "audit" and len(shown) > _global_shown_cap(),
-        rtk_used, budget_chars=shown_budget(content_category),
+        rtk_used, head_label,
+        rtk_head_substituted=rtk_head_substituted,
+        budget_chars=shown_budget(content_category),
     )
     try:
         _append_metric(metric)
@@ -2925,21 +3314,26 @@ def aggregate(rows):
             written rows never raise. The rows are not mutated.
 
     Returns:
-        dict[str, object]: Call counts, native-coverage and saved percentages,
-        token estimates, the ``repeat_calls`` count with the
+        dict[str, object]: Call counts, native/RTK coverage and saved
+        percentages, token estimates, the ``repeat_calls`` count with the
         ``repeat_saved_tokens_estimate`` those repeats would avoid, and a
-        ``groups`` mapping of dimension to per-key counters.
+        ``groups`` mapping of dimension to per-key counters. The
+        ``command_head`` dimension is present only when at least one row
+        carries that field; other dimensions bucket missing values under
+        ``none``.
 
     Pure: no I/O and no side effects. Every token figure is an estimate, never
     provider usage accounting.
     """
     groups = {
-        "day": {}, "session": {}, "command_category": {},
+        "day": {}, "session": {}, "command_category": {}, "command_head": {},
         "strategy": {}, "content_category": {}, "skip_reason": {},
         "mode": {}, "plugin_version": {},
     }
     for dimension in groups:
         for row in rows:
+            if dimension == "command_head" and not row.get(dimension):
+                continue
             key = row.get(dimension) or "none"
             group = groups[dimension].setdefault(key, {
                 "calls": 0, "original_tokens_estimate": 0,
@@ -2953,6 +3347,9 @@ def aggregate(rows):
             group["counterfactual_tokens_estimate"] += int(row.get("counterfactual_tokens_estimate") or 0)
             group["errors"] += 1 if row.get("compressor_error") else 0
             group["rtk_calls"] += 1 if row.get("rtk_used") else 0
+    if not groups["command_head"]:
+        # Only native wrapper rows carry the field; hide the section otherwise.
+        del groups["command_head"]
     original = sum(int(row.get("original_tokens_estimate") or 0) for row in rows)
     shown = sum(int(row.get("shown_tokens_estimate") or 0) for row in rows)
     counterfactual = sum(int(row.get("counterfactual_tokens_estimate") or 0) for row in rows)
@@ -3104,6 +3501,9 @@ def main(argv=None):
     repeat_cmd.add_argument("value", nargs="?")
     rtk_cmd = commands.add_parser("rtk", help="show, enable, or disable trusted RTK integration")
     rtk_cmd.add_argument("value", nargs="?", help="absolute RTK executable path, or 'off'")
+    rtk_cmd.add_argument(
+        "--skip", metavar="HEADS",
+        help="comma-separated command heads (e.g. 'git status,cat') that bypass RTK; '' clears")
     native = commands.add_parser("exec", help="execute direct argv and emit native compressed output")
     native.add_argument("--category", required=True)
     native.add_argument("--session-id")
@@ -3157,9 +3557,11 @@ def main(argv=None):
             if report["rtk_owned_calls"]:
                 print("RTK savings are external to these estimates; verify them with `rtk gain`.")
             for dimension in (
-                "day", "session", "command_category", "strategy",
+                "day", "session", "command_category", "command_head", "strategy",
                 "content_category", "skip_reason", "mode", "plugin_version",
             ):
+                if dimension not in report["groups"]:
+                    continue
                 print("\n%s:" % dimension)
                 for key, value in sorted(report["groups"][dimension].items()):
                     print("  %s: %d calls, %d -> %d est. tokens" % (
@@ -3198,8 +3600,17 @@ def main(argv=None):
                 set_configured_rtk(None)
             elif args.value:
                 set_configured_rtk(args.value)
+            if args.skip is not None:
+                set_configured_rtk_skip(args.skip)
             path, enabled = configured_rtk()
-            print("enabled {}".format(path) if enabled and path else "disabled")
+            if enabled and path:
+                state = " (missing)" if not trusted_rtk_path(path) else ""
+                print("enabled{} {}".format(state, path))
+            else:
+                print("disabled")
+            skipped = configured_rtk_skip()
+            if skipped:
+                print("skip: " + ", ".join(skipped))
         except ValueError as exc:
             print("tokenpipe: {}".format(exc), file=sys.stderr)
             return 2

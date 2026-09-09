@@ -108,6 +108,10 @@ claude --bare --plugin-dir . -p "..."
 | Python | 3.8 minimum | Current source and tests are compatible with Python 3.8; see the CI workflow for the release-tested matrix. |
 | Platform | macOS/Linux convention | Hook execution requires `/usr/bin/python3`; nonstandard layouts need explicit packaging support. |
 
+### Native wrapper command coverage
+
+In `safe` mode, the native wrapper recognizes read-only `git status|diff|log|show` (including approved global options), `rg`, `grep`, `find`, `ls`, `cat`, `head`, `tail`, `wc`, file-backed `jq`, `gh` read commands (`pr list|view|checks|status`, `issue list|view`, `run list|view`), and Docker `ps`, `logs`, `images`, and `compose ps`. `full` mode additionally recognizes `pytest`, Python `-m pytest`, `uv run pytest`, `uv run python -m pytest`, and the existing test/build/lint commands. Interactive, mutating, stdin-only, and unsupported subcommands pass through unchanged.
+
 ## Modes and configuration
 
 | Mode | Default | Behavior |
@@ -141,12 +145,25 @@ Persist a mode with `python3 scripts/tokenpipe.py mode audit|safe|full`. `TOKENP
 
 RTK is disabled unless explicitly configured with a trusted absolute executable:
 
+On Homebrew, configure the stable symlink `/opt/homebrew/bin/rtk` so upgrades do not leave a stale Cellar path behind. If the configured executable disappears, `tokenpipe rtk` reports `enabled (missing)` and native calls fail open without RTK.
+
 ```bash
 python3 scripts/tokenpipe.py rtk /absolute/path/to/rtk
 python3 scripts/tokenpipe.py rtk off
 ```
 
 When active, RTK owns filtering. Tokenpipe does not stack its own Lite/CCA transforms, cannot measure RTK's raw-to-filtered savings, and cannot provide a Tokenpipe `raw_ref` for that stage. Keep it off when recoverability and Tokenpipe-owned measurements matter.
+
+RTK routing uses `rtk pytest` for Python/UV pytest commands, `rtk read` for single-file `cat` and counted `head`/`tail`, and the original command shape for unsupported RTK rewrites such as `wc`, multiple files, or byte-counted reads.
+
+RTK helps some commands (`git status`, `git log`) and not others (`cat`, `git status --porcelain`). Exclude the useless ones by `command_head` (see below) with `--skip`; listed commands run natively with strategy `passthrough` and `skip_reason` `rtk-skipped`. The list is stored as `rtk_skip` next to `use_rtk` in the private settings file:
+
+```bash
+python3 scripts/tokenpipe.py rtk --skip "git status,cat"   # comma-separated, trimmed, de-duplicated
+python3 scripts/tokenpipe.py rtk                           # prints the state and `skip: git status, cat`
+python3 scripts/tokenpipe.py rtk --skip ""                 # clears the list
+```
+For `python -m pytest`, the rewritten head becomes `rtk` so Tokenpipe no longer executes the untrusted Python shim; `pytest` is resolved from RTK's own PATH. Projects that install pytest only in an inactive virtual environment should run with `uv run pytest` or activate that environment so RTK's `pytest` resolver can see it.
 
 ## Recovery, statistics, and privacy
 
@@ -166,7 +183,9 @@ Replacement is allowed only after raw output is securely spooled; a spool error 
 
 Output that looks like a credential is refused before anything is stored. Immediately before spooling, both the hook path and the native wrapper scan at most the first 256 KiB of the output for PEM private key blocks, AWS access keys, GitHub tokens, OpenAI/Anthropic-style keys, Slack tokens, JWTs, `Authorization: Bearer` headers, and a key word such as `password`, `secret`, `api_key`, or `token` directly assigned a value (prose that merely mentions those words does not match). On a match the output is returned byte-identical: this is a refusal, not a redaction, so nothing is rewritten, no raw file is written, no repeat-index entry is recorded, and the metric row carries only the skip reason `secret-guard` — never any matched text. The scan bound is deliberate: a credential appearing only after the first 256 KiB of a very large output is not detected, and output already spooled by earlier runs is unaffected.
 
-`stats` reads private metrics and reports estimates by mode, command category, strategy, and plugin version. Metrics omit prompts, command arguments, and tool output. They are not provider billing/usage measurements. The `Repeat outputs` line counts calls whose output was byte-identical to the previous output of the same identity and the estimated tokens a repeat notice would have avoided, whether or not `TOKENPIPE_REPEAT_REPLACE` is on.
+`stats` reads private metrics and reports estimates by mode, command category, command head, strategy, and plugin version. Metrics omit prompts, command arguments, and tool output. They are not provider billing/usage measurements. The `Repeat outputs` line counts calls whose output was byte-identical to the previous output of the same identity and the estimated tokens a repeat notice would have avoided, whether or not `TOKENPIPE_REPEAT_REPLACE` is on.
+
+Native wrapper metrics also record `command_head`: the allow-listed executable name plus, where applicable, its allow-listed subcommand (`git status`, `gh pr list`, `docker ps`, `pytest` for every pytest spelling). It is derived from the same fixed lists the wrapper uses to authorize a command and never contains arguments, paths, or flag values. Post-hook metrics do not carry it; `stats` prints the `command_head:` section (and `--json` includes the group) only when at least one record has the field, so you can see which commands RTK actually helps.
 
 Token counts come from the character-class estimator named in the `Estimator: class-ratio v1` line of the summary. It splits text into runs of prose, code punctuation, whitespace, digits, hex/base64 identifiers, non-Latin alphabets, CJK, and symbols, and charges each run its own characters-per-token rate, so hashes and ids are no longer under-counted and English prose is no longer over-counted. The caveat: those rates are heuristics calibrated against published OpenAI `o200k`-style measurements, not against the Claude tokenizer or any provider's billing, and a single estimate can still be off by tens of percent on unusual output. Rows written before this release were measured with the previous UTF-8-bytes/3.5 formula and are not rewritten, so a `--since` window that spans the upgrade mixes both. Thresholds such as `TOKENPIPE_MIN_TOKENS_ESTIMATE` keep their numeric defaults, so the size of output they admit shifts with the estimator.
 
