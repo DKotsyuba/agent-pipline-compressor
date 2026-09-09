@@ -1,23 +1,23 @@
-RTK version: rtk 0.48.0
+Measured against the locally installed RTK.
 Numbers are UTF-8 bytes and estimated tokens (bytes / 3.5).
-Fixture runtime: Python 3.12 with pytest 8.x.
+Fixtures are generated at run time; pytest rows need a Python with pytest importable.
 
 | command | raw bytes/tokens | rtk bytes/tokens (%) | tokenpipe bytes/tokens (%) |
 | --- | ---: | ---: | ---: |
-| git status | 787/225 (100.0%) | 375/108 (47.6%) | 787/225 (100.0%) |
-| git status --porcelain | 368/106 (100.0%) | 367/105 (99.7%) | 366/105 (99.5%) |
-| git diff | 5509/1574 (100.0%) | 4985/1425 (90.5%) | 5509/1574 (100.0%) |
-| git log -n 20 | 2979/852 (100.0%) | 1040/298 (34.9%) | 2979/852 (100.0%) |
-| git show HEAD | 362/104 (100.0%) | 229/66 (63.3%) | 362/104 (100.0%) |
-| ls -la project | 687/197 (100.0%) | 126/36 (18.3%) | 686/196 (99.9%) |
-| cat synthetic_module.py | 16090/4598 (100.0%) | 16090/4598 (100.0%) | 16090/4598 (100.0%) |
-| head -50 synthetic_module.py | 2640/755 (100.0%) | 2603/744 (98.6%) | 2640/755 (100.0%) |
-| tail -50 synthetic_module.py | 2700/772 (100.0%) | 2700/772 (100.0%) | 2700/772 (100.0%) |
-| wc -l synthetic_module.py | 86/25 (100.0%) | 18/6 (20.9%) | 80/23 (93.0%) |
-| rg synthetic_function project | 39190/11198 (100.0%) | 2317/662 (5.9%) | 2664/762 (6.8%) |
-| find Python files | 217/62 (100.0%) | 46/14 (21.2%) | 216/62 (99.5%) |
-| jq fixture.json | 348/100 (100.0%) | 349/100 (100.3%) | 125/36 (35.9%) |
-| pytest passing | 493/141 (100.0%) | 18/6 (3.7%) | 492/141 (99.8%) |
-| pytest failing | 2632/752 (100.0%) | 794/227 (30.2%) | 2632/752 (100.0%) |
+| git status | 787/257 (100.0%) | 375/134 (47.6%) | 787/257 (100.0%) |
+| git status --porcelain | 368/131 (100.0%) | 367/130 (99.7%) | 366/130 (99.5%) |
+| git diff | 5509/1961 (100.0%) | 4985/1832 (90.5%) | 5509/1961 (100.0%) |
+| git log -n 20 | 2979/1182 (100.0%) | 1040/330 (34.9%) | 2979/1182 (100.0%) |
+| git show HEAD | 362/139 (100.0%) | 229/82 (63.3%) | 362/139 (100.0%) |
+| ls -la project | 687/234 (100.0%) | 126/46 (18.3%) | 686/233 (99.9%) |
+| cat synthetic_module.py | 16090/5251 (100.0%) | 16090/5251 (100.0%) | 16090/5251 (100.0%) |
+| head -50 synthetic_module.py | 2640/859 (100.0%) | 2603/847 (98.6%) | 2640/859 (100.0%) |
+| tail -50 synthetic_module.py | 2700/883 (100.0%) | 2700/883 (100.0%) | 2700/883 (100.0%) |
+| wc -l synthetic_module.py | 122/50 (100.0%) | 18/8 (14.8%) | 116/48 (95.1%) |
+| rg synthetic_function project | 49990/19163 (100.0%) | 2421/826 (4.8%) | 1156/444 (2.3%) |
+| find Python files | 325/137 (100.0%) | 46/17 (14.2%) | 324/136 (99.7%) |
+| jq fixture.json | 348/153 (100.0%) | 349/154 (100.3%) | 125/58 (35.9%) |
+| pytest passing | 537/247 (100.0%) | 18/6 (3.4%) | 536/246 (99.8%) |
+| pytest failing | 2676/1094 (100.0%) | 875/307 (32.7%) | 2676/1094 (100.0%) |
 
-Winner per row: git status: rtk; git status --porcelain: tokenpipe; git diff: rtk; git log -n 20: rtk; git show HEAD: rtk; ls -la project: rtk; cat synthetic_module.py: neither; head -50 synthetic_module.py: rtk; tail -50 synthetic_module.py: neither; wc -l synthetic_module.py: rtk; rg synthetic_function project: rtk; find Python files: rtk; jq fixture.json: tokenpipe; pytest passing: rtk; pytest failing: rtk
+Winner per row: git status: rtk; git status --porcelain: tokenpipe; git diff: rtk; git log -n 20: rtk; git show HEAD: rtk; ls -la project: rtk; cat synthetic_module.py: neither; head -50 synthetic_module.py: rtk; tail -50 synthetic_module.py: neither; wc -l synthetic_module.py: rtk; rg synthetic_function project: tokenpipe; find Python files: rtk; jq fixture.json: tokenpipe; pytest passing: rtk; pytest failing: rtk

@@ -973,9 +973,9 @@ def render_rtk_table(rows, version):
         version (str): Version string reported by the RTK binary.
 
     Returns:
-        str: Markdown document containing the version header and table.
+        str: Markdown document containing the provenance header and table.
     """
-    lines = ["RTK version: %s" % version, "Numbers are UTF-8 bytes and estimated tokens (bytes / 3.5).", "Fixture runtime: Python 3.12 with pytest 8.x.", "",
+    lines = ["Measured against the locally installed RTK.", "Numbers are UTF-8 bytes and estimated tokens (bytes / 3.5).", "Fixtures are generated at run time; pytest rows need a Python with pytest importable.", "",
              "| command | raw bytes/tokens | rtk bytes/tokens (%) | tokenpipe bytes/tokens (%) |",
              "| --- | ---: | ---: | ---: |"]
     for row in rows:

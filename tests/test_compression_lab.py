@@ -32,7 +32,7 @@ class CompressionLabTests(unittest.TestCase):
                  "rtk": {"bytes": 40, "tokens": 11}, "tokenpipe_bytes": 50,
                  "tokenpipe_tokens": 14}]
         table = lab.render_rtk_table(rows, "rtk 0.0-test")
-        self.assertIn("RTK version: rtk 0.0-test", table)
+        self.assertIn("Measured against the locally installed RTK.", table)
         self.assertIn("| fixture | 100/28 (100.0%) | 40/11 (40.0%) | 50/14 (50.0%) |", table)
         with tempfile.TemporaryDirectory() as root:
             fake = os.path.join(root, "fake-rtk")
