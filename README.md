@@ -6,7 +6,7 @@
 
 **Agent Pipline Compressor** is a local, deterministic tool-output compressor for [Codex](https://github.com/openai/codex) and Claude Code. It measures noisy Bash output in `audit` mode and can selectively compress eligible output while keeping a recoverable original copy. Runtime code is Python standard library only: it makes no model, provider, telemetry, or network calls.
 
-This is an early `0.1.0` release. Start in `audit`, then opt into `safe` only after checking the hook trust/approval experience on your host. `full` remains cautionary until its live approval semantics have been tested.
+Start in `audit`, then opt into `safe` only after checking the hook trust/approval experience on your host. `full` remains cautionary until its live approval semantics have been tested.
 
 ## Five-minute start
 
